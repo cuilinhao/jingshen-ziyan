@@ -1,0 +1,120 @@
+#if os(iOS)
+import AVFoundation
+import CoreGraphics
+import UIKit
+import BokehCore
+
+/// 系统类型（CVPixelBuffer / AVDepthData / CGImage / UIImage）和 BokehCore 纯 Swift 类型之间的转换
+public enum ImageBridge {
+
+    /// BGRA 相机帧 -> 线性光图像，按整数倍降采样到大约 targetWidth 宽
+    public static func planarImage(from pixelBuffer: CVPixelBuffer, targetWidth: Int) -> PlanarImage {
+        CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
+        let w = CVPixelBufferGetWidth(pixelBuffer)
+        let h = CVPixelBufferGetHeight(pixelBuffer)
+        let bpr = CVPixelBufferGetBytesPerRow(pixelBuffer)
+        let base = CVPixelBufferGetBaseAddress(pixelBuffer)!
+        let factor = max(1, w / max(1, targetWidth))
+        return PlanarImage(interleaved8: UnsafeRawPointer(base), width: w, height: h,
+                           bytesPerRow: bpr, layout: .bgra, downsample: factor, maxSamplesPerAxis: 2)
+    }
+
+    /// 相机帧 -> 线性光图像，缩放到长边为 longSide（任意比例）。支持 BGRA
+    public static func planarImage(from pixelBuffer: CVPixelBuffer, longSide: Int) -> PlanarImage {
+        CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
+        let w = CVPixelBufferGetWidth(pixelBuffer)
+        let h = CVPixelBufferGetHeight(pixelBuffer)
+        let bpr = CVPixelBufferGetBytesPerRow(pixelBuffer)
+        let base = CVPixelBufferGetBaseAddress(pixelBuffer)!
+        let s = min(1, Double(longSide) / Double(max(w, h)))
+        let ow = max(1, Int((Double(w) * s).rounded()))
+        let oh = max(1, Int((Double(h) * s).rounded()))
+        return PlanarImage(interleaved8: UnsafeRawPointer(base), width: w, height: h, bytesPerRow: bpr,
+                           layout: .bgra, outputWidth: ow, outputHeight: oh)
+    }
+
+    /// AVDepthData -> 视差图（单位 1/米）。无效值写成 NaN，后面由 DepthRefiner 补洞
+    public static func disparityMap(from depthData: AVDepthData) -> FloatMap {
+        let converted = depthData.depthDataType == kCVPixelFormatType_DisparityFloat32
+            ? depthData
+            : depthData.converting(toDepthDataType: kCVPixelFormatType_DisparityFloat32)
+        let map = converted.depthDataMap
+        CVPixelBufferLockBaseAddress(map, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(map, .readOnly) }
+        let w = CVPixelBufferGetWidth(map)
+        let h = CVPixelBufferGetHeight(map)
+        let bpr = CVPixelBufferGetBytesPerRow(map)
+        let base = CVPixelBufferGetBaseAddress(map)!
+        var values = [Float](repeating: .nan, count: w * h)
+        for y in 0..<h {
+            let row = (base + y * bpr).assumingMemoryBound(to: Float32.self)
+            for x in 0..<w {
+                let v = row[x]
+                if v.isFinite && v > 0 { values[y * w + x] = v }
+            }
+        }
+        return FloatMap(width: w, height: h, values: values)
+    }
+
+    /// CGImage -> 线性光图像，长边缩到 maxLongSide 以内
+    public static func planarImage(from cgImage: CGImage, maxLongSide: Int) -> PlanarImage {
+        let scale = min(1, Double(maxLongSide) / Double(max(cgImage.width, cgImage.height)))
+        let w = max(1, Int(Double(cgImage.width) * scale))
+        let h = max(1, Int(Double(cgImage.height) * scale))
+        var bytes = [UInt8](repeating: 0, count: w * h * 4)
+        bytes.withUnsafeMutableBytes { raw in
+            let ctx = CGContext(data: raw.baseAddress, width: w, height: h, bitsPerComponent: 8,
+                                bytesPerRow: w * 4, space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue)!
+            ctx.interpolationQuality = .high
+            ctx.draw(cgImage, in: CGRect(x: 0, y: 0, width: w, height: h))
+        }
+        return bytes.withUnsafeBytes { raw in
+            PlanarImage(interleaved8: raw.baseAddress!, width: w, height: h, bytesPerRow: w * 4, layout: .rgba)
+        }
+    }
+
+    /// 线性光图像 -> CGImage（sRGB）
+    public static func cgImage(from image: PlanarImage) -> CGImage? {
+        let rgba = image.interleavedRGBA8()
+        guard let provider = CGDataProvider(data: Data(rgba) as CFData) else { return nil }
+        return CGImage(width: image.width, height: image.height, bitsPerComponent: 8, bitsPerPixel: 32,
+                       bytesPerRow: image.width * 4, space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                       bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.noneSkipLast.rawValue),
+                       provider: provider, decode: nil, shouldInterpolate: true, intent: .defaultIntent)
+    }
+
+    public static func uiImage(from image: PlanarImage, orientation: UIImage.Orientation) -> UIImage? {
+        guard let cg = cgImage(from: image) else { return nil }
+        return UIImage(cgImage: cg, scale: 1, orientation: orientation)
+    }
+
+    public static func uiOrientation(_ o: CGImagePropertyOrientation) -> UIImage.Orientation {
+        switch o {
+        case .up: return .up
+        case .upMirrored: return .upMirrored
+        case .down: return .down
+        case .downMirrored: return .downMirrored
+        case .left: return .left
+        case .leftMirrored: return .leftMirrored
+        case .right: return .right
+        case .rightMirrored: return .rightMirrored
+        @unknown default: return .up
+        }
+    }
+
+    /// 屏幕上显示的图片里的归一化坐标 (u, v) -> 原始（传感器方向）图像里的归一化坐标。
+    /// 相机原始帧是横着的，竖屏显示时带了旋转，点按对焦要换算回去。
+    public static func rawPoint(fromDisplayed p: CGPoint, orientation: UIImage.Orientation) -> CGPoint {
+        let u = p.x, v = p.y
+        switch orientation {
+        case .right, .rightMirrored: return CGPoint(x: v, y: 1 - u)   // 显示 = 原图顺时针转 90°
+        case .left, .leftMirrored: return CGPoint(x: 1 - v, y: u)     // 显示 = 原图逆时针转 90°
+        case .down, .downMirrored: return CGPoint(x: 1 - u, y: 1 - v)
+        default: return CGPoint(x: u, y: v)
+        }
+    }
+}
+#endif
