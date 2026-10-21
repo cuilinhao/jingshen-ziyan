@@ -39,11 +39,15 @@ public struct LensParameters: Equatable {
     public var maxRelative: Float
     /// `.thinLens`：软上限（ƒ4.5 时占长边的比例，随 ƒ 反比变化），0 = 关闭
     public var softLimitFraction: Float
+    /// `.system`：相对距离的分母。nil = 对焦视差本身（LiDAR / 双摄的绝对视差：rel = d/d_f − 1）。
+    /// AI 单目深度只有相对值（未知的比例和偏移），对焦在远处时 d_f 接近 0，rel 会被放得很大，
+    /// 所以用 max(d_f, 0.25 × (近端 − 远端)) 当分母（和 DepthBokehCamera 2 一样）
+    public var relativeScale: Float?
 
     public init(fNumber: Float = 2.8, focusDisparity: Float = 1, model: Model = .system,
                 focalLength35mm: Float = 52, maxBlurFraction: Float? = nil, focusTolerance: Float = 0.06,
                 blurK: Float = 0.015, foregroundScale: Float = 0.8, maxRelative: Float = 1.6,
-                softLimitFraction: Float = 0.012) {
+                softLimitFraction: Float = 0.012, relativeScale: Float? = nil) {
         self.fNumber = fNumber
         self.focusDisparity = focusDisparity
         self.model = model
@@ -54,6 +58,13 @@ public struct LensParameters: Equatable {
         self.foregroundScale = foregroundScale
         self.maxRelative = maxRelative
         self.softLimitFraction = softLimitFraction
+        self.relativeScale = relativeScale
+    }
+
+    /// 相对对焦面的距离：(d − d_f) / 分母。正数 = 前景，−1 = 无穷远（绝对视差时）
+    @inline(__always)
+    public func relativeDistance(_ d: Float) -> Float {
+        (d - focusDisparity) / max(relativeScale ?? focusDisparity, 1e-3)
     }
 
     /// 带符号的模糊半径（像素）。正数 = 在对焦面前方（前景），负数 = 后方（背景）
@@ -62,7 +73,7 @@ public struct LensParameters: Equatable {
         let maxR = maxBlurFraction * Float(L)
         switch model {
         case .system:
-            let rel = d / max(focusDisparity, 1e-3) - 1
+            let rel = relativeDistance(d)
             var mag = min(max(abs(rel) - focusTolerance, 0), maxRelative)
             if rel > 0 { mag *= foregroundScale }
             let r = mag * blurK / max(fNumber, 1) * Float(L)

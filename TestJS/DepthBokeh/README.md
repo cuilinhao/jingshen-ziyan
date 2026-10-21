@@ -21,6 +21,23 @@
    - `Privacy - Photo Library Additions Usage Description`（NSPhotoLibraryAddUsageDescription），比如「保存虚化后的照片」
 5. **Product → Scheme → Edit Scheme → Run → Build Configuration 改成 Release。** 这一步很重要：渲染器是纯 Swift 的 CPU 循环，Debug 模式不开优化，会慢 10 到 50 倍。
 6. 选你的 iPhone，运行。
+7. （可选，0.5× 超广角要用）把 `DepthAnythingV2SmallF16.mlpackage`（Apple 的 Core ML 版 Depth Anything V2，约 48 MB）拖进 App target。
+   没打包的话，第一次切到 0.5× 时会从 Hugging Face（国内先试 hf-mirror.com）下载并在手机上编译。
+
+### 变焦（0.5×–4×，和 DepthBokehCamera 2 一样）
+
+点 0.5 / 1 / 2 / 4 跳过去（预览 0.3 秒平滑变焦），或者左右拖刻度连续调；松手时离数字 ±5% 以内会吸附过去。
+
+| 倍率 | 实际用的相机 | App 裁切 | 深度 |
+|---|---|---|---|
+| 0.5×–0.99× | 超广角 | 1–1.98× | AI 单目深度 |
+| 1×–1.99× | LiDAR（1×） | 1–1.99× | LiDAR |
+| 2×–3.99× | 双摄广角（主摄原生 2×） | 1–1.99× | 双摄视差 |
+| 4× | 双摄长焦 | 无 | 双摄视差 |
+
+实时深度只在几个倍率点上有（iPhone 17 Pro Max：1×、2×、4×），两个点之间相机停在低的那个点，画面和深度图一起从中间裁。
+拖动时只裁当前相机的画面，往小拖超过当前相机 5% 才马上换相机；松手约 0.3 秒后换到这个倍率最合适的相机。
+换相机期间保留最后一帧，新相机出了 3 帧并且有深度（最多 0.8 秒）后淡入。路线规划在 `LensCatalog.swift`。
 
 ## 在电脑上调试算法
 

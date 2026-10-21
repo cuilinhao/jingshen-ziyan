@@ -24,7 +24,9 @@ struct PhotoEditorView: View {
                 Button("关闭") { dismiss() }
                 Spacer()
                 if editor.isRendering { ProgressView().controlSize(.small) }
-                Text(String(format: "%.0f ms · 对焦 %.2f m", editor.renderMilliseconds, editor.focusDistanceMeters))
+                Text(editor.focusDistanceMeters > 0
+                     ? String(format: "%.0f ms · 对焦 %.2f m", editor.renderMilliseconds, editor.focusDistanceMeters)
+                     : String(format: "%.0f ms · 相对深度", editor.renderMilliseconds))
                     .font(.caption.monospacedDigit())
                     .foregroundStyle(.secondary)
                 Spacer()

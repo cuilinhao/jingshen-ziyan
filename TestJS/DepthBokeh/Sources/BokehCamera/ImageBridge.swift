@@ -20,23 +20,52 @@ public enum ImageBridge {
                            bytesPerRow: bpr, layout: .bgra, downsample: factor, maxSamplesPerAxis: 2)
     }
 
-    /// 相机帧 -> 线性光图像，缩放到长边为 longSide（任意比例）。支持 BGRA
-    public static func planarImage(from pixelBuffer: CVPixelBuffer, longSide: Int) -> PlanarImage {
+    /// 相机帧 -> 线性光图像，缩放到长边为 longSide（任意比例）。支持 BGRA。
+    /// crop > 1 时只取中间 1/crop（数码变焦），输出不超过裁出来那块的原始像素数（不做放大）
+    public static func planarImage(from pixelBuffer: CVPixelBuffer, longSide: Int, crop: CGFloat = 1) -> PlanarImage {
         CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
         defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
         let w = CVPixelBufferGetWidth(pixelBuffer)
         let h = CVPixelBufferGetHeight(pixelBuffer)
         let bpr = CVPixelBufferGetBytesPerRow(pixelBuffer)
         let base = CVPixelBufferGetBaseAddress(pixelBuffer)!
-        let s = min(1, Double(longSide) / Double(max(w, h)))
-        let ow = max(1, Int((Double(w) * s).rounded()))
-        let oh = max(1, Int((Double(h) * s).rounded()))
+        let c = crop.isFinite ? max(1, Double(crop)) : 1
+        let cw = Double(w) / c, ch = Double(h) / c
+        let s = min(1, Double(longSide) / max(cw, ch))
+        let ow = max(1, Int((cw * s).rounded()))
+        let oh = max(1, Int((ch * s).rounded()))
+        let rect: (x: Float, y: Float, width: Float, height: Float)? = c > 1.0005
+            ? (Float((Double(w) - cw) / 2), Float((Double(h) - ch) / 2), Float(cw), Float(ch)) : nil
         return PlanarImage(interleaved8: UnsafeRawPointer(base), width: w, height: h, bytesPerRow: bpr,
-                           layout: .bgra, outputWidth: ow, outputHeight: oh)
+                           layout: .bgra, outputWidth: ow, outputHeight: oh, sourceRect: rect)
     }
 
-    /// AVDepthData -> 视差图（单位 1/米）。无效值写成 NaN，后面由 DepthRefiner 补洞
+    /// 图像中间的 1/crop（传感器方向，任何旋转下都居中）
+    public static func centerCrop(_ image: CGImage, by crop: CGFloat) -> CGImage {
+        guard crop.isFinite, crop > 1.001 else { return image }
+        let width = (CGFloat(image.width) / crop).rounded()
+        let height = (CGFloat(image.height) / crop).rounded()
+        let rect = CGRect(x: ((CGFloat(image.width) - width) / 2).rounded(),
+                          y: ((CGFloat(image.height) - height) / 2).rounded(), width: width, height: height)
+        return image.cropping(to: rect) ?? image
+    }
+
+    /// AVDepthData -> 视差图（单位 1/米）。无效值写成 NaN，后面由 DepthRefiner 补洞。
+    /// 双摄的视差精度是「相对」的（depthDataAccuracy = .relative），可能带偏移、出现 ≤ 0 的值：
+    /// 这时保留所有有限值，整体平移到最小值约 0.02（相对距离由 LensParameters.relativeScale 保护）
     public static func disparityMap(from depthData: AVDepthData) -> FloatMap {
+        var map = absoluteOrRawDisparity(from: depthData)
+        if depthData.depthDataAccuracy == .relative, let p = map.percentiles(0.02, 0.98), p.low < 0.02 {
+            let shift = 0.02 - p.low
+            for i in 0..<map.values.count where map.values[i].isFinite {
+                map.values[i] = max(map.values[i] + shift, 0.005)
+            }
+        }
+        return map
+    }
+
+    private static func absoluteOrRawDisparity(from depthData: AVDepthData) -> FloatMap {
+        let relative = depthData.depthDataAccuracy == .relative
         let converted = depthData.depthDataType == kCVPixelFormatType_DisparityFloat32
             ? depthData
             : depthData.converting(toDepthDataType: kCVPixelFormatType_DisparityFloat32)
@@ -52,7 +81,7 @@ public enum ImageBridge {
             let row = (base + y * bpr).assumingMemoryBound(to: Float32.self)
             for x in 0..<w {
                 let v = row[x]
-                if v.isFinite && v > 0 { values[y * w + x] = v }
+                if v.isFinite && (relative || v > 0) { values[y * w + x] = v }
             }
         }
         return FloatMap(width: w, height: h, values: values)

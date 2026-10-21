@@ -37,7 +37,8 @@ extension BokehRenderer {
             if let t = temporal { d = t.prepare(luma: luma.values, disparity: d) }
             if let sh = subject {
                 d = SubjectMatte.apply(disparity: d, image: full, focusDisparity: lens.focusDisparity,
-                                       focusPoint: sh.point, parameters: sh.parameters).0
+                                       focusPoint: sh.point, parameters: sh.parameters,
+                                         scale: lens.relativeScale).0
             }
             return render(image: full, disparity: d, lens: lens, quality: quality, temporal: temporal)
         }
@@ -50,7 +51,8 @@ extension BokehRenderer {
         var matte: FloatMap?
         if let sh = subject {
             let res = SubjectMatte.apply(disparity: dLow, image: low, focusDisparity: lens.focusDisparity,
-                                         focusPoint: sh.point, parameters: sh.parameters)
+                                         focusPoint: sh.point, parameters: sh.parameters,
+                                         scale: lens.relativeScale)
             dLow = res.0; matte = res.1
         }
         var bokeh = render(image: low, disparity: dLow, lens: lens, quality: quality, temporal: temporal)

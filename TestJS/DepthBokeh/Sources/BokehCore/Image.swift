@@ -109,6 +109,48 @@ public struct FloatMap {
         return FloatMap(width: newW, height: newH, values: out)
     }
 
+    /// 中心裁切：取中间 1/crop 的区域，双线性重采样到约 原尺寸/crop（至少 minSide）。crop ≤ 1 原样返回。
+    /// 变焦在两个能出深度的倍率之间时，相机停在较低的那个倍率，画面和深度图都按同样的比例从中间裁
+    public func centerCropped(by crop: Float, minSide: Int = 8) -> FloatMap {
+        guard crop.isFinite, crop > 1.0005, width > 1, height > 1 else { return self }
+        let cw = Float(width) / crop, ch = Float(height) / crop
+        let x0 = (Float(width) - cw) / 2, y0 = (Float(height) - ch) / 2
+        let ow = max(minSide, Int(cw.rounded())), oh = max(minSide, Int(ch.rounded()))
+        let sx = cw / Float(ow), sy = ch / Float(oh)
+        var out = [Float](repeating: 0, count: ow * oh)
+        for y in 0..<oh {
+            let fy = y0 + (Float(y) + 0.5) * sy
+            for x in 0..<ow {
+                let fx = x0 + (Float(x) + 0.5) * sx
+                var v = sampleBilinear(x: fx, y: fy)
+                if !v.isFinite {
+                    // 旁边有空洞（NaN）时退回最近邻，不让空洞变大
+                    let xi = min(width - 1, max(0, Int(fx))), yi = min(height - 1, max(0, Int(fy)))
+                    v = values[yi * width + xi]
+                }
+                out[y * ow + x] = v
+            }
+        }
+        return FloatMap(width: ow, height: oh, values: out)
+    }
+
+    /// 第 lower / upper 百分位（跳过 NaN），在最多约 4096 个均匀采样点上统计
+    public func percentiles(_ lower: Float, _ upper: Float) -> (low: Float, high: Float)? {
+        let step = max(1, values.count / 4096)
+        var sample: [Float] = []
+        sample.reserveCapacity(values.count / step + 1)
+        var i = 0
+        while i < values.count {
+            if values[i].isFinite { sample.append(values[i]) }
+            i += step
+        }
+        guard sample.count >= 16 else { return nil }
+        sample.sort()
+        let lo = sample[min(sample.count - 1, Int(Float(sample.count) * lower))]
+        let hi = sample[min(sample.count - 1, Int(Float(sample.count) * upper))]
+        return (lo, hi)
+    }
+
     func halved() -> FloatMap {
         let w2 = width / 2, h2 = height / 2
         var out = [Float](repeating: 0, count: w2 * h2)
@@ -206,18 +248,22 @@ extension PlanarImage {
     }
 
     /// 从 8 位交错像素缩放到任意尺寸（不要求整数倍）。
-    /// 每个输出像素在它覆盖的源区域里取 2×2 个样本平均，缩小 1–3 倍时不会有明显锯齿
+    /// 每个输出像素在它覆盖的源区域里取 2×2 个样本平均，缩小 1–3 倍时不会有明显锯齿。
+    /// `sourceRect`（源像素坐标 x, y, 宽, 高）只取其中一块，用于数码变焦的中心裁切；nil = 整张
     public init(interleaved8 base: UnsafeRawPointer, width srcW: Int, height srcH: Int,
-                bytesPerRow: Int, layout: InterleavedLayout, outputWidth w: Int, outputHeight h: Int) {
+                bytesPerRow: Int, layout: InterleavedLayout, outputWidth w: Int, outputHeight h: Int,
+                sourceRect: (x: Float, y: Float, width: Float, height: Float)? = nil) {
         self.init(width: w, height: h)
         let lut = SRGB.decodeLUT
         let bpp = layout.bytesPerPixel
         let (or, og, ob) = layout.offsets
-        let sx = Float(srcW) / Float(w), sy = Float(srcH) / Float(h)
+        let rect = sourceRect ?? (0, 0, Float(srcW), Float(srcH))
+        let sx = rect.width / Float(w), sy = rect.height / Float(h)
+        let ox = rect.x, oy = rect.y
         // 每个输出像素的 2 个采样列 / 行（位于覆盖区域的 1/4 和 3/4 处）
         let xs: [Int] = (0..<(2 * w)).map { k in
             let x = k / 2, q: Float = k % 2 == 0 ? 0.25 : 0.75
-            return min(srcW - 1, max(0, Int((Float(x) + q) * sx)))
+            return min(srcW - 1, max(0, Int(ox + (Float(x) + q) * sx)))
         }
         let src = base.assumingMemoryBound(to: UInt8.self)
         r.withUnsafeMutableBufferPointer { rp in
@@ -227,7 +273,8 @@ extension PlanarImage {
         xs.withUnsafeBufferPointer { xp in
             let R = rp.baseAddress!, G = gp.baseAddress!, B = bp.baseAddress!, L = lp.baseAddress!, XS = xp.baseAddress!
             parallelFor(h) { y in
-                let y0 = min(srcH - 1, Int((Float(y) + 0.25) * sy)), y1 = min(srcH - 1, Int((Float(y) + 0.75) * sy))
+                let y0 = min(srcH - 1, max(0, Int(oy + (Float(y) + 0.25) * sy)))
+                let y1 = min(srcH - 1, max(0, Int(oy + (Float(y) + 0.75) * sy)))
                 let row0 = src + y0 * bytesPerRow, row1 = src + y1 * bytesPerRow
                 for x in 0..<w {
                     let a = XS[2 * x] * bpp, c = XS[2 * x + 1] * bpp

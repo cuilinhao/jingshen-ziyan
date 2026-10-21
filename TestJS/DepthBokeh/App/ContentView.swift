@@ -1,10 +1,11 @@
 import SwiftUI
 import UIKit
+import QuartzCore
 import BokehCamera
 
 /// 取景界面：实时虚化预览 + 焦段调节 + 景深（ƒ）滑块 + 点按对焦 + 快门
-/// 焦段调节的界面和交互直接复用 DepthBokehCamera 2 的 ContinuousZoomControl：
-/// 点数字跳到对应焦段，左右拖动或长按展开刻度，松手约 1 秒收起
+/// 焦段调节的界面和交互直接复用 DepthBokehCamera 2 的 ContinuousZoomControl（0.5×–4×）：
+/// 点数字跳到对应焦段，左右拖动或长按展开刻度，松手 ±5% 内吸附到数字，约 1 秒收起
 struct ContentView: View {
     @StateObject private var camera = DepthCameraController()
     @State private var sliderValue: Double = ApertureScale.position(for: 2.8)
@@ -35,9 +36,9 @@ struct ContentView: View {
                 .animation(.easeInOut(duration: 0.2), value: camera.isTooClose)
 
             ContinuousZoomControl(zoomFactor: camera.zoomFactor, range: camera.zoomRange, stops: camera.zoomStops,
-                                  isEnabled: camera.zoomRange.upperBound > camera.zoomRange.lowerBound) { factor in
-                camera.setZoomFactor(factor)
-            }
+                                  isEnabled: !camera.isCapturing,
+                                  onZoomChange: { camera.setZoomFactor($0) },
+                                  onZoomCommit: { camera.commitZoom() })
             .padding(.horizontal, 16)
 
             VStack(spacing: 6) {
@@ -58,9 +59,9 @@ struct ContentView: View {
                     .strokeBorder(.white, lineWidth: 4)
                     .background(Circle().fill(.white).padding(7))
                     .frame(width: 72, height: 72)
-                    .opacity(camera.isCapturing ? 0.4 : 1)
+                    .opacity(camera.isCapturing || camera.isZoomSettling ? 0.4 : 1)
             }
-            .disabled(camera.isCapturing)
+            .disabled(camera.isCapturing || camera.isZoomSettling)
             .padding(.bottom, 8)
         }
         .padding(.top, 8)
@@ -79,37 +80,72 @@ struct ContentView: View {
         }
     }
 
+    /// 预览：每一帧按它渲染时的倍率出图，这里再补上它和此刻倍率之间的差（拖动刻度时跟手、
+    /// 点数字时 0.3 秒平滑变焦、换相机期间最后一帧继续放大）。换相机时上一帧 0.2 秒淡出
     private var preview: some View {
         GeometryReader { geo in
-            ZStack {
-                if let img = camera.previewImage {
-                    Image(uiImage: img)
-                        .resizable()
-                        .scaledToFit()
-                } else {
-                    ProgressView()
+            TimelineView(.animation(paused: !camera.isZoomGliding && camera.transitionImage == nil)) { _ in
+                let zoom = camera.previewZoom
+                ZStack {
+                    if let img = camera.previewImage {
+                        Image(uiImage: img)
+                            .resizable()
+                            .scaledToFit()
+                            .scaleEffect(Self.residualScale(zoom, camera.previewFrameZoom))
+                    } else {
+                        ProgressView()
+                    }
+                    if let held = camera.transitionImage {
+                        Image(uiImage: held)
+                            .resizable()
+                            .scaledToFit()
+                            .scaleEffect(Self.residualScale(zoom, camera.transitionImageZoom))
+                            .opacity(max(0, 1 - (CACurrentMediaTime() - camera.transitionStart) / 0.2))
+                    }
+                    if let m = focusMarker {
+                        RoundedRectangle(cornerRadius: 2)
+                            .stroke(.yellow, lineWidth: 1.5)
+                            .frame(width: 70, height: 70)
+                            .position(m)
+                            .allowsHitTesting(false)
+                    }
                 }
-                if let m = focusMarker {
-                    RoundedRectangle(cornerRadius: 2)
-                        .stroke(.yellow, lineWidth: 1.5)
-                        .frame(width: 70, height: 70)
-                        .position(m)
-                        .allowsHitTesting(false)
-                }
+                .frame(width: geo.size.width, height: geo.size.height)
+                .clipped()
+                .contentShape(Rectangle())
+                .gesture(SpatialTapGesture().onEnded { value in
+                    handleTap(at: value.location, in: geo.size)
+                })
             }
-            .frame(width: geo.size.width, height: geo.size.height)
-            .contentShape(Rectangle())
-            .gesture(SpatialTapGesture().onEnded { value in
-                handleTap(at: value.location, in: geo.size)
-            })
         }
         .aspectRatio(3.0 / 4.0, contentMode: .fit)
+        .overlay(alignment: .topLeading) {
+            if !camera.depthSourceLabel.isEmpty {
+                Text(camera.depthSourceLabel)
+                    .font(.caption2.weight(.medium))
+                    .padding(.horizontal, 8).padding(.vertical, 4)
+                    .background(.black.opacity(0.45), in: Capsule())
+                    .foregroundStyle(.white.opacity(0.9))
+                    .padding(10)
+                    .allowsHitTesting(false)
+            }
+        }
+    }
+
+    /// 帧的倍率比此刻小多少就放大多少（只放大，不缩小：裁过的帧补不出更广的画面）
+    private static func residualScale(_ zoom: CGFloat, _ frameZoom: CGFloat) -> CGFloat {
+        guard zoom.isFinite, frameZoom.isFinite, frameZoom > 0 else { return 1 }
+        return max(1, zoom / frameZoom)
     }
 
     /// 屏幕点击位置 -> 图片内归一化坐标 -> 传感器原始方向坐标
     private func handleTap(at location: CGPoint, in container: CGSize) {
         guard let img = camera.previewImage else { return }
-        guard let p = ImageGeometry.normalizedPoint(location, imageSize: img.size, container: container) else { return }
+        // 去掉上面补的放大（以中心为基准）
+        let s = Self.residualScale(camera.previewZoom, camera.previewFrameZoom)
+        let center = CGPoint(x: container.width / 2, y: container.height / 2)
+        let unscaled = CGPoint(x: center.x + (location.x - center.x) / s, y: center.y + (location.y - center.y) / s)
+        guard let p = ImageGeometry.normalizedPoint(unscaled, imageSize: img.size, container: container) else { return }
         let raw = ImageBridge.rawPoint(fromDisplayed: p, orientation: img.imageOrientation)
         camera.focus(atRawPoint: raw)
         withAnimation(.easeOut(duration: 0.15)) { focusMarker = location }

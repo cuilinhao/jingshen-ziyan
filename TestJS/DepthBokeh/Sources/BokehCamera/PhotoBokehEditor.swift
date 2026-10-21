@@ -11,6 +11,7 @@ public final class PhotoBokehEditor: ObservableObject, @unchecked Sendable {
     @Published public private(set) var image: UIImage?
     @Published public private(set) var isRendering = false
     @Published public private(set) var renderMilliseconds: Double = 0
+    /// 对焦距离（米）；相对深度的照片为 0
     @Published public private(set) var focusDistanceMeters: Float = 0
 
     public let photo: CapturedDepthPhoto
@@ -62,8 +63,14 @@ public final class PhotoBokehEditor: ObservableObject, @unchecked Sendable {
 
             let t0 = CACurrentMediaTime()
             let focusD = DepthRefiner.focusDisparity(in: photo.disparity, nx: Float(p.focus.x), ny: Float(p.focus.y))
+            // 相对深度（双摄视差 / AI 深度）：相对距离的分母有下限，和实时预览一致
+            var scale: Float?
+            if photo.isRelativeDepth, let range = photo.disparity.percentiles(0.05, 0.95) {
+                scale = max(focusD, 0.25 * (range.high - range.low))
+            }
             let lens = LensParameters(fNumber: p.fNumber, focusDisparity: focusD, model: lensModel,
-                                      focalLength35mm: virtualFocalLength, focusTolerance: focusTolerance)
+                                      focalLength35mm: virtualFocalLength, focusTolerance: focusTolerance,
+                                      relativeScale: scale)
             let hint = keepSubjectSharp ? SubjectHint(point: (Float(p.focus.x), Float(p.focus.y))) : nil
             let out = renderer.renderDetailPreserving(full: photo.image, disparity: photo.disparity, lens: lens,
                                                       lowLongSide: max(320, photo.image.longSide / max(1, blurDownscale)),
@@ -73,7 +80,8 @@ public final class PhotoBokehEditor: ObservableObject, @unchecked Sendable {
             DispatchQueue.main.async {
                 self.image = ui
                 self.renderMilliseconds = ms
-                self.focusDistanceMeters = 1 / focusD
+                // 相对深度换算不出米，显示 0（界面上显示「相对深度」）
+                self.focusDistanceMeters = self.photo.isRelativeDepth ? 0 : 1 / focusD
             }
         }
     }

@@ -1,4 +1,4 @@
-// 从 DepthBokehCamera 2（commit 510c420「修改调节焦段 UI」）原样迁移：
+// 从 DepthBokehCamera 2 迁移（最新版：松手 ±5% 吸附到 0.5× / 1× / 2× / 4×，松手或点按后通知相机换到最合适的镜头）。
 // 只加了 public 和 init，指针图片改从本包的资源里取
 #if os(iOS)
 import SwiftUI
@@ -11,15 +11,19 @@ public struct ContinuousZoomControl: View {
     let range: ClosedRange<CGFloat>
     let stops: [ZoomStop]
     var isEnabled: Bool = true
+    /// Every change while the finger moves (the camera may only crop the running stream).
     var onZoomChange: (CGFloat) -> Void
+    /// The zoom is final for now (finger lifted, stop tapped): the camera may move to its best route.
+    var onZoomCommit: () -> Void = {}
 
     public init(zoomFactor: CGFloat, range: ClosedRange<CGFloat>, stops: [ZoomStop], isEnabled: Bool = true,
-                onZoomChange: @escaping (CGFloat) -> Void) {
+                onZoomChange: @escaping (CGFloat) -> Void, onZoomCommit: @escaping () -> Void = {}) {
         self.zoomFactor = zoomFactor
         self.range = range
         self.stops = stops
         self.isEnabled = isEnabled
         self.onZoomChange = onZoomChange
+        self.onZoomCommit = onZoomCommit
     }
 
     @State private var progress: CGFloat = 0
@@ -80,6 +84,7 @@ public struct ContinuousZoomControl: View {
             @unknown default: return
             }
             applyProgress(progress + offset)
+            onZoomCommit()
             expand()
             scheduleCollapse()
         }
@@ -94,6 +99,7 @@ public struct ContinuousZoomControl: View {
                     guard isEnabled else { return }
                     progress = scale.progress(for: stop.factor)
                     onZoomChange(scale.clamped(stop.factor))
+                    onZoomCommit()
                 } label: {
                     Text("\(selected ? ZoomScale.focalLength(for: displayedFactor) : stop.focalLength)")
                         .font(.system(size: 20, weight: .medium))
@@ -173,8 +179,11 @@ public struct ContinuousZoomControl: View {
                 guard isDragging else { return }
                 isDragging = false
                 dragStartProgress = nil
-                // A failed camera change may have restored its value while dragging.
-                synchronizeProgress()
+                if !snapToStop() {
+                    // A failed camera change may have restored its value while dragging.
+                    synchronizeProgress()
+                }
+                onZoomCommit()
                 scheduleCollapse()
             }
             .exclusively(before: LongPressGesture(minimumDuration: 0.5)
@@ -243,6 +252,18 @@ public struct ContinuousZoomControl: View {
         onZoomChange(displayedFactor)
     }
 
+    /// Releasing the dial within ±5% of a stop lands exactly on it. The stops (1×, 2×, 4×) are where
+    /// the camera itself delivers depth, uncropped — 1× is the LiDAR route.
+    private func snapToStop() -> Bool {
+        let factor = displayedFactor
+        guard let stop = stops.map(\.factor).first(where: { range.contains($0) && abs(factor / $0 - 1) <= 0.05 }),
+              abs(factor - stop) > 0.000001 else { return false }
+        progress = scale.progress(for: stop)
+        hapticTrigger += 1
+        onZoomChange(stop)
+        return true
+    }
+
     private func factorText(_ factor: CGFloat) -> String {
         let truncated = floor(factor * 10 + 0.000001) / 10
         return String(format: factor >= 10 && truncated.rounded() == truncated ? "%.0fx" : "%.1fx", Double(truncated))
@@ -279,12 +300,12 @@ public struct ContinuousZoomControl: View {
 #Preview {
     ContinuousZoomControl(
         zoomFactor: 3,
-        range: 0.5...15,
+        range: 0.5...4,
         stops: [
             ZoomStop(factor: 0.5, focalLength: 13),
             ZoomStop(factor: 1, focalLength: 24),
             ZoomStop(factor: 2, focalLength: 48),
-            ZoomStop(factor: 100 / 24, focalLength: 100)
+            ZoomStop(factor: 4, focalLength: 96)
         ],
         onZoomChange: { _ in }
     )

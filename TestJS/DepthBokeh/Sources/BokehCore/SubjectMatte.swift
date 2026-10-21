@@ -36,18 +36,21 @@ public enum SubjectMatte {
     ///   - image: 同尺寸的彩色图（线性光）
     ///   - focusDisparity: 对焦视差
     ///   - focusPoint: 对焦点（归一化坐标），用于连通性
+    ///   - scale: 相对距离的分母（见 LensParameters.relativeScale），nil = 对焦视差
     /// - Returns: (修正后的视差, 遮罩 α)
     public static func apply(disparity: FloatMap, image: PlanarImage, focusDisparity df: Float,
-                             focusPoint: (Float, Float)?, parameters p: SubjectMatteParameters) -> (FloatMap, FloatMap) {
+                             focusPoint: (Float, Float)?, parameters p: SubjectMatteParameters,
+                             scale: Float? = nil) -> (FloatMap, FloatMap) {
         let w = disparity.width, h = disparity.height, n = w * h
         precondition(image.width == w && image.height == h)
         guard df > 0 else { return (disparity, FloatMap(width: w, height: h)) }
         let d = disparity.values
+        let norm = max(scale ?? df, 1e-3)
 
         // 1. 核心：对焦面附近的深度
         var core = [Float](repeating: 0, count: n)
         for i in 0..<n {
-            let rel = d[i] / df - 1
+            let rel = (d[i] - df) / norm
             if abs(rel) < p.band { core[i] = 1 }
         }
         if p.connectToFocus, let fp = focusPoint {
@@ -78,7 +81,7 @@ public enum SubjectMatte {
             let a = alpha[i]
             var v = d[i] + a * (df - d[i])
             let leak = max(0, core[i] - a)
-            if leak > 0 && farNearby[i] < df * (1 - p.band) {
+            if leak > 0 && farNearby[i] < df - p.band * norm {
                 v += leak * (farNearby[i] - v)
             }
             out[i] = v

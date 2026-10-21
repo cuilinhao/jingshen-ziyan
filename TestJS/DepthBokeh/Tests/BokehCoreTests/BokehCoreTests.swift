@@ -190,4 +190,46 @@ final class BokehCoreTests: XCTestCase {
         let filled = DepthRefiner.fillInvalid(FloatMap(width: w, height: h, values: values))
         for v in filled.values { XCTAssertEqual(v, 0.5, accuracy: 1e-4) }
     }
+
+    /// 数码变焦的中心裁切：画面和深度图裁同一块，内容对得上
+    func testCenterCrop() {
+        // 视差 = 横坐标（像素中心），裁 2 倍后应该只剩中间一半的值域
+        let w = 40, h = 30
+        var values = [Float](repeating: 0, count: w * h)
+        for y in 0..<h { for x in 0..<w { values[y * w + x] = Float(x) + 0.5 } }
+        let map = FloatMap(width: w, height: h, values: values)
+        let c = map.centerCropped(by: 2)
+        XCTAssertEqual(c.width, 20); XCTAssertEqual(c.height, 15)
+        XCTAssertEqual(c[0, 7], 10.5, accuracy: 0.01)
+        XCTAssertEqual(c[19, 7], 29.5, accuracy: 0.01)
+        XCTAssertEqual(map.centerCropped(by: 1).width, w)
+        // 空洞不会因为插值变大
+        var holes = values
+        holes[15 * w + 20] = .nan
+        let ch = FloatMap(width: w, height: h, values: holes).centerCropped(by: 1.25)
+        XCTAssertLessThanOrEqual(ch.values.filter { !$0.isFinite }.count, 2)
+
+        // 8 位图像：sourceRect 只取中间一块
+        var bytes = [UInt8](repeating: 0, count: w * h * 4)
+        for y in 0..<h { for x in 0..<w where x >= 10 && x < 30 { for c in 0..<3 { bytes[(y * w + x) * 4 + c] = 255 } } }
+        let img = bytes.withUnsafeBytes { raw in
+            PlanarImage(interleaved8: raw.baseAddress!, width: w, height: h, bytesPerRow: w * 4, layout: .rgba,
+                        outputWidth: 20, outputHeight: 15, sourceRect: (10, 7.5, 20, 15))
+        }
+        XCTAssertEqual(img.r.min()!, 1, accuracy: 1e-4)   // 整块都是中间的白色
+    }
+
+    /// AI 单目深度：相对距离的分母有下限，对焦远处时不会把一切都当成「很远的前景」
+    func testRelativeScale() {
+        let L = 1000
+        var lens = LensParameters(fNumber: 2, focusDisparity: 0.1)
+        let raw = abs(lens.signedBlurRadius(disparity: 0.2, imageLongSide: L))
+        lens.relativeScale = 0.25
+        let guarded = abs(lens.signedBlurRadius(disparity: 0.2, imageLongSide: L))
+        XCTAssertLessThan(guarded, raw)
+        XCTAssertEqual(lens.relativeDistance(0.9), 3.2, accuracy: 1e-4)
+        // 不设分母时和原公式完全一样
+        let abs1 = LensParameters(fNumber: 2, focusDisparity: 0.5)
+        XCTAssertEqual(abs1.relativeDistance(0.25), -0.5, accuracy: 1e-6)
+    }
 }
