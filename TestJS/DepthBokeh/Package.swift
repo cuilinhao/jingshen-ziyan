@@ -12,7 +12,7 @@ let package = Package(
     ],
     targets: [
         .target(name: "BokehCore"),
-        .target(name: "BokehCamera", dependencies: ["BokehCore"]),
+        .target(name: "BokehCamera", dependencies: ["BokehCore"], resources: [.process("Resources")]),
         // 命令行工具：读 PPM 图像 + PFM 视差图，输出虚化结果（用于在电脑上调试算法）
         .executableTarget(name: "bokeh-cli", dependencies: ["BokehCore"]),
         .testTarget(name: "BokehCoreTests", dependencies: ["BokehCore"]),

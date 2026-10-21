@@ -85,12 +85,18 @@ var args = Array(CommandLine.arguments.dropFirst())
 if args.first == "--batch" {
     args.removeFirst()
     let jobsPath = args.removeFirst()
-    var useTemporal = false, low = 480, tol: Float = 0.08, soft: Float = 0.012, focalB: Float = 52
+    var useTemporal = false, low = 480, tol: Float = 0.06, soft: Float = 0.012, focalB: Float = 52
+    var thinB = false, matteB = false
     var qualityB = RenderQuality.preview
     while !args.isEmpty {
         let a = args.removeFirst()
         switch a {
         case "--temporal": useTemporal = true
+        case "--thin": thinB = true
+        case "--matte": matteB = true
+        case "--legacy-highlights": qualityB.useLegacyHighlights()
+        case "--hgain": qualityB.highlightGain = Float(args.removeFirst())!
+        case "--hthr": qualityB.highlightThreshold = Float(args.removeFirst())!
         case "--lowres": low = Int(args.removeFirst())!
         case "--tol": tol = Float(args.removeFirst())!
         case "--soft": soft = Float(args.removeFirst())!
@@ -117,11 +123,14 @@ if args.first == "--batch" {
         guard p.count >= 5 else { continue }
         let image = try readPPM(p[0])
         let disparity = try readPFM(p[1])
-        let lens = LensParameters(fNumber: Float(p[3])!, focusDisparity: Float(p[4])!, focalLength35mm: focalB,
-                                  focusTolerance: tol, softLimitFraction: soft)
+        let lens = LensParameters(fNumber: Float(p[3])!, focusDisparity: Float(p[4])!, model: thinB ? .thinLens : .system,
+                                  focalLength35mm: focalB, focusTolerance: thinB && tol == 0.06 ? 0.08 : tol,
+                                  softLimitFraction: soft)
+        var hint: SubjectHint? = nil
+        if matteB { hint = SubjectHint(point: p.count >= 7 ? (Float(p[5])!, Float(p[6])!) : nil) }
         let t0 = Date()
         let out = renderer.renderDetailPreserving(full: image, disparity: disparity, lens: lens, lowLongSide: low,
-                                                  quality: qualityB, temporal: temporal)
+                                                  quality: qualityB, temporal: temporal, subject: hint)
         total += Date().timeIntervalSince(t0) * 1000; count += 1
         try writePPM(out, p[2])
         print("done \(p[2])")
@@ -141,8 +150,9 @@ var refine = false, quality = RenderQuality.photo
 var focusDisparityOverride: Float? = nil
 var saveRefined: String? = nil
 var lowres = 0
-var tolerance: Float = 0.08
+var tolerance: Float = 0.06
 var softLimit: Float = 0.012
+var thin = false, useMatte = false
 var debugPrefix: String? = nil
 while !args.isEmpty {
     let a = args.removeFirst()
@@ -159,6 +169,8 @@ while !args.isEmpty {
     case "--lowres": lowres = Int(args.removeFirst())!
     case "--tol": tolerance = Float(args.removeFirst())!
     case "--soft": softLimit = Float(args.removeFirst())!
+    case "--thin": thin = true
+    case "--matte": useMatte = true
     case "--debug": debugPrefix = args.removeFirst()
     case "--hgain": quality.highlightGain = Float(args.removeFirst())!
     default: print("未知参数 \(a)"); exit(1)
@@ -175,15 +187,20 @@ var focusD: Float
 if lowres > 0 {
     // 双分辨率：模糊在低分辨率算，清晰部分用全分辨率
     focusD = focusDisparityOverride ?? DepthRefiner.focusDisparity(in: DepthRefiner.fillInvalid(disparity), nx: focus.0, ny: focus.1)
-    let lens = LensParameters(fNumber: fNumber, focusDisparity: focusD, focalLength35mm: focal, focusTolerance: tolerance, softLimitFraction: softLimit)
-    result = renderer.renderDetailPreserving(full: image, disparity: disparity, lens: lens, lowLongSide: lowres, quality: quality)
+    let lens = LensParameters(fNumber: fNumber, focusDisparity: focusD, model: thin ? .thinLens : .system,
+                              focalLength35mm: focal, focusTolerance: thin && tolerance == 0.06 ? 0.08 : tolerance,
+                              softLimitFraction: softLimit)
+    result = renderer.renderDetailPreserving(full: image, disparity: disparity, lens: lens, lowLongSide: lowres, quality: quality,
+                                             subject: useMatte ? SubjectHint(point: focus) : nil)
 } else {
     if refine || disparity.width != image.width || disparity.height != image.height {
         disparity = DepthRefiner.refine(disparity: disparity, guide: image)
     }
     focusD = focusDisparityOverride ?? DepthRefiner.focusDisparity(in: disparity, nx: focus.0, ny: focus.1)
     if let path = saveRefined { try writePFM(disparity, path) }
-    let lens = LensParameters(fNumber: fNumber, focusDisparity: focusD, focalLength35mm: focal, focusTolerance: tolerance, softLimitFraction: softLimit)
+    let lens = LensParameters(fNumber: fNumber, focusDisparity: focusD, model: thin ? .thinLens : .system,
+                              focalLength35mm: focal, focusTolerance: thin && tolerance == 0.06 ? 0.08 : tolerance,
+                              softLimitFraction: softLimit)
     result = renderer.render(image: image, disparity: disparity, lens: lens, quality: quality)
 }
 let total = Date().timeIntervalSince(t0) * 1000
@@ -191,6 +208,7 @@ try writePPM(result, outPath)
 if let p = debugPrefix {
     if let w = renderer.debugWeights { try writePFM(w, p + "_w.pfm") }
     if let d = renderer.debugLowDisparity { try writePFM(d, p + "_dlow.pfm") }
+    if let m = renderer.debugMatte { try writePFM(m, p + "_matte.pfm") }
 }
 print(String(format: "%dx%d  ƒ%.1f  对焦视差 %.3f (%.2fm)  层数 %d  深度处理 0ms  渲染 %.0fms",
              image.width, image.height, fNumber, focusD, 1 / focusD, renderer.lastLayerCount, total))

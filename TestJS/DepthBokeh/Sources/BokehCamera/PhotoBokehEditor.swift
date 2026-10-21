@@ -14,9 +14,14 @@ public final class PhotoBokehEditor: ObservableObject, @unchecked Sendable {
     @Published public private(set) var focusDistanceMeters: Float = 0
 
     public let photo: CapturedDepthPhoto
+    /// 只在 `lensModel = .thinLens` 时使用
     public var virtualFocalLength: Float = 52
-    /// 对焦面前后的全清晰区（对焦距离的比例）
-    public var focusTolerance: Float = 0.08
+    /// 对焦面前后的全清晰区（相对对焦距离）
+    public var focusTolerance: Float = 0.06
+    /// 虚化模型（默认按系统相机标定）
+    public var lensModel: LensParameters.Model = .system
+    /// 对焦的主体整个保持清晰
+    public var keepSubjectSharp = true
     /// 模糊部分在几分之一的分辨率上计算
     public var blurDownscale = 3
 
@@ -57,11 +62,12 @@ public final class PhotoBokehEditor: ObservableObject, @unchecked Sendable {
 
             let t0 = CACurrentMediaTime()
             let focusD = DepthRefiner.focusDisparity(in: photo.disparity, nx: Float(p.focus.x), ny: Float(p.focus.y))
-            let lens = LensParameters(fNumber: p.fNumber, focusDisparity: focusD,
+            let lens = LensParameters(fNumber: p.fNumber, focusDisparity: focusD, model: lensModel,
                                       focalLength35mm: virtualFocalLength, focusTolerance: focusTolerance)
+            let hint = keepSubjectSharp ? SubjectHint(point: (Float(p.focus.x), Float(p.focus.y))) : nil
             let out = renderer.renderDetailPreserving(full: photo.image, disparity: photo.disparity, lens: lens,
                                                       lowLongSide: max(320, photo.image.longSide / max(1, blurDownscale)),
-                                                      quality: .photo, refinePasses: 2)
+                                                      quality: .photo, refinePasses: 2, subject: hint)
             let ui = ImageBridge.uiImage(from: out, orientation: photo.orientation)
             let ms = (CACurrentMediaTime() - t0) * 1000
             DispatchQueue.main.async {

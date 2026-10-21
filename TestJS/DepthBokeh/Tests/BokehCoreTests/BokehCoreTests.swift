@@ -38,7 +38,7 @@ final class BokehCoreTests: XCTestCase {
         let c = 100 * w + 100
         img.r[c] = 1; img.g[c] = 1; img.b[c] = 1
         let disp = FloatMap(width: w, height: h, repeating: 0.1)
-        let lens = LensParameters(fNumber: 2, focusDisparity: 1, focalLength35mm: 100, maxBlurFraction: 0.2, softLimitFraction: 0)
+        let lens = LensParameters(fNumber: 2, focusDisparity: 1, model: .thinLens, focalLength35mm: 100, maxBlurFraction: 0.2, softLimitFraction: 0)
         let expected = abs(lens.signedBlurRadius(disparity: 0.1, imageLongSide: w))
         XCTAssertGreaterThan(expected, 10)
         let out = BokehRenderer().render(image: img, disparity: disp, lens: lens,
@@ -75,7 +75,7 @@ final class BokehCoreTests: XCTestCase {
         }
         // 两个角上放更极端的深度，让前景/背景的半径正好落在两层中间
         disp[0] = 2.2; disp[w * h - 1] = 0.2
-        let lens = LensParameters(fNumber: 2, focusDisparity: 1, focalLength35mm: 50, maxBlurFraction: 0.1)
+        let lens = LensParameters(fNumber: 2, focusDisparity: 1, model: .thinLens, focalLength35mm: 50, maxBlurFraction: 0.1)
         let out = BokehRenderer().render(image: img, disparity: FloatMap(width: w, height: h, values: disp),
                                          lens: lens, quality: RenderQuality(layersPerSide: 4, highlightThreshold: 2, highlightGain: 0))
         let y = h / 2
@@ -149,7 +149,7 @@ final class BokehCoreTests: XCTestCase {
     /// 软上限：小半径几乎不变，大半径饱和在 r_sat 附近；ƒ 值越大上限越小
     func testSoftLimit() {
         let L = 2016
-        var lens = LensParameters(fNumber: 4.5, focusDisparity: 3, focalLength35mm: 52, maxBlurFraction: 0.2, focusTolerance: 0)
+        var lens = LensParameters(fNumber: 4.5, focusDisparity: 3, model: .thinLens, focalLength35mm: 52, maxBlurFraction: 0.2, focusTolerance: 0)
         var phys = lens; phys.softLimitFraction = 0
         let small = lens.signedBlurRadius(disparity: 2.8, imageLongSide: L)
         XCTAssertEqual(small, phys.signedBlurRadius(disparity: 2.8, imageLongSide: L), accuracy: 0.05)
@@ -159,6 +159,28 @@ final class BokehCoreTests: XCTestCase {
         XCTAssertGreaterThan(far, 0.012 * Float(L) * 0.85)
         lens.fNumber = 9
         XCTAssertLessThan(abs(lens.signedBlurRadius(disparity: 0.01, imageLongSide: L)), far * 0.55)
+    }
+
+    /// 系统模型：模糊只和相对距离有关。blurK = 0.012 时 ƒ1.4、主体 1.5 m、背景 6 m 约为长边的 0.55%
+    ///（DepthBokehCamera 2 的标定）；默认 0.015 是它的 1.25 倍
+    func testSystemModel() {
+        let L = 1440
+        let ref = LensParameters(fNumber: 1.4, focusDisparity: 1 / 1.5, blurK: 0.012)
+        XCTAssertEqual(-ref.signedBlurRadius(disparity: 1 / 6, imageLongSide: L) / Float(L), 0.0055, accuracy: 0.0006)
+        let lens = LensParameters(fNumber: 1.4, focusDisparity: 1 / 1.5)
+        let bg = lens.signedBlurRadius(disparity: 1 / 6, imageLongSide: L)
+        XCTAssertLessThan(bg, 0)
+        XCTAssertEqual(bg / ref.signedBlurRadius(disparity: 1 / 6, imageLongSide: L), 1.25, accuracy: 0.01)
+        // 对焦 0.46 m 的拳头、背景 3 m：和对焦 1.5 m 时差不多（相对距离接近），不会变成几倍
+        let near = LensParameters(fNumber: 1.4, focusDisparity: 1 / 0.46)
+        XCTAssertLessThan(abs(near.signedBlurRadius(disparity: 1 / 3, imageLongSide: L)), 1.3 * abs(bg))
+        // 死区内完全清晰；前景比同样相对距离的背景柔和
+        XCTAssertEqual(lens.signedBlurRadius(disparity: (1 / 1.5) * 1.05, imageLongSide: L), 0)
+        let fg = lens.signedBlurRadius(disparity: (1 / 1.5) * 1.5, imageLongSide: L)
+        let back = lens.signedBlurRadius(disparity: (1 / 1.5) * 0.5, imageLongSide: L)
+        XCTAssertEqual(fg, -0.8 * back, accuracy: 0.01)
+        // 上限 1.4%
+        XCTAssertLessThanOrEqual(abs(near.signedBlurRadius(disparity: 50, imageLongSide: L)), 0.014 * Float(L) + 1e-3)
     }
 
     func testPullPushFillsHoles() {

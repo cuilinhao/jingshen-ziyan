@@ -30,15 +30,32 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
     @Published public private(set) var statusText = "正在启动相机…"
     @Published public private(set) var lastPhoto: CapturedDepthPhoto?
     @Published public private(set) var isCapturing = false
+    /// 主体太近，景深已自动关闭
+    @Published public private(set) var isTooClose = false
+
+    // MARK: - 变焦（界面和交互复用 DepthBokehCamera 2 的 ContinuousZoomControl / ZoomScale）
+    /// 当前倍率（1× = 主摄 24mm）
+    @Published public private(set) var zoomFactor: CGFloat = 1
+    /// 可调范围：只包含当前格式能同时输出深度的倍率
+    @Published public private(set) var zoomRange: ClosedRange<CGFloat> = 1...1
+    /// 快捷焦段
+    @Published public private(set) var zoomStops: [ZoomStop] = []
 
     /// 实时预览输出的长边（像素）。清晰部分按这个分辨率显示
     public var previewLongSide = 1440
     /// 模糊部分在几分之一的分辨率上计算（3 = 1440 → 480），越大越快
     public var blurDownscale = 3
-    /// 对焦面前后的全清晰区（对焦距离的比例）
-    public var focusTolerance: Float = 0.08
-    /// 模拟镜头的 35mm 等效焦距，决定同样 ƒ 值下的虚化强度
+    /// 对焦面前后的全清晰区（相对对焦距离，0.06 = ±6%，和系统相机一致）
+    public var focusTolerance: Float = 0.06
+    /// 只在 `lensModel = .thinLens` 时使用：模拟镜头的 35mm 等效焦距
     public var virtualFocalLength: Float = 52
+    /// 虚化模型。默认 `.system`：按系统相机实测标定，虚化量只和 ƒ、相对距离有关
+    public var lensModel: LensParameters.Model = .system
+    /// 让对焦的主体整个保持清晰（深度 + 颜色做主体遮罩，修正主体边缘深度不准）
+    public var keepSubjectSharp = true
+    /// 景深效果允许的最近对焦距离（米）。主体比这更近时，和系统相机一样自动关掉景深并提示离远一点：
+    /// 这么近的时候拳头、手这类主体自身前后就差好几厘米（相对距离 20% 以上），深度边缘也最不准
+    public var minSubjectDistance: Float = 0.30
     /// 拍照后给编辑器的图像长边
     public var photoLongSide = 3024
 
@@ -77,6 +94,16 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
     private let renderer = BokehRenderer()
     private var lastDisparity: FloatMap?
     private var focusStabilizer = FocusStabilizer()
+    // 变焦：主线程只保留最新的目标倍率，sessionQueue 上一次只设置一个
+    private var pendingZoom: CGFloat?
+    private var zoomApplying = false
+    /// 设备倍率 = 显示倍率 × displayScale（双摄广角+超广角时设备 1.0 是超广角，所以主摄 1× 对应设备 2.0）
+    private var displayScale: CGFloat = 1
+    /// sessionQueue：能输出深度的倍率区间（显示倍率）
+    private var depthZoomRanges: [ClosedRange<CGFloat>] = [1...1]
+    // dataQueue：景深开关的平滑过渡
+    private var effectAmount: Float = 1
+    private var tooCloseState = false
     /// 跨帧稳定深度边缘和焦外光斑（静止时不闪，运动时不拖影）
     private let temporal = TemporalState()
     private var focusResetPending = false
@@ -118,18 +145,122 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
         // 让真实镜头也对到这里，否则「清晰区域」本身可能是光学失焦的
         sessionQueue.async {
             guard let d = self.device else { return }
+            // 画面放大后，画面上的点在整个传感器上更靠近中心
+            let z = max(1, d.videoZoomFactor)
+            let devicePoint = CGPoint(x: 0.5 + (point.x - 0.5) / z, y: 0.5 + (point.y - 0.5) / z)
             do {
                 try d.lockForConfiguration()
                 if d.isFocusPointOfInterestSupported && d.isFocusModeSupported(.autoFocus) {
-                    d.focusPointOfInterest = point
+                    d.focusPointOfInterest = devicePoint
                     d.focusMode = .autoFocus
                 }
                 if d.isExposurePointOfInterestSupported && d.isExposureModeSupported(.autoExpose) {
-                    d.exposurePointOfInterest = point
+                    d.exposurePointOfInterest = devicePoint
                     d.exposureMode = .autoExpose
                 }
                 d.unlockForConfiguration()
             } catch {}
+        }
+    }
+
+    // MARK: - 变焦
+
+    /// 设置倍率（主线程调用，拖动时会连续调用；只会把最新的值交给相机）
+    public func setZoomFactor(_ factor: CGFloat) {
+        let target = ZoomScale(range: zoomRange).clamped(factor)
+        guard abs(target - zoomFactor) > 0.0001 else { return }
+        zoomFactor = target
+        pendingZoom = target
+        applyPendingZoom()
+    }
+
+    private func applyPendingZoom() {
+        guard !zoomApplying, let target = pendingZoom else { return }
+        pendingZoom = nil
+        zoomApplying = true
+        sessionQueue.async {
+            let applied = self.applyZoomOnSession(target)
+            DispatchQueue.main.async {
+                self.zoomApplying = false
+                // 落在两个深度区间之间的倍率会被吸附到最近的可用值
+                if self.pendingZoom == nil, abs(applied - self.zoomFactor) > 0.001 { self.zoomFactor = applied }
+                self.applyPendingZoom()
+            }
+        }
+    }
+
+    /// sessionQueue：吸附到能输出深度的倍率，然后设置给相机。返回实际的显示倍率
+    private func applyZoomOnSession(_ target: CGFloat) -> CGFloat {
+        guard let d = device else { return 1 }
+        let z = Self.nearestSupported(target, ranges: depthZoomRanges)
+        let deviceZoom = min(max(z * displayScale, d.minAvailableVideoZoomFactor), d.maxAvailableVideoZoomFactor)
+        do {
+            try d.lockForConfiguration()
+            d.videoZoomFactor = deviceZoom
+            d.unlockForConfiguration()
+        } catch {
+            return d.videoZoomFactor / displayScale
+        }
+        return deviceZoom / displayScale
+    }
+
+    static func nearestSupported(_ z: CGFloat, ranges: [ClosedRange<CGFloat>]) -> CGFloat {
+        if ranges.contains(where: { $0.contains(z) }) { return z }
+        var best = ranges.first?.lowerBound ?? 1
+        for r in ranges {
+            for c in [r.lowerBound, r.upperBound] where abs(c - z) < abs(best - z) { best = c }
+        }
+        return best
+    }
+
+    /// 当前格式下能输出深度的倍率区间（换算成显示倍率，1× = 主摄）
+    private static func depthZoomRanges(for device: AVCaptureDevice, displayScale: CGFloat) -> [ClosedRange<CGFloat>] {
+        let format = device.activeFormat
+        var ranges: [ClosedRange<CGFloat>]
+        if #available(iOS 17.2, *) {
+            ranges = format.supportedVideoZoomRangesForDepthDataDelivery
+        } else {
+            ranges = format.supportedVideoZoomFactorsForDepthDataDelivery.map { $0...$0 }
+        }
+        let minZ = max(device.minAvailableVideoZoomFactor, displayScale)       // 不提供比主摄更广的倍率
+        let maxZ = min(format.videoMaxZoomFactor, device.maxAvailableVideoZoomFactor, 10 * displayScale)
+        if ranges.isEmpty && !device.isVirtualDevice { ranges = [minZ...maxZ] }
+        let clipped = ranges.compactMap { r -> ClosedRange<CGFloat>? in
+            let a = max(r.lowerBound, minZ), b = min(r.upperBound, maxZ)
+            return a <= b ? (a / displayScale)...(b / displayScale) : nil
+        }
+        return clipped.isEmpty ? [1...1] : clipped
+    }
+
+    /// 快捷焦段：1×、2×、3×、5× 里落在可用范围内的
+    private static func makeStops(range: ClosedRange<CGFloat>) -> [ZoomStop] {
+        var factors: [CGFloat] = [range.lowerBound]
+        for c: CGFloat in [1, 2, 3, 5] where range.contains(c) && !factors.contains(where: { abs($0 - c) < 0.05 }) {
+            factors.append(c)
+        }
+        return factors.sorted().prefix(4).map { ZoomStop(factor: $0, focalLength: ZoomScale.focalLength(for: $0)) }
+    }
+
+    /// sessionQueue：会话配置好以后，算出可用倍率并通知界面
+    private func refreshZoomCapabilities(device: AVCaptureDevice) {
+        // 广角+超广角的虚拟相机，设备倍率 1.0 是超广角，切到主摄的倍率就是「主摄 1×」
+        if device.deviceType == .builtInDualWideCamera || device.deviceType == .builtInTripleCamera,
+           let s = device.virtualDeviceSwitchOverVideoZoomFactors.first {
+            displayScale = CGFloat(truncating: s)
+        } else {
+            displayScale = 1
+        }
+        depthZoomRanges = Self.depthZoomRanges(for: device, displayScale: displayScale)
+        let lo = depthZoomRanges.map(\.lowerBound).min() ?? 1
+        let hi = depthZoomRanges.map(\.upperBound).max() ?? 1
+        let range = lo...max(lo, hi)
+        let start = Self.nearestSupported(ZoomScale(range: range).clamped(1), ranges: depthZoomRanges)
+        let applied = applyZoomOnSession(start)
+        let stops = Self.makeStops(range: range)
+        DispatchQueue.main.async {
+            self.zoomRange = range
+            self.zoomStops = stops
+            self.zoomFactor = applied
         }
     }
 
@@ -243,6 +374,7 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
         sync.setDelegate(self, queue: dataQueue)
         synchronizer = sync
 
+        refreshZoomCapabilities(device: device)
         session.startRunning()
         setStatus(depthFormats.isEmpty ? "当前格式没有深度数据" : "")
     }
@@ -275,13 +407,35 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
         lastFrameTime = t0
         let focusD = focusStabilizer.update(map: raw, nx: Float(p.x), ny: Float(p.y), dt: dt)
 
-        // 2. 双分辨率渲染：模糊在 1/blurDownscale 分辨率上算（含深度对齐），清晰部分用全分辨率原图
-        let lens = LensParameters(fNumber: fNumber, focusDisparity: focusD,
+        // 2. 主体太近：和系统相机一样关掉景深（0.15 秒淡出 / 淡入，进出留 12% 回差，避免在临界距离来回闪）
+        let distance = 1 / max(focusD, 1e-3)
+        let wasTooClose = tooCloseState
+        if tooCloseState {
+            if distance > minSubjectDistance * 1.12 { tooCloseState = false }
+        } else if distance < minSubjectDistance {
+            tooCloseState = true
+        }
+        if tooCloseState != wasTooClose {
+            let v = tooCloseState
+            DispatchQueue.main.async { self.isTooClose = v }
+        }
+        effectAmount += ((tooCloseState ? 0 : 1) - effectAmount) * Float(1 - exp(-dt / 0.15))
+
+        // 3. 双分辨率渲染：模糊在 1/blurDownscale 分辨率上算（含深度对齐），清晰部分用全分辨率原图
+        var lens = LensParameters(fNumber: fNumber, focusDisparity: focusD, model: lensModel,
                                   focalLength35mm: virtualFocalLength, focusTolerance: focusTolerance)
+        lens.blurK *= effectAmount
+        lens.maxBlurFraction *= effectAmount
         let lowSide = max(160, image.longSide / max(1, blurDownscale))
-        let out = renderer.renderDetailPreserving(full: image, disparity: raw, lens: lens,
+        let out: PlanarImage
+        if effectAmount < 0.02 {
+            out = image
+        } else {
+            let hint = keepSubjectSharp ? SubjectHint(point: (Float(p.x), Float(p.y))) : nil
+            out = renderer.renderDetailPreserving(full: image, disparity: raw, lens: lens,
                                                   lowLongSide: lowSide, quality: .preview, refinePasses: 1,
-                                                  temporal: temporal)
+                                                  temporal: temporal, subject: hint)
+        }
         let ui = ImageBridge.uiImage(from: out, orientation: previewOrientation)
 
         // 统计帧耗时
@@ -290,7 +444,7 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
         if frameTimes.count > 20 { frameTimes.removeFirst() }
         let avg = frameTimes.reduce(0, +) / Double(frameTimes.count)
         let text = String(format: "%d×%d（模糊 %d）· %.0f ms/帧 · 对焦 %.2f m",
-                          image.width, image.height, lowSide, avg, 1 / focusD)
+                          image.width, image.height, lowSide, avg, distance)
         DispatchQueue.main.async {
             self.previewImage = ui
             self.statusText = text

@@ -25,7 +25,10 @@ public final class BokehRenderer {
     public var captureDebugMaps = false
     public internal(set) var debugWeights: FloatMap?
     public internal(set) var debugLowDisparity: FloatMap?
+    public internal(set) var debugMatte: FloatMap?
 
+    // ---
+    
 
     public init() {}
 
@@ -100,9 +103,9 @@ public final class BokehRenderer {
         }
 
         // ---- 3. 高光提亮 ----
-        // 照片里的灯珠、反光点在传感器上早就过曝成 255 了，真实亮度可能是它的几十倍。
+        // 照片里的灯珠、反光点在传感器上早就过曝了，真实亮度可能是它的几十倍。
         // 不提亮的话，模糊后它们会被平均成灰蒙蒙的一片，而不是明亮的光斑。
-        // 只提亮「小面积」的亮点：大块的白墙、白纸不算高光（否则整张图焦外发白）。
+        // 只提亮「比周围亮得多」的地方：大块的白墙、白纸不算高光（否则整张图焦外发白）。
         var br = image.r, bg = image.g, bb = image.b
         let thr = quality.highlightThreshold, gain = quality.highlightGain
         if gain > 0 {
@@ -113,41 +116,42 @@ public final class BokehRenderer {
                 maxC[i] = m
                 brightMask[i] = m > thr ? 1 : 0
             }
-            // 每个像素周围亮像素所占比例：小亮点周围比例低，大块亮区比例高。
-            // 窗口要比常见灯具的尺寸大（长边的 1/50），否则一盏椭圆形筒灯中间会被当成「大面积」，
-            // 只有两头被提亮，虚化后变成两个分开的光斑
+            // 窗口要比常见灯具的尺寸大（长边的 1/25），否则一盏椭圆形筒灯中间会被当成「大面积」
             let windowR = max(3, L / 25)
-            var brightFraction = BoxFilter.mean(brightMask, width: w, height: h, radius: windowR)
-            // 局部平均亮度：真正的点光源比周围亮得多；锐化造成的边缘亮线只比周围亮一点
+            // 局部平均亮度：真正的光源比周围亮得多
             var localMean = BoxFilter.mean(maxC, width: w, height: h, radius: windowR)
-            // 按深度分组再统计一次：只和「同一深度」的邻居比。
-            // 例如人站在过曝的窗户前，肩膀和脖子之间漏出来的一小块窗户，和周围的人比是小亮点，
-            // 但和同样在背景深度上的窗户比，它只是大块亮区的一部分，不应该变成发光的光斑
-            let groups = min(7, layerCount)
-            if groups > 1 {
-                var bin = [UInt8](repeating: 0, count: n)
-                var hasCandidate = [Bool](repeating: false, count: groups)
-                let scale = Float(groups - 1) / Float(max(1, layerCount - 1))
-                for i in 0..<n {
-                    let b = min(groups - 1, max(0, Int(((Float(lo[i]) + tt[i]) * scale).rounded())))
-                    bin[i] = UInt8(b)
-                    if maxC[i] > thr { hasCandidate[b] = true }
-                }
-                for b in 0..<groups where hasCandidate[b] {
-                    var mask = [Float](repeating: 0, count: n)
-                    var mb = [Float](repeating: 0, count: n)
-                    var mx = [Float](repeating: 0, count: n)
-                    for i in 0..<n where Int(bin[i]) == b { mask[i] = 1; mb[i] = brightMask[i]; mx[i] = maxC[i] }
-                    let cnt = BoxFilter.mean(mask, width: w, height: h, radius: windowR)
-                    let fb = BoxFilter.mean(mb, width: w, height: h, radius: windowR)
-                    let fm = BoxFilter.mean(mx, width: w, height: h, radius: windowR)
-                    for i in 0..<n where Int(bin[i]) == b && maxC[i] > thr && cnt[i] > 0.25 {
-                        let inv = 1 / cnt[i]
-                        brightFraction[i] = max(brightFraction[i], fb[i] * inv)
-                        localMean[i] = max(localMean[i], fm[i] * inv)
+            var brightFraction = [Float](repeating: 0, count: n)
+            if !quality.smoothHighlights {
+                // 旧算法：再加「亮像素占比」和按深度分组的统计。门限是硬的，灯管这类亮度在门限附近的光源
+                // 会随噪声、曝光一段一段地亮暗跳变（实测预览里灯管一节一节地闪）
+                brightFraction = BoxFilter.mean(brightMask, width: w, height: h, radius: windowR)
+                let groups = min(7, layerCount)
+                if groups > 1 {
+                    var bin = [UInt8](repeating: 0, count: n)
+                    var hasCandidate = [Bool](repeating: false, count: groups)
+                    let scale = Float(groups - 1) / Float(max(1, layerCount - 1))
+                    for i in 0..<n {
+                        let b = min(groups - 1, max(0, Int(((Float(lo[i]) + tt[i]) * scale).rounded())))
+                        bin[i] = UInt8(b)
+                        if maxC[i] > thr { hasCandidate[b] = true }
+                    }
+                    for b in 0..<groups where hasCandidate[b] {
+                        var mask = [Float](repeating: 0, count: n)
+                        var mb = [Float](repeating: 0, count: n)
+                        var mx = [Float](repeating: 0, count: n)
+                        for i in 0..<n where Int(bin[i]) == b { mask[i] = 1; mb[i] = brightMask[i]; mx[i] = maxC[i] }
+                        let cnt = BoxFilter.mean(mask, width: w, height: h, radius: windowR)
+                        let fb = BoxFilter.mean(mb, width: w, height: h, radius: windowR)
+                        let fm = BoxFilter.mean(mx, width: w, height: h, radius: windowR)
+                        for i in 0..<n where Int(bin[i]) == b && maxC[i] > thr && cnt[i] > 0.25 {
+                            let inv = 1 / cnt[i]
+                            brightFraction[i] = max(brightFraction[i], fb[i] * inv)
+                            localMean[i] = max(localMean[i], fm[i] * inv)
+                        }
                     }
                 }
             }
+            let smooth = quality.smoothHighlights
             var boost = [Float](repeating: 1, count: n)
             boost.withUnsafeMutableBufferPointer { op in
             s.withUnsafeBufferPointer { sp in
@@ -157,12 +161,20 @@ public final class BokehRenderer {
                         let i = y * w + x
                         let m = maxC[i]
                         if m <= thr { continue }
-                        let k = Self.smoothstep(thr, 1, m)
-                        let small = 1 - Self.smoothstep(0.15, 0.5, brightFraction[i])
-                        let contrast = Self.smoothstep(0.1, 0.3, m - localMean[i])
                         // 只对要被虚化的像素提亮，清晰区域保持原样
                         let blurAmount = min(1, abs(S[i]) / 2)
-                        O[i] = 1 + gain * k * small * contrast * blurAmount
+                        if smooth {
+                            // 新算法：提亮量随亮度、对比度平滑变化（过渡带宽 0.4，旧的只有 0.1），
+                            // 亮度有 1% 的波动，提亮量只变 2–3%，而不是 20%
+                            let k = Self.smoothstep(thr, 1, m)
+                            let contrast = Self.smoothstep(0.1, 0.4, m - localMean[i])
+                            O[i] = 1 + gain * k * k * contrast * blurAmount
+                        } else {
+                            let k = Self.smoothstep(thr, 1, m)
+                            let small = 1 - Self.smoothstep(0.15, 0.5, brightFraction[i])
+                            let contrast = Self.smoothstep(0.1, 0.3, m - localMean[i])
+                            O[i] = 1 + gain * k * small * contrast * blurAmount
+                        }
                     }
                 }
             }}

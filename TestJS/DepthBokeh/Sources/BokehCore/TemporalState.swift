@@ -20,12 +20,43 @@ public final class TemporalState {
     var boost: [Float] = []
     /// 当前帧每个像素沿用上一帧的比例（由 prepare 算出，render 里给高光用）
     var blend: [Float] = []
+    /// 焦外区域的时间平滑强度（0 = 关闭）。只作用在已经虚化的地方：
+    /// 灯管在卷帘快门下的明暗条纹、深度噪声、高光提亮的小波动都会让焦外光斑一闪一闪，
+    /// 而焦外本来就没有细节，沿用一部分上一帧看不出拖影；清晰的主体完全不受影响
+    public var backgroundStrength: Float = 0.7
+    /// 相邻两帧焦外颜色的相对差异超过它，就认为是画面真的变了（运动），不再沿用
+    public var backgroundSigma: Float = 0.25
+    var bokehR: [Float] = [], bokehG: [Float] = [], bokehB: [Float] = []
 
     public init() {}
 
     public func reset() {
         width = 0; height = 0
         luma = []; disparity = []; boost = []; blend = []
+        bokehR = []; bokehG = []; bokehB = []
+    }
+
+    /// 低分辨率虚化结果的时间平滑。w 是每个像素的虚化程度（0 清晰 … 1 完全虚化）
+    func stabilizeBokeh(_ img: inout PlanarImage, defocus w: [Float]) {
+        let n = img.pixelCount
+        guard backgroundStrength > 0, bokehR.count == n, w.count == n else {
+            bokehR = img.r; bokehG = img.g; bokehB = img.b
+            return
+        }
+        let s = backgroundStrength, inv = 1 / backgroundSigma
+        for i in 0..<n {
+            let wi = w[i]
+            if wi <= 0.01 { continue }
+            let r = img.r[i], g = img.g[i], b = img.b[i]
+            let pr = bokehR[i], pg = bokehG[i], pb = bokehB[i]
+            let ref = 0.04 + max(max(r, g), max(b, max(pr, max(pg, pb))))
+            let d = max(abs(r - pr), max(abs(g - pg), abs(b - pb))) / ref * inv
+            let beta = s * wi * expf(-d * d)
+            img.r[i] = r + beta * (pr - r)
+            img.g[i] = g + beta * (pg - g)
+            img.b[i] = b + beta * (pb - b)
+        }
+        bokehR = img.r; bokehG = img.g; bokehB = img.b
     }
 
     /// 根据这一帧的亮度算出 blend，并把视差向上一帧靠拢。返回稳定后的视差

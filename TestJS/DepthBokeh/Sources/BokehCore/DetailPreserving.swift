@@ -1,5 +1,15 @@
 import Foundation
 
+/// 对焦主体的提示：对焦点位置 + 主体遮罩参数（见 SubjectMatte）
+public struct SubjectHint {
+    public var point: (Float, Float)?
+    public var parameters: SubjectMatteParameters
+    public init(point: (Float, Float)?, parameters: SubjectMatteParameters = SubjectMatteParameters()) {
+        self.point = point
+        self.parameters = parameters
+    }
+}
+
 extension BokehRenderer {
 
     /// 双分辨率渲染：模糊在低分辨率上算，清晰部分用全分辨率原图。
@@ -18,12 +28,17 @@ extension BokehRenderer {
     ///   - temporal: 实时预览传同一个对象进来，跨帧稳定深度边缘和光斑；拍照编辑传 nil
     public func renderDetailPreserving(full: PlanarImage, disparity: FloatMap, lens: LensParameters,
                                        lowLongSide: Int, quality: RenderQuality = .preview,
-                                       refinePasses: Int = 1, temporal: TemporalState? = nil) -> PlanarImage {
+                                       refinePasses: Int = 1, temporal: TemporalState? = nil,
+                                       subject: SubjectHint? = nil) -> PlanarImage {
         let scale = Float(lowLongSide) / Float(full.longSide)
         if scale >= 0.95 {
             let luma = full.perceptualLuma()
             var d = DepthRefiner.refine(disparity: disparity, guide: full, passes: refinePasses, guideLuma: luma)
             if let t = temporal { d = t.prepare(luma: luma.values, disparity: d) }
+            if let sh = subject {
+                d = SubjectMatte.apply(disparity: d, image: full, focusDisparity: lens.focusDisparity,
+                                       focusPoint: sh.point, parameters: sh.parameters).0
+            }
             return render(image: full, disparity: d, lens: lens, quality: quality, temporal: temporal)
         }
         let W = full.width, H = full.height
@@ -32,7 +47,13 @@ extension BokehRenderer {
         let lowLuma = low.perceptualLuma()
         var dLow = DepthRefiner.refine(disparity: disparity, guide: low, passes: refinePasses, guideLuma: lowLuma)
         if let t = temporal { dLow = t.prepare(luma: lowLuma.values, disparity: dLow) }
-        let bokeh = render(image: low, disparity: dLow, lens: lens, quality: quality, temporal: temporal)
+        var matte: FloatMap?
+        if let sh = subject {
+            let res = SubjectMatte.apply(disparity: dLow, image: low, focusDisparity: lens.focusDisparity,
+                                         focusPoint: sh.point, parameters: sh.parameters)
+            dLow = res.0; matte = res.1
+        }
+        var bokeh = render(image: low, disparity: dLow, lens: lens, quality: quality, temporal: temporal)
 
         // 低分辨率上的虚化程度 w
         let Ll = low.longSide
@@ -44,9 +65,12 @@ extension BokehRenderer {
             let spill = Self.smoothstep(0.015, 0.06, diff)
             w[i] = max(own, spill)
         }
+        // 焦外的时间平滑（实时预览）
+        temporal?.stabilizeBokeh(&bokeh, defocus: w)
         if captureDebugMaps {
             debugWeights = FloatMap(width: lw, height: lh, values: w)
             debugLowDisparity = dLow
+            debugMatte = matte
         }
 
         // 双线性插值表（像素中心对齐）

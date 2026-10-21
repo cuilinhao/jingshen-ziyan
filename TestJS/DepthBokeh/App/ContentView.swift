@@ -2,7 +2,9 @@ import SwiftUI
 import UIKit
 import BokehCamera
 
-/// 取景界面：实时虚化预览 + 景深（ƒ）滑块 + 点按对焦 + 快门
+/// 取景界面：实时虚化预览 + 焦段调节 + 景深（ƒ）滑块 + 点按对焦 + 快门
+/// 焦段调节的界面和交互直接复用 DepthBokehCamera 2 的 ContinuousZoomControl：
+/// 点数字跳到对应焦段，左右拖动或长按展开刻度，松手约 1 秒收起
 struct ContentView: View {
     @StateObject private var camera = DepthCameraController()
     @State private var sliderValue: Double = ApertureScale.position(for: 2.8)
@@ -19,6 +21,24 @@ struct ContentView: View {
                 .frame(height: 16)
 
             preview
+                .overlay(alignment: .top) {
+                    if camera.isTooClose {
+                        Text("离远一点")
+                            .font(.subheadline.weight(.semibold))
+                            .padding(.horizontal, 12).padding(.vertical, 6)
+                            .background(.yellow, in: Capsule())
+                            .foregroundStyle(.black)
+                            .padding(.top, 12)
+                            .transition(.opacity)
+                    }
+                }
+                .animation(.easeInOut(duration: 0.2), value: camera.isTooClose)
+
+            ContinuousZoomControl(zoomFactor: camera.zoomFactor, range: camera.zoomRange, stops: camera.zoomStops,
+                                  isEnabled: camera.zoomRange.upperBound > camera.zoomRange.lowerBound) { factor in
+                camera.setZoomFactor(factor)
+            }
+            .padding(.horizontal, 16)
 
             VStack(spacing: 6) {
                 Text("景深")
