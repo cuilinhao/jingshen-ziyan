@@ -80,6 +80,80 @@ func writePPM(_ img: PlanarImage, _ path: String) throws {
 
 var args = Array(CommandLine.arguments.dropFirst())
 
+/// 读 PPM 的原始 RGB 字节（模拟相机帧，交给 PlanarImage.cameraFrame 裁切缩放，和 App 里同一份代码）
+func readPPMBytes(_ path: String) throws -> (bytes: [UInt8], width: Int, height: Int) {
+    let data = try Data(contentsOf: URL(fileURLWithPath: path))
+    var idx = 0
+    func token() -> String {
+        var s = ""
+        while idx < data.count {
+            let c = data[idx]
+            if c == UInt8(ascii: "#") { while idx < data.count && data[idx] != 10 { idx += 1 }; continue }
+            if c == 32 || c == 10 || c == 13 || c == 9 { if !s.isEmpty { break }; idx += 1; continue }
+            s.append(Character(UnicodeScalar(c))); idx += 1
+        }
+        return s
+    }
+    guard token() == "P6" else { throw NSError(domain: "ppm", code: 1) }
+    let w = Int(token())!, h = Int(token())!
+    _ = token()
+    idx += 1
+    return (Array(data[idx..<(idx + w * h * 3)]), w, h)
+}
+
+// 实时预览模拟：bokeh-cli --live -
+// 每行一个 JSON：{"img": 相机整帧.ppm, "depth": 整帧视差.pfm 或 "", "out": 输出.ppm, "f": 1.4, "crop": 1.0,
+//               "rel": false, "fx": 0.5, "fy": 0.5, "tap": false, "t": 秒, "reset": false, "mask": 人像遮罩.pfm 或 "",
+//               "long": 1440}
+// 和 App 的 DepthCameraController 走同一个 LivePreviewPipeline。每帧输出一行 JSON（对焦、耗时）
+if args.first == "--live" {
+    args.removeFirst()
+    let pipeline = LivePreviewPipeline()
+    while let line = readLine() {
+        guard let data = line.data(using: .utf8),
+              let job = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { continue }
+        let t0 = Double(DispatchTime.now().uptimeNanoseconds) / 1e9
+        if job["reset"] as? Bool == true { pipeline.resetHistory() }
+        if let g = job["grow"] as? Double { pipeline.settings.matte.colorGrowth = Float(g) }
+        if let m = job["motion"] as? Double { pipeline.temporal.motionCutoff = Float(m) }
+        if let v = job["tstrength"] as? Double { pipeline.temporal.strength = Float(v) }
+        if let v = job["bstrength"] as? Double { pipeline.temporal.backgroundStrength = Float(v) }
+        if let v = job["hold"] as? Double { pipeline.maxHoldOverride = v }
+        let frame = try readPPMBytes(job["img"] as! String)
+        let crop = Float(job["crop"] as? Double ?? 1)
+        let longSide = job["long"] as? Int ?? 1440
+        let image = frame.bytes.withUnsafeBytes { raw in
+            PlanarImage.cameraFrame(interleaved8: raw.baseAddress!, width: frame.width, height: frame.height,
+                                    bytesPerRow: frame.width * 3, layout: .rgb, longSide: longSide, crop: crop)
+        }
+        let t1 = Double(DispatchTime.now().uptimeNanoseconds) / 1e9
+        let depthPath = job["depth"] as? String ?? ""
+        let disparity = depthPath.isEmpty ? nil : try readPFM(depthPath)
+        let maskPath = job["mask"] as? String ?? ""
+        let mask = maskPath.isEmpty ? nil : try readPFM(maskPath)
+        let input = LivePreviewPipeline.Frame(
+            image: image, disparity: disparity, relativeDepth: job["rel"] as? Bool ?? false, crop: crop,
+            fNumber: Float(job["f"] as? Double ?? 2.8),
+            focusPoint: (Float(job["fx"] as? Double ?? 0.5), Float(job["fy"] as? Double ?? 0.5)),
+            focusTapped: job["tap"] as? Bool ?? false, time: job["t"] as? Double ?? 0, personMask: mask)
+        let r = pipeline.process(input)
+        let t2 = Double(DispatchTime.now().uptimeNanoseconds) / 1e9
+        if let out = job["out"] as? String, !out.isEmpty { try writePPM(r.image, out) }
+        var info: [String: Any] = ["out": job["out"] as? String ?? "", "w": r.image.width, "h": r.image.height,
+                                   "fx": r.focusPoint.x, "fy": r.focusPoint.y, "recentered": r.focusRecentered,
+                                   "tooClose": r.tooClose, "moving": r.cameraMoving,
+                                   "shift": pipeline.temporal.cameraShift,
+                                   "ms_frame": (t1 - t0) * 1000, "ms_pipeline": (t2 - t1) * 1000]
+        if let d = r.focusDisparity { info["focusD"] = d }
+        if let d = r.focusDistance { info["focusM"] = d }
+        for (k, v) in r.timings { info["ms_" + k] = v }
+        let json = try JSONSerialization.data(withJSONObject: info, options: [.sortedKeys])
+        print(String(data: json, encoding: .utf8)!)
+        fflush(stdout)
+    }
+    exit(0)
+}
+
 // 批处理：bokeh-cli --batch jobs.txt [--temporal] [其它参数]
 // jobs.txt 每行：输入.ppm 视差.pfm 输出.ppm ƒ值 对焦视差。同一个进程按顺序渲染，模拟 App 里的连续预览
 if args.first == "--batch" {

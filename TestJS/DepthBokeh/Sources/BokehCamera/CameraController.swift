@@ -19,6 +19,8 @@ public struct CapturedDepthPhoto: Identifiable {
     public let fNumber: Float
     /// 视差只有相对值（双摄视差 / AI 单目深度），不能换算成米
     public let isRelativeDepth: Bool
+    /// 人像分割遮罩（传感器方向，0…1），画面里没人时为 nil
+    public let personMask: FloatMap?
 }
 
 /// 实时景深相机。
@@ -151,16 +153,16 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
     private var isConfigured = false
 
     // MARK: - 每帧状态（只在 dataQueue 上访问）
-    private let renderer = BokehRenderer()
+    /// 每帧的对焦、虚化、跨帧稳定（纯 Swift，云主机上的模拟测试跑的是同一份代码）
+    private let pipeline = LivePreviewPipeline()
     private var acceptedVideoOutput: AVCaptureVideoDataOutput?
     private var acceptedSynchronizer: AVCaptureDataOutputSynchronizer?
-    private var focusStabilizer = FocusStabilizer()
-    /// 跨帧稳定深度边缘和焦外光斑（静止时不闪，运动时不拖影）
-    private let temporal = TemporalState()
-    private var effectAmount: Float = 1
     private var tooCloseState = false
-    private var lastFrameTime: CFTimeInterval?
     private var frameTimes: [Double] = []
+    /// 拍完照、在编辑器里调景深时暂停预览处理（省电、不发热，编辑器渲染也更快）
+    private var previewPaused = false
+    /// 人像分割（Vision）：对焦在人身上时，整个人（包括伸出脸外的眼镜框）保持清晰
+    private let segmenter = PersonSegmenter()
     /// 当前相机的视场倍率（每帧都按它和 previewZoom 算裁切）
     private var streamZoom: CGFloat = 1
     private var depthEnabled = false
@@ -174,8 +176,6 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
     private var lastMonoMap: FloatMap?
     private var monoRange: DepthRange?
     private var monoCounter = 0
-    private var smoothedNear: Float?
-    private var smoothedFar: Float?
     private var frameZoomRevision = 0
     private var minimumFrameTimestamp = CMTime.invalid
     private var notifyZoomFrame = false
@@ -217,6 +217,21 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
         sessionQueue.async {
             if self.session.isRunning { self.session.stopRunning() }
         }
+    }
+
+    /// 暂停 / 恢复预览处理（相机不关，恢复时马上有画面）。打开照片编辑器时暂停：
+    /// 预览每帧要占满好几个 CPU 核，和编辑器的全分辨率渲染抢 CPU，手机发热后整体降频，回到取景时就会卡
+    public func setPreviewPaused(_ paused: Bool) {
+        dataQueue.async {
+            guard self.previewPaused != paused else { return }
+            self.previewPaused = paused
+            if !paused { self.pipeline.resetHistory() }
+        }
+    }
+
+    /// 编辑器已经拿到照片：释放这张照片（全分辨率浮点图约 80 MB）
+    public func clearLastPhoto() {
+        lastPhoto = nil
     }
 
     // MARK: - 对焦
@@ -694,14 +709,11 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
 
     /// dataQueue：深度、对焦、时间平滑的历史都和具体的相机画面绑定
     private func resetDepthHistory() {
-        temporal.reset()
-        focusStabilizer = FocusStabilizer()
+        pipeline.resetHistory()
         lastMonoMap = nil
         monoRange = nil
         monoCounter = 0
-        smoothedNear = nil
-        smoothedFar = nil
-        lastFrameTime = nil
+        segmenter.reset()
     }
 
     private func setStatus(_ text: String) {
@@ -719,7 +731,8 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
 
     private func processFrame(_ sampleBuffer: CMSampleBuffer, depthData: AVDepthData?) {
         let timestamp = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
-        guard !minimumFrameTimestamp.isValid || CMTimeCompare(timestamp, minimumFrameTimestamp) >= 0,
+        guard !previewPaused,
+              !minimumFrameTimestamp.isValid || CMTimeCompare(timestamp, minimumFrameTimestamp) >= 0,
               let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
         let t0 = CACurrentMediaTime()
 
@@ -785,7 +798,11 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
         }
         let crop = max(1, zoomNow / max(streamZoom, 0.01))
         let frameZoom = streamZoom * crop
-        let image = ImageBridge.planarImage(from: pixelBuffer, longSide: previewLongSide, crop: crop)
+        // 发热降频时减少每帧的计算量（模糊部分的分辨率降到 1/4，严重时预览也降到 1080），保持跟手
+        let thermal = ProcessInfo.processInfo.thermalState
+        let hot = thermal == .serious || thermal == .critical
+        let longSide = thermal == .critical ? min(previewLongSide, 1080) : previewLongSide
+        let image = ImageBridge.planarImage(from: pixelBuffer, longSide: longSide, crop: crop)
         lastFrameCrop = crop
 
         guard let fullDisparity = disparity else {
@@ -794,82 +811,52 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
                     firstRouteFrame: firstRouteFrame, source: source, text: noDepthText())
             return
         }
-        let map = fullDisparity.centerCropped(by: Float(crop))
 
-        // 5. 对焦点（相机画面坐标）换到裁出来的画面里；已经裁到画面外了就回到中心
+        // 人像分割在单独的队列上跑（用上一次的结果，不增加这一帧的延迟）
+        if keepSubjectSharp { segmenter.update(with: pixelBuffer) }
+
+        // 对焦点（相机画面坐标）
         paramLock.lock()
-        var p = _focusPoint
-        var resetFocus = focusResetPending
+        let p = _focusPoint
+        let tapped = focusResetPending
         focusResetPending = false
-        let c = CGFloat(crop)
-        var leftFrame = false
-        if abs(p.x - 0.5) * c > 0.5 || abs(p.y - 0.5) * c > 0.5 {
-            p = CGPoint(x: 0.5, y: 0.5)
-            _focusPoint = p
-            resetFocus = true
-            leftFrame = true
-        }
         paramLock.unlock()
-        if leftFrame { sessionQueue.async { self.focusDeviceAtCenter() } }
-        let fx = Float(0.5 + (p.x - 0.5) * c), fy = Float(0.5 + (p.y - 0.5) * c)
-        if resetFocus { focusStabilizer.reset() }
-        let dt = lastFrameTime.map { min(0.2, t0 - $0) } ?? (1.0 / 30)
-        lastFrameTime = t0
-        // 对焦稳定器：主体晃出那个点时不会立刻跳焦；换焦是平滑拉焦
-        let focusD = focusStabilizer.update(map: map, nx: fx, ny: fy, dt: dt)
 
-        // 6. 主体太近：和系统相机一样关掉景深（0.15 秒淡出 / 淡入，进出留 12% 回差）。只有绝对深度能换算成米
-        let distance = relative ? Float.nan : 1 / max(focusD, 1e-3)
-        let wasTooClose = tooCloseState
-        if relative {
-            tooCloseState = false
-        } else if tooCloseState {
-            if distance > minSubjectDistance * 1.12 { tooCloseState = false }
-        } else if distance < minSubjectDistance {
-            tooCloseState = true
+        var settings = pipeline.settings
+        settings.blurDownscale = hot ? max(blurDownscale, 4) : blurDownscale
+        settings.focusTolerance = focusTolerance
+        settings.lensModel = lensModel
+        settings.virtualFocalLength = virtualFocalLength
+        settings.keepSubjectSharp = keepSubjectSharp
+        settings.minSubjectDistance = minSubjectDistance
+        pipeline.settings = settings
+        let result = pipeline.process(LivePreviewPipeline.Frame(
+            image: image, disparity: fullDisparity, relativeDepth: relative, crop: Float(crop), fNumber: fNumber,
+            focusPoint: (Float(p.x), Float(p.y)), focusTapped: tapped, time: t0,
+            personMask: keepSubjectSharp ? segmenter.latestMask : nil))
+
+        if result.focusRecentered {
+            // 原来的对焦点已经裁到画面外：回到中心，镜头也回到连续自动对焦
+            paramLock.lock()
+            if !focusResetPending && _focusPoint == p { _focusPoint = CGPoint(x: 0.5, y: 0.5) }
+            paramLock.unlock()
+            sessionQueue.async { self.focusDeviceAtCenter() }
         }
-        if tooCloseState != wasTooClose {
-            let v = tooCloseState
+        if result.tooClose != tooCloseState {
+            tooCloseState = result.tooClose
+            let v = result.tooClose
             DispatchQueue.main.async { self.isTooClose = v }
         }
-        effectAmount += ((tooCloseState ? 0 : 1) - effectAmount) * Float(1 - exp(-dt / 0.15))
-
-        // 7. 相对深度（双摄视差 / AI 深度）：相对距离的分母用 max(d_f, 0.25 × (近端 − 远端))
-        var relativeScale: Float?
-        if relative, let range = map.percentiles(0.05, 0.95) {
-            let near = smoothedNear.map { $0 + (range.high - $0) * 0.15 } ?? range.high
-            let far = smoothedFar.map { $0 + (range.low - $0) * 0.15 } ?? range.low
-            smoothedNear = near
-            smoothedFar = far
-            relativeScale = max(focusD, 0.25 * (near - far))
-        }
-
-        // 8. 双分辨率渲染：模糊在 1/blurDownscale 分辨率上算（含深度对齐），清晰部分用全分辨率原图
-        var lens = LensParameters(fNumber: fNumber, focusDisparity: focusD, model: lensModel,
-                                  focalLength35mm: virtualFocalLength, focusTolerance: focusTolerance,
-                                  relativeScale: relativeScale)
-        lens.blurK *= effectAmount
-        lens.maxBlurFraction *= effectAmount
-        let lowSide = max(160, image.longSide / max(1, blurDownscale))
-        let out: PlanarImage
-        if effectAmount < 0.02 {
-            out = image
-        } else {
-            let hint = keepSubjectSharp ? SubjectHint(point: (fx, fy)) : nil
-            out = renderer.renderDetailPreserving(full: image, disparity: map, lens: lens,
-                                                  lowLongSide: lowSide, quality: .preview, refinePasses: 1,
-                                                  temporal: temporal, subject: hint)
-        }
-        let ui = ImageBridge.uiImage(from: out, orientation: previewOrientation)
+        let ui = ImageBridge.uiImage(from: result.image, orientation: previewOrientation)
 
         // 统计帧耗时
         let ms = (CACurrentMediaTime() - t0) * 1000
         frameTimes.append(ms)
         if frameTimes.count > 20 { frameTimes.removeFirst() }
         let avg = frameTimes.reduce(0, +) / Double(frameTimes.count)
-        let focusText = relative ? source.label : String(format: "对焦 %.2f m", distance)
+        let focusText = result.focusDistance.map { String(format: "对焦 %.2f m", $0) } ?? source.label
         let text = String(format: "%@× · %d×%d · %.0f ms/帧 · ", Self.zoomText(frameZoom), image.width, image.height, avg)
-            + focusText
+            + focusText + (hot ? " · 降温中" : "")
         publish(ui, zoom: frameZoom, crop: crop, firstRouteFrame: firstRouteFrame, source: source, text: text)
     }
 
@@ -990,10 +977,12 @@ extension DepthCameraController: AVCapturePhotoCaptureDelegate {
             }
             // 没有深度（光线太暗、AI 模型没准备好）：整张图当作在对焦面上
             let hasDepth = disparity != nil
+            // 人像分割（高质量）：对焦在人身上时整个人保持清晰，和预览一致
+            let person = hasDepth ? PersonSegmenter.photoMask(cg) : nil
             let captured = CapturedDepthPhoto(image: image,
                                               disparity: disparity ?? FloatMap(width: 64, height: 48, repeating: 1),
                                               orientation: orientation, focusPoint: focus, fNumber: fNumber,
-                                              isRelativeDepth: relative)
+                                              isRelativeDepth: relative, personMask: person)
             DispatchQueue.main.async {
                 self.lastPhoto = captured
                 self.isCapturing = false

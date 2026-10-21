@@ -42,12 +42,26 @@
 ## 在电脑上调试算法
 
 ```bash
-swift test                                   # 5 个单元测试
+swift test                                   # 单元测试
 swift build -c release
 .build/release/bokeh-cli in.ppm disparity.pfm out.ppm --f 2.8 --focus 0.6,0.55
 ```
 
 输入是 8 位 PPM 图像和单通道 PFM 视差图（单位 1/米）。视差图分辨率可以比图像低，工具会自动补洞、上采样并做引导滤波。
+
+### 实时预览模拟（和 App 跑同一份代码）
+
+App 每帧的处理（变焦裁切、对焦稳定、主体太近、双摄相对视差、主体遮罩、人像分割、跨帧稳定、扫镜头检测）都在
+`BokehCore/LivePreviewPipeline.swift`，`DepthCameraController` 只负责相机和换镜头。电脑上用
+`bokeh-cli --live` 读录好的「相机整帧 + 深度」逐帧跑同一个 pipeline，每帧输出对焦、是否在扫镜头、各步骤耗时：
+
+```bash
+echo '{"img":"frame.ppm","depth":"depth.pfm","out":"out.ppm","f":1.4,"crop":1.5,"rel":true,"fx":0.5,"fy":0.5,"tap":true,"t":0}' \
+  | .build/release/bokeh-cli --live
+```
+
+`crop` 是从相机画面中间裁的倍数（两个深度倍率点之间的数码变焦），`rel` 表示视差是相对值（双摄 / AI），
+`reset: true` 模拟换相机，`mask` 可以传人像分割遮罩（PFM，0…1）。
 
 ## 算法
 

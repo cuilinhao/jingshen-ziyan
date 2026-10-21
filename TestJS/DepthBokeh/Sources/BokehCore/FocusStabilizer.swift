@@ -27,6 +27,9 @@ public struct FocusStabilizer {
     public var nearHold: Double = 0.3
     /// 换焦动画的时间常数（秒）
     public var smoothingTime: Double = 0.12
+    /// 手机正在移动（上下左右扫）：这时对焦点下面换了东西是因为镜头在动，而不是主体滑出去，
+    /// 变远时也只坚持 `nearHold`，否则扫过去时虚化要过 1.5 秒才跟上，看起来像延迟
+    public var cameraMoving = false
 
     private var anchor: Float?
     private var diverged: Double = 0
@@ -70,7 +73,7 @@ public struct FocusStabilizer {
             return c
         }
         diverged += dt
-        let hold = c > a ? nearHold : maxHold
+        let hold = c > a || cameraMoving ? nearHold : maxHold
         if diverged < hold {
             let around = Self.samples(map, nx, ny, searchWindow)
             var near = around.filter { abs($0 - a) <= relativeTolerance * a }

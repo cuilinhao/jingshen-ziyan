@@ -105,38 +105,52 @@ public enum DepthRefiner {
 /// O(1) 每像素的盒式均值滤波（可分离，行列各一次滑动求和）
 enum BoxFilter {
     static func mean(_ src: [Float], width w: Int, height h: Int, radius r: Int) -> [Float] {
-        var tmp = [Float](repeating: 0, count: w * h)
-        var out = [Float](repeating: 0, count: w * h)
+        let n = w * h
+        guard n > 0 else { return [] }
+        var tmp = [Float](repeating: 0, count: n)
+        var out = [Float](repeating: 0, count: n)
         src.withUnsafeBufferPointer { sp in
         tmp.withUnsafeMutableBufferPointer { tp in
             let S = sp.baseAddress!, T = tp.baseAddress!
-            // 水平方向
+            // 水平方向：每行一个滑动窗口
             parallelFor(h) { y in
                 let row = S + y * w, dst = T + y * w
-                var acc: Double = 0
-                for x in 0...min(r, w - 1) { acc += Double(row[x]) }
+                var acc: Float = 0
+                for x in 0...min(r, w - 1) { acc += row[x] }
                 for x in 0..<w {
                     let lo = max(0, x - r), hi = min(w - 1, x + r)
-                    dst[x] = Float(acc / Double(hi - lo + 1))
+                    dst[x] = acc / Float(hi - lo + 1)
                     let add = x + r + 1, sub = x - r
-                    if add < w { acc += Double(row[add]) }
-                    if sub >= 0 { acc -= Double(row[sub]) }
+                    if add < w { acc += row[add] }
+                    if sub >= 0 { acc -= row[sub] }
                 }
             }
         }}
         tmp.withUnsafeBufferPointer { tp in
         out.withUnsafeMutableBufferPointer { op in
             let T = tp.baseAddress!, O = op.baseAddress!
-            // 垂直方向
-            parallelFor(w) { x in
-                var acc: Double = 0
-                for y in 0...min(r, h - 1) { acc += Double(T[y * w + x]) }
-                for y in 0..<h {
-                    let lo = max(0, y - r), hi = min(h - 1, y + r)
-                    O[y * w + x] = Float(acc / Double(hi - lo + 1))
-                    let add = y + r + 1, sub = y - r
-                    if add < h { acc += Double(T[add * w + x]) }
-                    if sub >= 0 { acc -= Double(T[sub * w + x]) }
+            // 垂直方向：按列分块，每块维护一行「列和」，逐行向下滑动（按行连续访问内存，比逐列快）
+            let bands = max(1, min(8, w / 32))
+            DispatchQueue.concurrentPerform(iterations: bands) { band in
+                let x0 = band * w / bands, x1 = (band + 1) * w / bands
+                let bw = x1 - x0
+                guard bw > 0 else { return }
+                var col = [Float](repeating: 0, count: bw)
+                col.withUnsafeMutableBufferPointer { cp in
+                    let C = cp.baseAddress!
+                    for y in 0...min(r, h - 1) {
+                        let row = T + y * w + x0
+                        for x in 0..<bw { C[x] += row[x] }
+                    }
+                    for y in 0..<h {
+                        let lo = max(0, y - r), hi = min(h - 1, y + r)
+                        let inv = 1 / Float(hi - lo + 1)
+                        let dst = O + y * w + x0
+                        for x in 0..<bw { dst[x] = C[x] * inv }
+                        let add = y + r + 1, sub = y - r
+                        if add < h { let row = T + add * w + x0; for x in 0..<bw { C[x] += row[x] } }
+                        if sub >= 0 { let row = T + sub * w + x0; for x in 0..<bw { C[x] -= row[x] } }
+                    }
                 }
             }
         }}

@@ -73,9 +73,13 @@ struct ContentView: View {
         .onDisappear { camera.stop() }
         .onChange(of: sliderValue) { _, _ in camera.fNumber = fNumber }
         .onReceive(camera.$lastPhoto) { photo in
-            if let photo { editingPhoto = photo }
+            guard let photo else { return }
+            // 编辑器打开期间暂停预览处理（不和编辑器抢 CPU，也不让手机一直发热），照片交给编辑器后释放
+            camera.setPreviewPaused(true)
+            editingPhoto = photo
+            DispatchQueue.main.async { camera.clearLastPhoto() }   // 不能在 lastPhoto 的发布回调里直接改它
         }
-        .fullScreenCover(item: $editingPhoto) { photo in
+        .fullScreenCover(item: $editingPhoto, onDismiss: { camera.setPreviewPaused(false) }) { photo in
             PhotoEditorView(photo: photo)
         }
     }

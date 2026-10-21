@@ -29,15 +29,8 @@ public enum ImageBridge {
         let h = CVPixelBufferGetHeight(pixelBuffer)
         let bpr = CVPixelBufferGetBytesPerRow(pixelBuffer)
         let base = CVPixelBufferGetBaseAddress(pixelBuffer)!
-        let c = crop.isFinite ? max(1, Double(crop)) : 1
-        let cw = Double(w) / c, ch = Double(h) / c
-        let s = min(1, Double(longSide) / max(cw, ch))
-        let ow = max(1, Int((cw * s).rounded()))
-        let oh = max(1, Int((ch * s).rounded()))
-        let rect: (x: Float, y: Float, width: Float, height: Float)? = c > 1.0005
-            ? (Float((Double(w) - cw) / 2), Float((Double(h) - ch) / 2), Float(cw), Float(ch)) : nil
-        return PlanarImage(interleaved8: UnsafeRawPointer(base), width: w, height: h, bytesPerRow: bpr,
-                           layout: .bgra, outputWidth: ow, outputHeight: oh, sourceRect: rect)
+        return PlanarImage.cameraFrame(interleaved8: UnsafeRawPointer(base), width: w, height: h, bytesPerRow: bpr,
+                                       layout: .bgra, longSide: longSide, crop: Float(crop))
     }
 
     /// 图像中间的 1/crop（传感器方向，任何旋转下都居中）

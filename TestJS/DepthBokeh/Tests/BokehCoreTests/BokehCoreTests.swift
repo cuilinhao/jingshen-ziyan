@@ -232,4 +232,68 @@ final class BokehCoreTests: XCTestCase {
         let abs1 = LensParameters(fNumber: 2, focusDisparity: 0.5)
         XCTAssertEqual(abs1.relativeDistance(0.25), -0.5, accuracy: 1e-6)
     }
+
+    /// 手机移动时整幅画面的平移量估计（扫镜头时不再沿用上一帧，避免拖影 / 延迟感）
+    func testGlobalShift() {
+        let w = 480, h = 360
+        var rng = SystemRandomNumberGenerator()
+        // 有纹理的图：随机块
+        var base = [Float](repeating: 0, count: (w + 16) * h)
+        for y in 0..<h { for x in 0..<(w + 16) { base[y * (w + 16) + x] = Float((x / 6 + y / 5 * 7) % 11) / 11 } }
+        _ = rng
+        func crop(_ dx: Int) -> [Float] {
+            var out = [Float](repeating: 0, count: w * h)
+            for y in 0..<h { for x in 0..<w { out[y * w + x] = base[y * (w + 16) + x + dx] } }
+            return out
+        }
+        let a = crop(4)
+        XCTAssertEqual(TemporalState.globalShift(a, a, width: w, height: h), 0)
+        let s = TemporalState.globalShift(crop(10), a, width: w, height: h)
+        XCTAssertEqual(s, 6, accuracy: 2.1)
+    }
+
+    /// 深度边界往里缩了一圈（双摄视差、4× 长焦常见）：颜色和主体一样的那一圈要补回主体
+    func testColorGrowthRestoresSubjectEdge() {
+        let w = 160, h = 120, n = w * h
+        var img = PlanarImage(width: w, height: h)
+        var d = [Float](repeating: 0.25, count: n)            // 背景 4 m
+        for y in 0..<h {
+            for x in 0..<w {
+                let i = y * w + x
+                let inBox = x >= 50 && x < 110 && y >= 30 && y < 100
+                if inBox {
+                    img.r[i] = 0.05; img.g[i] = 0.05; img.b[i] = 0.6   // 蓝色盒子
+                    if y >= 42 { d[i] = 1 }                            // 深度只覆盖到 y = 42，顶上 12 行拿到的是背景深度
+                } else {
+                    img.r[i] = 0.8; img.g[i] = 0.8; img.b[i] = 0.75   // 白色桌面
+                }
+            }
+        }
+        let disp = FloatMap(width: w, height: h, values: d)
+        var params = SubjectMatteParameters()
+        params.colorGrowth = 0
+        let off = SubjectMatte.apply(disparity: disp, image: img, focusDisparity: 1, focusPoint: (0.5, 0.6), parameters: params)
+        params.colorGrowth = 1.0 / 8
+        let on = SubjectMatte.apply(disparity: disp, image: img, focusDisparity: 1, focusPoint: (0.5, 0.6), parameters: params)
+        let strip = 33 * w + 80   // 盒子顶上那一圈里的像素
+        XCTAssertLessThan(off.1.values[strip], 0.5)
+        XCTAssertGreaterThan(on.1.values[strip], 0.9)
+        XCTAssertGreaterThan(on.0.values[strip], 0.9)          // 视差被拉回对焦面
+        // 背景不受影响
+        XCTAssertLessThan(on.1.values[10 * w + 10], 0.05)
+        XCTAssertLessThan(on.1.values[60 * w + 140], 0.05)
+    }
+
+    /// 人像遮罩：只保留对焦点所在的那个人；对焦点不在人身上时不起作用
+    func testPersonRegion() {
+        let w = 100, h = 80
+        var m = [Float](repeating: 0, count: w * h)
+        for y in 10..<70 { for x in 10..<30 { m[y * w + x] = 1 } }   // 人 A
+        for y in 10..<70 { for x in 60..<80 { m[y * w + x] = 1 } }   // 人 B
+        let mask = FloatMap(width: w, height: h, values: m)
+        let a = SubjectMatte.personRegion(mask, width: w, height: h, focusPoint: (0.2, 0.5))!
+        XCTAssertEqual(a[40 * w + 20], 1, accuracy: 1e-4)
+        XCTAssertEqual(a[40 * w + 70], 0, accuracy: 1e-4)
+        XCTAssertNil(SubjectMatte.personRegion(mask, width: w, height: h, focusPoint: (0.5, 0.5)))
+    }
 }

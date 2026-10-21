@@ -71,7 +71,8 @@ public final class PhotoBokehEditor: ObservableObject, @unchecked Sendable {
             let lens = LensParameters(fNumber: p.fNumber, focusDisparity: focusD, model: lensModel,
                                       focalLength35mm: virtualFocalLength, focusTolerance: focusTolerance,
                                       relativeScale: scale)
-            let hint = keepSubjectSharp ? SubjectHint(point: (Float(p.focus.x), Float(p.focus.y))) : nil
+            let hint = keepSubjectSharp
+                ? SubjectHint(point: (Float(p.focus.x), Float(p.focus.y)), personMask: photo.personMask) : nil
             let out = renderer.renderDetailPreserving(full: photo.image, disparity: photo.disparity, lens: lens,
                                                       lowLongSide: max(320, photo.image.longSide / max(1, blurDownscale)),
                                                       quality: .photo, refinePasses: 2, subject: hint)

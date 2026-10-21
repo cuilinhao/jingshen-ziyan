@@ -23,6 +23,8 @@ public final class BokehRenderer {
     public private(set) var lastRenderMilliseconds: Double = 0
     /// 调试用：打开后双分辨率渲染会把低分辨率的虚化程度 w 和细化后的视差留下来
     public var captureDebugMaps = false
+    /// 各步骤耗时（毫秒），每次 renderDetailPreserving 重新填写
+    public var stageTimings: [(String, Double)] = []
     public internal(set) var debugWeights: FloatMap?
     public internal(set) var debugLowDisparity: FloatMap?
     public internal(set) var debugMatte: FloatMap?
@@ -44,6 +46,13 @@ public final class BokehRenderer {
 
         let w = image.width, h = image.height, n = w * h
         let L = image.longSide
+        var mark = DispatchTime.now().uptimeNanoseconds
+        func lap(_ name: String) {
+            let t = DispatchTime.now().uptimeNanoseconds
+            renderTimings.append((name, Double(t - mark) / 1e6))
+            mark = t
+        }
+        renderTimings.removeAll(keepingCapacity: true)
 
         // ---- 1. 每个像素带符号的模糊半径 ----
         var s = [Float](repeating: 0, count: n)
@@ -73,35 +82,57 @@ public final class BokehRenderer {
         let layerCount = centers.count
         var minX = [Int](repeating: w, count: layerCount), maxX = [Int](repeating: -1, count: layerCount)
         var minY = [Int](repeating: h, count: layerCount), maxY = [Int](repeating: -1, count: layerCount)
-        for y in 0..<h {
-            for x in 0..<w {
-                let i = y * w + x
-                let v = s[i]
-                var j = 0
-                var t: Float = 0
-                if v <= centers[0] {
-                    j = 0
-                } else if v >= centers[layerCount - 1] {
-                    j = layerCount - 1
-                } else {
-                    while j + 1 < layerCount && centers[j + 1] <= v { j += 1 }
-                    if j + 1 < layerCount {
-                        t = (v - centers[j]) / (centers[j + 1] - centers[j])
+        // 按行并行：每行记下各层出现的最左 / 最右列，最后再汇总成每层的包围盒
+        var rowMinX = [Int32](repeating: Int32(w), count: h * layerCount)
+        var rowMaxX = [Int32](repeating: -1, count: h * layerCount)
+        s.withUnsafeBufferPointer { sp in
+        lo.withUnsafeMutableBufferPointer { lp in
+        tt.withUnsafeMutableBufferPointer { tp in
+        rowMinX.withUnsafeMutableBufferPointer { mnp in
+        rowMaxX.withUnsafeMutableBufferPointer { mxp in
+        centers.withUnsafeBufferPointer { cp in
+            let S = sp.baseAddress!, LO = lp.baseAddress!, TT = tp.baseAddress!
+            let MN = mnp.baseAddress!, MX = mxp.baseAddress!, C = cp.baseAddress!
+            parallelFor(h) { y in
+                let rb = y * layerCount
+                for x in 0..<w {
+                    let i = y * w + x
+                    let v = S[i]
+                    var j = 0
+                    var t: Float = 0
+                    if v <= C[0] {
+                        j = 0
+                    } else if v >= C[layerCount - 1] {
+                        j = layerCount - 1
+                    } else {
+                        while j + 1 < layerCount && C[j + 1] <= v { j += 1 }
+                        if j + 1 < layerCount {
+                            t = (v - C[j]) / (C[j + 1] - C[j])
+                        }
+                    }
+                    LO[i] = Int32(j)
+                    TT[i] = t
+                    let xi = Int32(x)
+                    if t < 1 {
+                        if xi < MN[rb + j] { MN[rb + j] = xi }
+                        if xi > MX[rb + j] { MX[rb + j] = xi }
+                    }
+                    if t > 0 {
+                        if xi < MN[rb + j + 1] { MN[rb + j + 1] = xi }
+                        if xi > MX[rb + j + 1] { MX[rb + j + 1] = xi }
                     }
                 }
-                lo[i] = Int32(j)
-                tt[i] = t
-                if t < 1 {
-                    minX[j] = min(minX[j], x); maxX[j] = max(maxX[j], x)
-                    minY[j] = min(minY[j], y); maxY[j] = max(maxY[j], y)
-                }
-                if t > 0 {
-                    minX[j + 1] = min(minX[j + 1], x); maxX[j + 1] = max(maxX[j + 1], x)
-                    minY[j + 1] = min(minY[j + 1], y); maxY[j + 1] = max(maxY[j + 1], y)
-                }
+            }
+        }}}}}}
+        for y in 0..<h {
+            for j in 0..<layerCount where rowMaxX[y * layerCount + j] >= 0 {
+                minX[j] = min(minX[j], Int(rowMinX[y * layerCount + j]))
+                maxX[j] = max(maxX[j], Int(rowMaxX[y * layerCount + j]))
+                minY[j] = min(minY[j], y); maxY[j] = max(maxY[j], y)
             }
         }
 
+        lap("分层")
         // ---- 3. 高光提亮 ----
         // 照片里的灯珠、反光点在传感器上早就过曝了，真实亮度可能是它的几十倍。
         // 不提亮的话，模糊后它们会被平均成灰蒙蒙的一片，而不是明亮的光斑。
@@ -185,6 +216,7 @@ public final class BokehRenderer {
             }
         }
 
+        lap("高光")
         // ---- 4/5. 逐层模糊并合成 ----
         prefixBuf.ensure(4 * h * (w + 1))
         planeBuf.ensure(4 * n)
@@ -225,37 +257,60 @@ public final class BokehRenderer {
         // 归一化 + 补洞。
         // 一个像素被拆到相邻两层（权重 1-t 和 t）时，over 合成后的覆盖率是 1 - t(1-t) < 1，
         // 所以要除以覆盖率恢复原色；覆盖率很低的地方（被前景挡住的空洞）用 pull-push 外推的背景填。
+        lap("背景层")
         let filled = PullPush.fill(premultiplied: [accR, accG, accB], weight: accA, width: w, height: h)
+        lap("补洞")
         var outR = filled[0], outG = filled[1], outB = filled[2]
-        for i in 0..<n {
-            let a = accA[i]
+        func compose(_ body: (Int, UnsafeMutablePointer<Float>, UnsafeMutablePointer<Float>, UnsafeMutablePointer<Float>,
+                              UnsafePointer<Float>, UnsafePointer<Float>, UnsafePointer<Float>, UnsafePointer<Float>) -> Void) {
+            outR.withUnsafeMutableBufferPointer { orp in
+            outG.withUnsafeMutableBufferPointer { ogp in
+            outB.withUnsafeMutableBufferPointer { obp in
+            accR.withUnsafeBufferPointer { arp in
+            accG.withUnsafeBufferPointer { agp in
+            accB.withUnsafeBufferPointer { abp in
+            accA.withUnsafeBufferPointer { aap in
+                let OR = orp.baseAddress!, OG = ogp.baseAddress!, OB = obp.baseAddress!
+                let AR = arp.baseAddress!, AG = agp.baseAddress!, AB = abp.baseAddress!, AA = aap.baseAddress!
+                parallelFor(h) { y in
+                    for i in (y * w)..<(y * w + w) { body(i, OR, OG, OB, AR, AG, AB, AA) }
+                }
+            }}}}}}}
+        }
+        compose { i, OR, OG, OB, AR, AG, AB, AA in
+            let a = AA[i]
             if a > 0.3 {
                 let s = Self.smoothstep(0.3, 0.7, a), inv = 1 / a
-                outR[i] = accR[i] * inv * s + outR[i] * (1 - s)
-                outG[i] = accG[i] * inv * s + outG[i] * (1 - s)
-                outB[i] = accB[i] * inv * s + outB[i] * (1 - s)
+                OR[i] = AR[i] * inv * s + OR[i] * (1 - s)
+                OG[i] = AG[i] * inv * s + OG[i] * (1 - s)
+                OB[i] = AB[i] * inv * s + OB[i] * (1 - s)
             }
         }
 
         // ---- 前景层：加法累积，再整体盖到背景上 ----
         // 同一个表面被拆到两层时权重相加正好是 1，不会变透明；点光源的能量也守恒
         if zeroIndex + 1 < layerCount {
-            for i in 0..<n { accR[i] = 0; accG[i] = 0; accB[i] = 0; accA[i] = 0 }
+            accR = [Float](repeating: 0, count: n); accG = [Float](repeating: 0, count: n)
+            accB = [Float](repeating: 0, count: n); accA = [Float](repeating: 0, count: n)
             runLayers(Array((zeroIndex + 1)..<layerCount), additive: true)
-            for i in 0..<n {
-                let a = accA[i]
-                if a <= 1e-5 { continue }
+            compose { i, OR, OG, OB, AR, AG, AB, AA in
+                let a = AA[i]
+                if a <= 1e-5 { return }
                 // 覆盖率超过 1（不同前景物体的虚化互相重叠）时按权重平均颜色
                 let coverage = min(a, 1), scale = coverage / a
                 let k = 1 - coverage
-                outR[i] = outR[i] * k + accR[i] * scale
-                outG[i] = outG[i] * k + accG[i] * scale
-                outB[i] = outB[i] * k + accB[i] * scale
+                OR[i] = OR[i] * k + AR[i] * scale
+                OG[i] = OG[i] * k + AG[i] * scale
+                OB[i] = OB[i] * k + AB[i] * scale
             }
         }
 
+        lap("前景")
         return PlanarImage(width: w, height: h, r: outR, g: outG, b: outB)
     }
+
+    /// render 内部各步骤耗时（毫秒）
+    public var renderTimings: [(String, Double)] = []
 
     // 复用的工作缓冲区
     private let prefixBuf = FloatBuffer()

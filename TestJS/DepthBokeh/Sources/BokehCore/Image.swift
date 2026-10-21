@@ -287,6 +287,21 @@ extension PlanarImage {
         }}}}}
     }
 
+    /// 相机帧（8 位交错）→ 线性光图像：从中间裁出 1/crop（数码变焦），缩放到长边不超过 longSide。
+    /// 裁出来的那块本身比 longSide 小时不放大（界面再放大显示）。iOS 和电脑上的模拟测试共用这一份计算
+    public static func cameraFrame(interleaved8 base: UnsafeRawPointer, width w: Int, height h: Int, bytesPerRow: Int,
+                                   layout: InterleavedLayout, longSide: Int, crop: Float) -> PlanarImage {
+        let c = crop.isFinite ? Double(max(1, crop)) : 1
+        let cw = Double(w) / c, ch = Double(h) / c
+        let s = min(1, Double(longSide) / max(cw, ch))
+        let ow = max(1, Int((cw * s).rounded()))
+        let oh = max(1, Int((ch * s).rounded()))
+        let rect: (x: Float, y: Float, width: Float, height: Float)? = c > 1.0005
+            ? (Float((Double(w) - cw) / 2), Float((Double(h) - ch) / 2), Float(cw), Float(ch)) : nil
+        return PlanarImage(interleaved8: base, width: w, height: h, bytesPerRow: bytesPerRow,
+                           layout: layout, outputWidth: ow, outputHeight: oh, sourceRect: rect)
+    }
+
     /// 输出 8 位 RGBA（sRGB 编码，alpha = 255），可直接用来创建 CGImage
     public func interleavedRGBA8() -> [UInt8] {
         var out = [UInt8](repeating: 255, count: pixelCount * 4)

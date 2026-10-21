@@ -27,6 +27,13 @@ public final class TemporalState {
     /// 相邻两帧焦外颜色的相对差异超过它，就认为是画面真的变了（运动），不再沿用
     public var backgroundSigma: Float = 0.25
     var bokehR: [Float] = [], bokehG: [Float] = [], bokehB: [Float] = []
+    /// 手机移动（扫、晃）时整幅画面的平移量（低分辨率像素 / 帧）。由 prepare 估计
+    public private(set) var cameraShift: Float = 0
+    /// 平移达到多少像素（低分辨率、每帧）时完全不沿用上一帧。手持微抖约 0–1 像素，上下扫镜头 3–20 像素：
+    /// 扫的时候还按静止的比例沿用上一帧，焦外和深度会拖在画面后面，看起来就是延迟
+    public var motionCutoff: Float = 2
+    /// 当前帧整体还能沿用上一帧的比例（1 = 静止，0 = 在扫镜头）
+    var stillness: Float = 1
 
     public init() {}
 
@@ -34,6 +41,7 @@ public final class TemporalState {
         width = 0; height = 0
         luma = []; disparity = []; boost = []; blend = []
         bokehR = []; bokehG = []; bokehB = []
+        cameraShift = 0; stillness = 1
     }
 
     /// 低分辨率虚化结果的时间平滑。w 是每个像素的虚化程度（0 清晰 … 1 完全虚化）
@@ -43,7 +51,7 @@ public final class TemporalState {
             bokehR = img.r; bokehG = img.g; bokehB = img.b
             return
         }
-        let s = backgroundStrength, inv = 1 / backgroundSigma
+        let s = backgroundStrength * stillness, inv = 1 / backgroundSigma
         for i in 0..<n {
             let wi = w[i]
             if wi <= 0.01 { continue }
@@ -70,11 +78,14 @@ public final class TemporalState {
         }
         // 3×3 平均后的亮度差，避免单像素噪声
         let w = d.width, h = d.height
+        // 整幅画面在平移（手机在动）：按平移量减少沿用上一帧的比例
+        cameraShift = Self.globalShift(now, luma, width: w, height: h)
+        stillness = min(1, max(0, 1 - (cameraShift - 0.5) / max(motionCutoff - 0.5, 0.1)))
         var diff = [Float](repeating: 0, count: n)
         for i in 0..<n { diff[i] = abs(now[i] - luma[i]) }
         let dm = BoxFilter.mean(diff, width: w, height: h, radius: 1)
         var out = d.values
-        let s = strength, inv = 1 / sigma
+        let s = strength * stillness, inv = 1 / sigma
         for i in 0..<n {
             let x = dm[i] * inv
             let b = s * expf(-x * x)
@@ -86,10 +97,60 @@ public final class TemporalState {
         return FloatMap(width: w, height: h, values: out)
     }
 
+    /// 两帧亮度之间的整体平移（像素，当前分辨率）。先在 1/4 分辨率上 ±3 搜索，再在 1/2 分辨率上 ±1 细化。
+    /// 纹理太少（平移前后差别不明显）时返回 0
+    static func globalShift(_ a: [Float], _ b: [Float], width w: Int, height h: Int) -> Float {
+        guard a.count == w * h, b.count == w * h else { return 0 }
+        func down(_ s: [Float], _ f: Int) -> (v: [Float], w: Int, h: Int) {
+            let sw = w / f, sh = h / f
+            var out = [Float](repeating: 0, count: sw * sh)
+            let inv = 1 / Float(f * f)
+            for y in 0..<sh {
+                for x in 0..<sw {
+                    var sum: Float = 0
+                    for yy in 0..<f { let row = (y * f + yy) * w + x * f; for xx in 0..<f { sum += s[row + xx] } }
+                    out[y * sw + x] = sum * inv
+                }
+            }
+            return (out, sw, sh)
+        }
+        func sad(_ A: [Float], _ B: [Float], _ sw: Int, _ sh: Int, _ dx: Int, _ dy: Int, _ m: Int) -> Float {
+            var sum: Float = 0
+            for y in m..<(sh - m) {
+                let ra = y * sw, rb = (y + dy) * sw + dx
+                for x in m..<(sw - m) { sum += abs(A[ra + x] - B[rb + x]) }
+            }
+            return sum
+        }
+        let q1 = down(a, 4), q2 = down(b, 4)
+        guard q1.w >= 24, q1.h >= 16 else { return 0 }
+        let R = 3
+        var best = Float.infinity, bx = 0, by = 0
+        let zero = sad(q1.v, q2.v, q1.w, q1.h, 0, 0, R)
+        for dy in -R...R {
+            for dx in -R...R {
+                let v = sad(q1.v, q2.v, q1.w, q1.h, dx, dy, R)
+                if v < best { best = v; bx = dx; by = dy }
+            }
+        }
+        guard best < zero * 0.9 else { return 0 }
+        // 1/2 分辨率上细化
+        let h1 = down(a, 2), h2 = down(b, 2)
+        let m = 2 * R + 1
+        var best2 = Float.infinity, fx = 2 * bx, fy = 2 * by
+        for dy in (2 * by - 1)...(2 * by + 1) {
+            for dx in (2 * bx - 1)...(2 * bx + 1) {
+                let v = sad(h1.v, h2.v, h1.w, h1.h, dx, dy, m)
+                if v < best2 { best2 = v; fx = dx; fy = dy }
+            }
+        }
+        return 2 * sqrtf(Float(fx * fx + fy * fy))
+    }
+
     /// 高光提亮系数的时间稳定（在 render 里调用）
     func stabilizeBoost(_ b: inout [Float]) {
         if boost.count == b.count && blend.count == b.count {
-            for i in 0..<b.count { b[i] += blend[i] * (boost[i] - b[i]) }
+            for i in 0..<b.count { b[i] += blend[i] * (boost[i] - b[i]) }   // blend 已含 stillness
         }
         boost = b
     }

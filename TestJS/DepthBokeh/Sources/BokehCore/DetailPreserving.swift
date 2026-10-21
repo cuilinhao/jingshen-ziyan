@@ -4,9 +4,14 @@ import Foundation
 public struct SubjectHint {
     public var point: (Float, Float)?
     public var parameters: SubjectMatteParameters
-    public init(point: (Float, Float)?, parameters: SubjectMatteParameters = SubjectMatteParameters()) {
+    /// 人像分割遮罩（和视差图同一画面，任意分辨率，0…1）。对焦点落在人身上时，整个人保持清晰 ——
+    /// 包括伸出脸外、深度根本测不到的眼镜框
+    public var personMask: FloatMap?
+    public init(point: (Float, Float)?, parameters: SubjectMatteParameters = SubjectMatteParameters(),
+                personMask: FloatMap? = nil) {
         self.point = point
         self.parameters = parameters
+        self.personMask = personMask
     }
 }
 
@@ -38,24 +43,37 @@ extension BokehRenderer {
             if let sh = subject {
                 d = SubjectMatte.apply(disparity: d, image: full, focusDisparity: lens.focusDisparity,
                                        focusPoint: sh.point, parameters: sh.parameters,
-                                         scale: lens.relativeScale).0
+                                         scale: lens.relativeScale, personMask: sh.personMask).0
             }
             return render(image: full, disparity: d, lens: lens, quality: quality, temporal: temporal)
+        }
+        stageTimings.removeAll(keepingCapacity: true)
+        var mark = DispatchTime.now().uptimeNanoseconds
+        func lap(_ name: String) {
+            let t = DispatchTime.now().uptimeNanoseconds
+            stageTimings.append((name, Double(t - mark) / 1e6))
+            mark = t
         }
         let W = full.width, H = full.height
         let low = Self.downsample(full, longSide: lowLongSide)
         let lw = low.width, lh = low.height
         let lowLuma = low.perceptualLuma()
+        lap("缩小")
         var dLow = DepthRefiner.refine(disparity: disparity, guide: low, passes: refinePasses, guideLuma: lowLuma)
+        lap("深度对齐")
         if let t = temporal { dLow = t.prepare(luma: lowLuma.values, disparity: dLow) }
+        lap("时间稳定")
         var matte: FloatMap?
         if let sh = subject {
             let res = SubjectMatte.apply(disparity: dLow, image: low, focusDisparity: lens.focusDisparity,
                                          focusPoint: sh.point, parameters: sh.parameters,
-                                         scale: lens.relativeScale)
+                                         scale: lens.relativeScale, personMask: sh.personMask)
             dLow = res.0; matte = res.1
         }
+        lap("主体遮罩")
         var bokeh = render(image: low, disparity: dLow, lens: lens, quality: quality, temporal: temporal)
+        lap("虚化")
+        stageTimings += renderTimings.map { ("虚化." + $0.0, $0.1) }
 
         // 低分辨率上的虚化程度 w
         let Ll = low.longSide
@@ -69,6 +87,7 @@ extension BokehRenderer {
         }
         // 焦外的时间平滑（实时预览）
         temporal?.stabilizeBokeh(&bokeh, defocus: w)
+        lap("焦外稳定")
         if captureDebugMaps {
             debugWeights = FloatMap(width: lw, height: lh, values: w)
             debugLowDisparity = dLow
@@ -129,6 +148,7 @@ extension BokehRenderer {
                 }
             }
         }}}}}}}}}}}}}}}}
+        lap("合成")
         return out
     }
 

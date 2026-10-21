@@ -44,6 +44,21 @@ public struct LensParameters: Equatable {
     /// 所以用 max(d_f, 0.25 × (近端 − 远端)) 当分母（和 DepthBokehCamera 2 一样）
     public var relativeScale: Float?
 
+    
+    /*
+     这个问题先不改了，看下我现在测试出的一个问题
+     在 4x 的情况下，
+     第一个问题，当我拍摄距离镜头近的盒子的时候，发现盒子顶部有蒙层，不清楚，你可以对比下同一个手机，系统的景深效果（视频demo-1021.MP4，系统视频是xitong.MP4）
+
+     第二个问题， 当我拍摄距离镜头远的人脸的时候，发现这个人佩戴的眼镜是有蒙层的，看下可以修复吗？（视频demo-1021.MP4）
+
+
+     第三个问题，当我上下移动镜头的时候，怎么感觉拍摄画面有延迟？（第一次打开没问题，选择 4x 焦距，然后拍几张后，再上下移动就有延迟了）视频demo-kadun.MP4
+
+     ---
+     另外，你这次改动加了焦段调节，要自己使用2 核云主机上测试，发现问题，解决问题
+
+     */
     public init(fNumber: Float = 2.8, focusDisparity: Float = 1, model: Model = .system,
                 focalLength35mm: Float = 52, maxBlurFraction: Float? = nil, focusTolerance: Float = 0.06,
                 blurK: Float = 0.015, foregroundScale: Float = 0.8, maxRelative: Float = 1.6,
