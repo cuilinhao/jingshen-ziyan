@@ -23,7 +23,8 @@ import Foundation
 ///    对焦越近、模糊越大；与原始 blurK = 0.015 的系统模型相比，实测拳头 0.46 m 时约为其 4 倍。
 public struct LensParameters: Equatable {
     /// 默认景深虚化强度：调整预览和照片的虚化时，只需修改这里。
-    public static let defaultBlurK: Float = 0.06
+    //public static let defaultBlurK: Float = 0.015
+    public static let defaultBlurK: Float = 0.015 + 0.003
 
     public enum Model: Equatable { case system, thinLens }
 
