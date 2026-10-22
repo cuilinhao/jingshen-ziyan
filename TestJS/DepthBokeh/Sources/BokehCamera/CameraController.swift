@@ -796,7 +796,8 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
 
     // MARK: - 每一帧（dataQueue）
 
-    /// 省电档位：0 = 正常；1 = 隔帧处理、模糊部分降到 1/4 分辨率；2 = 每三帧处理一次、预览降到 1080
+    /// 机身发热程度（系统压力 / 发热状态）：0 = 正常，1 = serious，2 = critical。
+    /// 只显示在状态行上，不降帧、不降分辨率（发热也不能影响取景体验）
     private func powerLevel() -> Int {
         paramLock.lock()
         let pressure = _pressureLevel
@@ -810,7 +811,9 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
         return max(pressure, thermal)
     }
 
-    /// 画面静止多久以后开始隔帧处理（秒）。手机放在桌上不动时，每秒只算 15 帧
+    /// 画面静止时隔帧处理（15 fps）。默认关：先测不降帧时的发热
+    public var throttleWhenStill = false
+    /// 画面静止多久以后开始隔帧处理（秒）
     private static let stillThrottleDelay: CFTimeInterval = 1.5
 
     private struct CameraTexture {
@@ -865,9 +868,8 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
         // 省电：画面静止一会儿以后隔帧处理；系统发热时处理得更少
         let power = powerLevel()
         frameCounter &+= 1
-        var interval = power >= 2 ? 3 : (power >= 1 ? 2 : 1)
-        if let still = stillSince, t0 - still > Self.stillThrottleDelay { interval = max(interval, 2) }
-        if routeReady, interval > 1, frameCounter % interval != 0 { return }
+        if throttleWhenStill, routeReady, let still = stillSince, t0 - still > Self.stillThrottleDelay,
+           frameCounter % 2 != 0 { return }
 
         // 1. 硬件深度。有的相机深度帧比视频少：只在同一条线路里短暂沿用上一张
         var hardware: FloatMap?
@@ -936,7 +938,7 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
         // 5. 输出尺寸固定（相机整帧缩到 previewLongSide，严重发热时 1080），裁出来的那块缩放进去：
         //    拖刻度盘时尺寸不变，GPU 上的中间结果和跨帧历史都不用重建
         let W = CVPixelBufferGetWidth(pixelBuffer), H = CVPixelBufferGetHeight(pixelBuffer)
-        let longSide = power >= 2 ? min(previewLongSide, 1080) : previewLongSide
+        let longSide = previewLongSide
         let scale = min(1, Double(longSide) / Double(max(W, H)))
         let outW = max(1, Int((Double(W) * scale).rounded())), outH = max(1, Int((Double(H) * scale).rounded()))
         let cw = Double(W) / Double(crop), ch = Double(H) / Double(crop)
@@ -960,7 +962,7 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
             paramLock.unlock()
 
             var settings = analyzer.settings
-            settings.blurDownscale = power >= 1 ? max(blurDownscale, 4) : blurDownscale
+            settings.blurDownscale = blurDownscale
             settings.focusTolerance = focusTolerance
             settings.lensModel = lensModel
             settings.virtualFocalLength = virtualFocalLength
@@ -1041,7 +1043,7 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
         let gpuMs = gpuTimes.isEmpty ? 0 : gpuTimes.reduce(0, +) / Double(gpuTimes.count)
         var text = String(format: "%@× · %d×%d · CPU %.0f / GPU %.1f ms · %d fps · ",
                           Self.zoomText(frameZoom), width, height, cpu, gpuMs, shownTimes.count)
-        if power > 0 { text += "降温中 · " }
+        if power > 0 { text += power >= 2 ? "机身很热 · " : "机身发热 · " }
         return text
     }
 

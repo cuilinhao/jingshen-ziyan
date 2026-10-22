@@ -1,0 +1,30 @@
+# See LICENSE folder for this sample’s licensing information.
+#
+# Apple sample code gitignore configuration.
+
+# Finder
+.DS_Store
+
+# Xcode / SwiftPM — local package checkouts (never commit as submodules)
+build/
+.build/
+
+# Xcode - User files
+xcuserdata/
+xcshareddata/
+
+# LookinRealDeviceFix/ is intentionally tracked; it contains the reproducible
+# LookinServer real-device fix.
+
+# LookinServer is restored by CocoaPods. Keep its downloaded source and
+# generated support files out of PRs.
+Pods/
+Podfile.lock
+
+# OpenCV framework is delivered separately because the binary is too large for GitHub.
+OpenCV/
+
+# Keep Codex feature worktrees out of the main checkout.
+/.worktrees
+docs/
+AGENTS.md

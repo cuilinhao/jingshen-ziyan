@@ -19,16 +19,20 @@ constant int BOX_SEG = 16;   // 盒式滤波每个线程负责的一段长度（
 struct LensParams {
     float fNumber;
     float focusDisparity;
-    float normScale;          // 相对距离的分母（relativeScale ?? focusDisparity），着色器里再取 max(·, 1e-3)
     float focalLength35mm;
     float maxBlurFraction;
-    float focusTolerance;
+    float focusTolerance;     // thinLens 的全清晰区（相对距离）
     float blurK;
-    float foregroundScale;
-    float maxRelative;
+    float frontTolerance;     // system：对焦面前面的全清晰区、斜率、上限（视差差）
+    float frontSlope;
+    float frontMax;
+    float backTolerance;      // system：对焦面后面的
+    float backSlope;
+    float backMax;
     float softLimitFraction;
     float longSide;           // 低分辨率图像的长边（像素）
     int model;                // 0 = system, 1 = thinLens
+    int pad;
 };
 
 // LensParameters.signedBlurRadius（Lens.swift）
@@ -36,11 +40,12 @@ inline float signedBlurRadius(float d, constant LensParams& p) {
     float L = p.longSide;
     float maxR = p.maxBlurFraction * L;
     if (p.model == 0) {
-        float rel = (d - p.focusDisparity) / max(p.normScale, 1e-3f);
-        float mag = min(max(fabs(rel) - p.focusTolerance, 0.0f), p.maxRelative);
-        if (rel > 0.0f) { mag *= p.foregroundScale; }
-        float r = mag * p.blurK / max(p.fNumber, 1.0f) * L;
-        return rel > 0.0f ? min(r, maxR) : -min(r, maxR);
+        float dd = d - p.focusDisparity;
+        float g = dd > 0.0f
+            ? p.frontMax * tanh(p.frontSlope * max(dd - p.frontTolerance, 0.0f) / p.frontMax)
+            : p.backMax * tanh(p.backSlope * max(-dd - p.backTolerance, 0.0f) / p.backMax);
+        float r = g * p.blurK / max(p.fNumber, 1.0f) * L;
+        return dd > 0.0f ? min(r, maxR) : -min(r, maxR);
     }
     float f = p.focalLength35mm;
     float delta = d - p.focusDisparity;
@@ -51,7 +56,7 @@ inline float signedBlurRadius(float d, constant LensParams& p) {
     if (p.softLimitFraction > 0.0f) {
         float rSat = p.softLimitFraction * L * 4.5f / max(p.fNumber, 0.5f);
         float x = radiusPx / rSat;
-        radiusPx /= cbrt(1.0f + fabs(x * x * x));
+        radiusPx /= pow(1.0f + fabs(x * x * x), 1.0f / 3.0f);   // MSL 没有 cbrt
     }
     return min(max(radiusPx, -maxR), maxR);
 }

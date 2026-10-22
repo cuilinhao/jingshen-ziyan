@@ -4,15 +4,20 @@ import Foundation
 ///
 /// 两种模型：
 ///
-/// 1. `.system`（默认）—— 按系统相机实测标定的「相对离焦」模型（和 DepthBokehCamera 工程一致）：
+/// 1. `.system`（默认）—— 按系统相机标定的「视差差」模型：
 ///
-///        rel = d / d_f − 1            （d 是视差 1/z；背景在无穷远时 rel = −1，前景 rel > 0）
-///        r   = max(|rel| − 死区, 0) × (前景 ? 0.8 : 1) × blurK / ƒ × 长边
+///        Δd = d − d_f                 （d 是视差 1/z，单位 1/米；前景 Δd > 0，背景 Δd < 0）
+///        背景：g = 0.95 · tanh(1.6 · max(|Δd| − 0.04, 0) / 0.95)
+///        前景：g = 1.2  · tanh(1.6 · max(Δd − 0.25, 0) / 1.2)
+///        r = g × blurK / ƒ × 长边
 ///
-///    blurK = 0.015：DepthBokehCamera 2 按系统相机标定的是 0.012（ƒ1.4、主体 1.5 m、背景 6 m 时背景模糊半径
-///    约为长边的 0.55%）；对比你录的系统相机预览（拳头 0.46 m、ƒ1.4，远处灯的光斑半径约为长边的 1%）和
-///    S02–S07 的系统人像照片，0.012 偏弱，取 0.015（那个工程 README 里「更奶油」的推荐值）。
-///    模糊量只和「相对距离」有关，不随对焦距离变化，所以拳头拿近时背景不会糊得比系统多几倍。
+///    和真实镜头一样，模糊只和视差差有关，不除以对焦视差：以前的「相对距离」(d − d_f) / d_f 在对焦远处时分母很小，
+///    对焦后面的柜子时，前面一两米的人被虚化得很厉害；系统相机这时人几乎是清晰的，前面的杯子只是轻微虚化。
+///    前面有一段 0.25（1/米）的全清晰区：系统人像照片里，对焦面前面视差差 0.3 以内的东西都是清晰的
+///    （S02：对焦 2 m 的人，前面 1.6 m 以外的东西都清晰），后面没有这么宽。
+///    视差差还不受双摄 / AI 相对视差里那个未知偏移的影响（实测双摄视差 ≈ 激光雷达视差 + 0.2…0.4）。
+///    tanh 让大视差差（拳头 0.46 m、背景 3 m）饱和在长边的 1% 左右（ƒ1.4），和系统相机的预览一致；
+///    ƒ1.4、主体 1.5 m、背景 6 m 时背景约为长边的 0.66%（以前标定的 0.69%）。
 ///
 /// 2. `.thinLens` —— 薄透镜物理公式：c ≈ (f² / N) · |1/z − 1/z_f|。
 ///    对焦越近、模糊越大，同样的 ƒ 值下比系统强得多（实测拳头 0.46 m 时是系统的 4 倍左右）。
@@ -29,19 +34,22 @@ public struct LensParameters: Equatable {
     public var focalLength35mm: Float
     /// 最大模糊半径（占图像长边的比例）。系统模型默认 1.4%（和系统相机一致）
     public var maxBlurFraction: Float
-    /// 对焦面前后的「全清晰区」（相对距离），0.06 = 对焦距离的 ±6% 内完全清晰
+    /// `.thinLens`：对焦面前后的「全清晰区」（相对距离），0.06 = 对焦距离的 ±6% 内完全清晰
     public var focusTolerance: Float
-    /// `.system`：ƒ1 时背景在无穷远的模糊半径（占长边的比例）。默认 0.015
+    /// `.system`：模糊强度（g = 1 时、ƒ1 的模糊半径占长边的比例）。默认 0.015
     public var blurK: Float
-    /// `.system`：前景模糊相对背景的比例（系统相机前景更柔和）
-    public var foregroundScale: Float
-    /// `.system`：|rel| 超过这个值后不再增大（极近的前景）
-    public var maxRelative: Float
+    /// `.system`：对焦面前面的全清晰区、斜率、上限（视差差，1/米）
+    public var frontTolerance: Float
+    public var frontSlope: Float
+    public var frontMax: Float
+    /// `.system`：对焦面后面的全清晰区、斜率、上限
+    public var backTolerance: Float
+    public var backSlope: Float
+    public var backMax: Float
     /// `.thinLens`：软上限（ƒ4.5 时占长边的比例，随 ƒ 反比变化），0 = 关闭
     public var softLimitFraction: Float
-    /// `.system`：相对距离的分母。nil = 对焦视差本身（LiDAR / 双摄的绝对视差：rel = d/d_f − 1）。
-    /// AI 单目深度只有相对值（未知的比例和偏移），对焦在远处时 d_f 接近 0，rel 会被放得很大，
-    /// 所以用 max(d_f, 0.25 × (近端 − 远端)) 当分母（和 DepthBokehCamera 2 一样）
+    /// 「相对距离」(d − d_f) / 分母 的分母，主体遮罩用它判断「和对焦面差不多远」（SubjectMatte 的 band）。
+    /// nil = 对焦视差本身（LiDAR）。双摄 / AI 深度只有相对值，用 max(d_f, 0.25 × (近端 − 远端))
     public var relativeScale: Float?
 
     
@@ -61,7 +69,8 @@ public struct LensParameters: Equatable {
      */
     public init(fNumber: Float = 2.8, focusDisparity: Float = 1, model: Model = .system,
                 focalLength35mm: Float = 52, maxBlurFraction: Float? = nil, focusTolerance: Float = 0.06,
-                blurK: Float = 0.015, foregroundScale: Float = 0.8, maxRelative: Float = 1.6,
+                blurK: Float = 0.015, frontTolerance: Float = 0.25, frontSlope: Float = 1.6, frontMax: Float = 1.2,
+                backTolerance: Float = 0.04, backSlope: Float = 1.6, backMax: Float = 0.95,
                 softLimitFraction: Float = 0.012, relativeScale: Float? = nil) {
         self.fNumber = fNumber
         self.focusDisparity = focusDisparity
@@ -70,8 +79,12 @@ public struct LensParameters: Equatable {
         self.maxBlurFraction = maxBlurFraction ?? (model == .system ? 0.014 : 0.04)
         self.focusTolerance = focusTolerance
         self.blurK = blurK
-        self.foregroundScale = foregroundScale
-        self.maxRelative = maxRelative
+        self.frontTolerance = frontTolerance
+        self.frontSlope = frontSlope
+        self.frontMax = frontMax
+        self.backTolerance = backTolerance
+        self.backSlope = backSlope
+        self.backMax = backMax
         self.softLimitFraction = softLimitFraction
         self.relativeScale = relativeScale
     }
@@ -88,11 +101,15 @@ public struct LensParameters: Equatable {
         let maxR = maxBlurFraction * Float(L)
         switch model {
         case .system:
-            let rel = relativeDistance(d)
-            var mag = min(max(abs(rel) - focusTolerance, 0), maxRelative)
-            if rel > 0 { mag *= foregroundScale }
-            let r = mag * blurK / max(fNumber, 1) * Float(L)
-            return rel > 0 ? min(r, maxR) : -min(r, maxR)
+            let dd = d - focusDisparity
+            let g: Float
+            if dd > 0 {
+                g = frontMax * tanhf(frontSlope * max(dd - frontTolerance, 0) / frontMax)
+            } else {
+                g = backMax * tanhf(backSlope * max(-dd - backTolerance, 0) / backMax)
+            }
+            let r = g * blurK / max(fNumber, 1) * Float(L)
+            return dd > 0 ? min(r, maxR) : -min(r, maxR)
         case .thinLens:
             // 等效全画幅 36mm 宽的底片上的弥散圆直径（毫米）；视差单位 1/m -> 1/mm 要除以 1000
             let f = focalLength35mm

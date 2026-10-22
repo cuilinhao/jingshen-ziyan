@@ -711,27 +711,34 @@ final class UploadSlot {
 struct GPULens {
     var fNumber: Float
     var focusDisparity: Float
-    var normScale: Float
     var focalLength35mm: Float
     var maxBlurFraction: Float
     var focusTolerance: Float
     var blurK: Float
-    var foregroundScale: Float
-    var maxRelative: Float
+    var frontTolerance: Float
+    var frontSlope: Float
+    var frontMax: Float
+    var backTolerance: Float
+    var backSlope: Float
+    var backMax: Float
     var softLimitFraction: Float
     var longSide: Float
     var model: Int32
+    var pad: Int32 = 0
 
     init(_ l: LensParameters, longSide: Int) {
         fNumber = l.fNumber
         focusDisparity = l.focusDisparity
-        normScale = l.relativeScale ?? l.focusDisparity
         focalLength35mm = l.focalLength35mm
         maxBlurFraction = l.maxBlurFraction
         focusTolerance = l.focusTolerance
         blurK = l.blurK
-        foregroundScale = l.foregroundScale
-        maxRelative = l.maxRelative
+        frontTolerance = l.frontTolerance
+        frontSlope = l.frontSlope
+        frontMax = l.frontMax
+        backTolerance = l.backTolerance
+        backSlope = l.backSlope
+        backMax = l.backMax
         softLimitFraction = l.softLimitFraction
         self.longSide = Float(longSide)
         model = l.model == .system ? 0 : 1

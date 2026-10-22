@@ -161,26 +161,30 @@ final class BokehCoreTests: XCTestCase {
         XCTAssertLessThan(abs(lens.signedBlurRadius(disparity: 0.01, imageLongSide: L)), far * 0.55)
     }
 
-    /// 系统模型：模糊只和相对距离有关。blurK = 0.012 时 ƒ1.4、主体 1.5 m、背景 6 m 约为长边的 0.55%
-    ///（DepthBokehCamera 2 的标定）；默认 0.015 是它的 1.25 倍
+    /// 系统模型：模糊只和视差差有关（像真实镜头），大视差差饱和；对焦面前面有一段全清晰区
     func testSystemModel() {
         let L = 1440
-        let ref = LensParameters(fNumber: 1.4, focusDisparity: 1 / 1.5, blurK: 0.012)
-        XCTAssertEqual(-ref.signedBlurRadius(disparity: 1 / 6, imageLongSide: L) / Float(L), 0.0055, accuracy: 0.0006)
-        let lens = LensParameters(fNumber: 1.4, focusDisparity: 1 / 1.5)
-        let bg = lens.signedBlurRadius(disparity: 1 / 6, imageLongSide: L)
-        XCTAssertLessThan(bg, 0)
-        XCTAssertEqual(bg / ref.signedBlurRadius(disparity: 1 / 6, imageLongSide: L), 1.25, accuracy: 0.01)
-        // 对焦 0.46 m 的拳头、背景 3 m：和对焦 1.5 m 时差不多（相对距离接近），不会变成几倍
-        let near = LensParameters(fNumber: 1.4, focusDisparity: 1 / 0.46)
-        XCTAssertLessThan(abs(near.signedBlurRadius(disparity: 1 / 3, imageLongSide: L)), 1.3 * abs(bg))
-        // 死区内完全清晰；前景比同样相对距离的背景柔和
-        XCTAssertEqual(lens.signedBlurRadius(disparity: (1 / 1.5) * 1.05, imageLongSide: L), 0)
-        let fg = lens.signedBlurRadius(disparity: (1 / 1.5) * 1.5, imageLongSide: L)
-        let back = lens.signedBlurRadius(disparity: (1 / 1.5) * 0.5, imageLongSide: L)
-        XCTAssertEqual(fg, -0.8 * back, accuracy: 0.01)
+        func pct(_ lens: LensParameters, _ d: Float) -> Float { lens.signedBlurRadius(disparity: d, imageLongSide: L) / Float(L) * 100 }
+        // ƒ1.4、主体 1.5 m、背景 6 m：背景约为长边的 0.66%（以前按 DepthBokehCamera 2 标定的 0.69%）
+        let p15 = LensParameters(fNumber: 1.4, focusDisparity: 1 / 1.5)
+        XCTAssertEqual(pct(p15, 1 / 6), -0.66, accuracy: 0.05)
+        // 拳头 0.46 m、背景 3 m：饱和在长边的 1% 左右（系统相机预览实测）
+        let fist = LensParameters(fNumber: 1.4, focusDisparity: 1 / 0.46)
+        XCTAssertEqual(pct(fist, 1 / 3), -1.0, accuracy: 0.1)
+        // 对焦在 3.5 m 的柜子：前面 1.7 m 的人几乎清晰，1.4 m 的杯子轻微虚化（系统相机的效果）
+        let far = LensParameters(fNumber: 1.4, focusDisparity: 1 / 3.5)
+        XCTAssertLessThan(pct(far, 1 / 1.7), 0.12)
+        XCTAssertGreaterThan(pct(far, 1 / 1.4), 0.15)
+        XCTAssertLessThan(pct(far, 1 / 1.4), 0.4)
+        // 全清晰区：前面 0.25、后面 0.04（视差差）
+        XCTAssertEqual(far.signedBlurRadius(disparity: 1 / 3.5 + 0.24, imageLongSide: L), 0)
+        XCTAssertEqual(far.signedBlurRadius(disparity: 1 / 3.5 - 0.035, imageLongSide: L), 0)
+        // 双摄视差的偏移不影响模糊
+        var shifted = far
+        shifted.focusDisparity += 0.3
+        XCTAssertEqual(pct(shifted, 1 / 1.4 + 0.3), pct(far, 1 / 1.4), accuracy: 1e-4)
         // 上限 1.4%
-        XCTAssertLessThanOrEqual(abs(near.signedBlurRadius(disparity: 50, imageLongSide: L)), 0.014 * Float(L) + 1e-3)
+        XCTAssertLessThanOrEqual(abs(fist.signedBlurRadius(disparity: 50, imageLongSide: L)), 0.014 * Float(L) + 1e-3)
     }
 
     func testPullPushFillsHoles() {
@@ -219,14 +223,14 @@ final class BokehCoreTests: XCTestCase {
         XCTAssertEqual(img.r.min()!, 1, accuracy: 1e-4)   // 整块都是中间的白色
     }
 
-    /// AI 单目深度：相对距离的分母有下限，对焦远处时不会把一切都当成「很远的前景」
+    /// 相对距离（主体遮罩用）：相对深度时分母有下限；模糊本身只看视差差，不受这个分母影响
     func testRelativeScale() {
         let L = 1000
         var lens = LensParameters(fNumber: 2, focusDisparity: 0.1)
-        let raw = abs(lens.signedBlurRadius(disparity: 0.2, imageLongSide: L))
+        let raw = lens.signedBlurRadius(disparity: 0.2, imageLongSide: L)
         lens.relativeScale = 0.25
-        let guarded = abs(lens.signedBlurRadius(disparity: 0.2, imageLongSide: L))
-        XCTAssertLessThan(guarded, raw)
+        XCTAssertEqual(lens.signedBlurRadius(disparity: 0.6, imageLongSide: L) > raw, true)
+        XCTAssertEqual(lens.signedBlurRadius(disparity: 0.2, imageLongSide: L), raw)
         XCTAssertEqual(lens.relativeDistance(0.9), 3.2, accuracy: 1e-4)
         // 不设分母时和原公式完全一样
         let abs1 = LensParameters(fNumber: 2, focusDisparity: 0.5)
@@ -236,7 +240,7 @@ final class BokehCoreTests: XCTestCase {
     /// 手机移动时整幅画面的平移量估计（扫镜头时不再沿用上一帧，避免拖影 / 延迟感）
     func testGlobalShift() {
         let w = 480, h = 360
-        var rng = SystemRandomNumberGenerator()
+        let rng = SystemRandomNumberGenerator()
         // 有纹理的图：随机块
         var base = [Float](repeating: 0, count: (w + 16) * h)
         for y in 0..<h { for x in 0..<(w + 16) { base[y * (w + 16) + x] = Float((x / 6 + y / 5 * 7) % 11) / 11 } }

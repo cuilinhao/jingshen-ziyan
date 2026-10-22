@@ -46,11 +46,10 @@ final class PersonSegmenter: @unchecked Sendable {   // 可变状态都由 lock 
     private var lastStart: TimeInterval = -1
     private var lastPersonSeen: TimeInterval = -100
 
-    /// 用这一帧更新遮罩（异步）。省电：画面里有人（最近 3 秒看到过）时每秒最多 10 次，
-    /// 一直没人时每秒 2 次（只为了发现有人走进画面）
+    /// 用这一帧更新遮罩（异步）。每秒最多 10 次（遮罩本来就用上一次的结果，10 次足够跟上人的动作）
     func update(with pixelBuffer: CVPixelBuffer, now: TimeInterval) {
         lock.lock()
-        let interval: TimeInterval = now - lastPersonSeen < 3 ? 0.1 : 0.5
+        let interval: TimeInterval = 0.1
         if busy || now - lastStart < interval {
             lock.unlock()
             return
