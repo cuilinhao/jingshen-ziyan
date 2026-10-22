@@ -164,15 +164,17 @@ final class BokehCoreTests: XCTestCase {
     /// 系统模型：模糊只和视差差有关（像真实镜头），大视差差饱和；对焦面前面有一段全清晰区
     func testSystemModel() {
         let L = 1440
+        // 固定原始标定值验证距离曲线，调节默认强度时无需同步修改这些断言。
+        let calibratedBlurK: Float = 0.015
         func pct(_ lens: LensParameters, _ d: Float) -> Float { lens.signedBlurRadius(disparity: d, imageLongSide: L) / Float(L) * 100 }
-        // ƒ1.4、主体 1.5 m、背景 6 m：背景约为长边的 0.66%（以前按 DepthBokehCamera 2 标定的 0.69%）
-        let p15 = LensParameters(fNumber: 1.4, focusDisparity: 1 / 1.5)
+        // 原始标定：ƒ1.4、主体 1.5 m、背景 6 m，背景半径约为长边的 0.66%
+        let p15 = LensParameters(fNumber: 1.4, focusDisparity: 1 / 1.5, blurK: calibratedBlurK)
         XCTAssertEqual(pct(p15, 1 / 6), -0.66, accuracy: 0.05)
-        // 拳头 0.46 m、背景 3 m：饱和在长边的 1% 左右（系统相机预览实测）
-        let fist = LensParameters(fNumber: 1.4, focusDisparity: 1 / 0.46)
+        // 拳头 0.46 m、背景 3 m：饱和在长边的 1% 左右
+        let fist = LensParameters(fNumber: 1.4, focusDisparity: 1 / 0.46, blurK: calibratedBlurK)
         XCTAssertEqual(pct(fist, 1 / 3), -1.0, accuracy: 0.1)
-        // 对焦在 3.5 m 的柜子：前面 1.7 m 的人几乎清晰，1.4 m 的杯子轻微虚化（系统相机的效果）
-        let far = LensParameters(fNumber: 1.4, focusDisparity: 1 / 3.5)
+        // 对焦在 3.5 m 的柜子：前面 1.7 m 的人几乎清晰，1.4 m 的杯子轻微虚化
+        let far = LensParameters(fNumber: 1.4, focusDisparity: 1 / 3.5, blurK: calibratedBlurK)
         XCTAssertLessThan(pct(far, 1 / 1.7), 0.12)
         XCTAssertGreaterThan(pct(far, 1 / 1.4), 0.15)
         XCTAssertLessThan(pct(far, 1 / 1.4), 0.4)

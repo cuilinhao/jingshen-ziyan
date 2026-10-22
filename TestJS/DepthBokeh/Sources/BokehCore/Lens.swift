@@ -16,12 +16,15 @@ import Foundation
 ///    前面有一段 0.25（1/米）的全清晰区：系统人像照片里，对焦面前面视差差 0.3 以内的东西都是清晰的
 ///    （S02：对焦 2 m 的人，前面 1.6 m 以外的东西都清晰），后面没有这么宽。
 ///    视差差还不受双摄 / AI 相对视差里那个未知偏移的影响（实测双摄视差 ≈ 激光雷达视差 + 0.2…0.4）。
-///    tanh 让大视差差（拳头 0.46 m、背景 3 m）饱和在长边的 1% 左右（ƒ1.4），和系统相机的预览一致；
-///    ƒ1.4、主体 1.5 m、背景 6 m 时背景约为长边的 0.66%（以前标定的 0.69%）。
+///    原始 blurK = 0.015 时，ƒ1.4、拳头 0.46 m、背景 3 m 的半径约为长边的 1%；
+///    主体 1.5 m、背景 6 m 时约为 0.66%。当前默认强度统一由 defaultBlurK 配置，半径仍受 maxBlurFraction 限制。
 ///
 /// 2. `.thinLens` —— 薄透镜物理公式：c ≈ (f² / N) · |1/z − 1/z_f|。
-///    对焦越近、模糊越大，同样的 ƒ 值下比系统强得多（实测拳头 0.46 m 时是系统的 4 倍左右）。
+///    对焦越近、模糊越大；与原始 blurK = 0.015 的系统模型相比，实测拳头 0.46 m 时约为其 4 倍。
 public struct LensParameters: Equatable {
+    /// 默认景深虚化强度：调整预览和照片的虚化时，只需修改这里。
+    public static let defaultBlurK: Float = 0.06
+
     public enum Model: Equatable { case system, thinLens }
 
     /// 模拟的光圈值（ƒ1.4 ... ƒ16）
@@ -36,7 +39,7 @@ public struct LensParameters: Equatable {
     public var maxBlurFraction: Float
     /// `.thinLens`：对焦面前后的「全清晰区」（相对距离），0.06 = 对焦距离的 ±6% 内完全清晰
     public var focusTolerance: Float
-    /// `.system`：模糊强度（g = 1 时、ƒ1 的模糊半径占长边的比例）。默认 0.015
+    /// `.system`：模糊强度（g = 1 时、ƒ1 的模糊半径占长边的比例）。默认使用 defaultBlurK
     public var blurK: Float
     /// `.system`：对焦面前面的全清晰区、斜率、上限（视差差，1/米）
     public var frontTolerance: Float
@@ -69,7 +72,7 @@ public struct LensParameters: Equatable {
      */
     public init(fNumber: Float = 2.8, focusDisparity: Float = 1, model: Model = .system,
                 focalLength35mm: Float = 52, maxBlurFraction: Float? = nil, focusTolerance: Float = 0.06,
-                blurK: Float = 0.015, frontTolerance: Float = 0.25, frontSlope: Float = 1.6, frontMax: Float = 1.2,
+                blurK: Float = LensParameters.defaultBlurK, frontTolerance: Float = 0.25, frontSlope: Float = 1.6, frontMax: Float = 1.2,
                 backTolerance: Float = 0.04, backSlope: Float = 1.6, backMax: Float = 0.95,
                 softLimitFraction: Float = 0.012, relativeScale: Float? = nil) {
         self.fNumber = fNumber
