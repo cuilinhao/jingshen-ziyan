@@ -68,7 +68,8 @@ public final class TemporalState {
     }
 
     /// 根据这一帧的亮度算出 blend，并把视差向上一帧靠拢。返回稳定后的视差
-    func prepare(luma now: [Float], disparity d: FloatMap) -> FloatMap {
+    /// - Parameter stillness: 外面已经估计好的「画面整体静止程度」（LiveFrameAnalyzer），nil = 这里自己估计
+    func prepare(luma now: [Float], disparity d: FloatMap, stillness given: Float? = nil) -> FloatMap {
         let n = d.width * d.height
         guard strength > 0, width == d.width, height == d.height, luma.count == n, disparity.count == n else {
             width = d.width; height = d.height
@@ -79,8 +80,12 @@ public final class TemporalState {
         // 3×3 平均后的亮度差，避免单像素噪声
         let w = d.width, h = d.height
         // 整幅画面在平移（手机在动）：按平移量减少沿用上一帧的比例
-        cameraShift = Self.globalShift(now, luma, width: w, height: h)
-        stillness = min(1, max(0, 1 - (cameraShift - 0.5) / max(motionCutoff - 0.5, 0.1)))
+        if let given {
+            stillness = given
+        } else {
+            cameraShift = Self.globalShift(now, luma, width: w, height: h)
+            stillness = Self.stillness(shift: cameraShift, cutoff: motionCutoff)
+        }
         var diff = [Float](repeating: 0, count: n)
         for i in 0..<n { diff[i] = abs(now[i] - luma[i]) }
         let dm = BoxFilter.mean(diff, width: w, height: h, radius: 1)
@@ -97,9 +102,14 @@ public final class TemporalState {
         return FloatMap(width: w, height: h, values: out)
     }
 
+    /// 平移量（低分辨率像素 / 帧）→ 沿用上一帧的比例：0.5 像素以内全沿用，到 cutoff 完全不沿用
+    public static func stillness(shift: Float, cutoff: Float) -> Float {
+        min(1, max(0, 1 - (shift - 0.5) / max(cutoff - 0.5, 0.1)))
+    }
+
     /// 两帧亮度之间的整体平移（像素，当前分辨率）。先在 1/4 分辨率上 ±3 搜索，再在 1/2 分辨率上 ±1 细化。
     /// 纹理太少（平移前后差别不明显）时返回 0
-    static func globalShift(_ a: [Float], _ b: [Float], width w: Int, height h: Int) -> Float {
+    public static func globalShift(_ a: [Float], _ b: [Float], width w: Int, height h: Int) -> Float {
         guard a.count == w * h, b.count == w * h else { return 0 }
         func down(_ s: [Float], _ f: Int) -> (v: [Float], w: Int, h: Int) {
             let sw = w / f, sh = h / f

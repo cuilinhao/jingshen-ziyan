@@ -28,6 +28,10 @@ public final class BokehRenderer {
     public internal(set) var debugWeights: FloatMap?
     public internal(set) var debugLowDisparity: FloatMap?
     public internal(set) var debugMatte: FloatMap?
+    /// 低分辨率原图、引导滤波 + 跨帧稳定后（主体遮罩前）的视差、焦外稳定后的低分辨率虚化结果（GPU 版逐步对比用）
+    public internal(set) var debugLow: PlanarImage?
+    public internal(set) var debugRefinedDisparity: FloatMap?
+    public internal(set) var debugBokeh: PlanarImage?
 
     // ---
     
@@ -36,7 +40,7 @@ public final class BokehRenderer {
 
     public func render(image: PlanarImage, disparity: FloatMap,
                        lens: LensParameters, quality: RenderQuality = .photo,
-                       temporal: TemporalState? = nil) -> PlanarImage {
+                       temporal: TemporalState? = nil, centers givenCenters: [Float]? = nil) -> PlanarImage {
         precondition(image.width == disparity.width && image.height == disparity.height,
                      "视差图需要先缩放到和图像相同的尺寸（见 DepthRefiner.refine）")
         let start = DispatchTime.now()
@@ -72,7 +76,7 @@ public final class BokehRenderer {
         for v in s { sMin = min(sMin, v); sMax = max(sMax, v) }
 
         // ---- 2. 深度分层：靠近对焦面的层更密（小半径之间的差别肉眼更敏感）----
-        let centers = Self.layerCenters(sMin: sMin, sMax: sMax, perSide: quality.layersPerSide)
+        let centers = givenCenters ?? Self.layerCenters(sMin: sMin, sMax: sMax, perSide: quality.layersPerSide)
         let zeroIndex = centers.firstIndex(of: 0)!
         lastLayerCount = centers.count
 
@@ -324,7 +328,7 @@ public final class BokehRenderer {
         return t * t * (3 - 2 * t)
     }
 
-    static func layerCenters(sMin: Float, sMax: Float, perSide K: Int) -> [Float] {
+    public static func layerCenters(sMin: Float, sMax: Float, perSide K: Int) -> [Float] {
         let minSpacing: Float = 0.35
         var neg: [Float] = []
         for k in stride(from: K, through: 1, by: -1) {

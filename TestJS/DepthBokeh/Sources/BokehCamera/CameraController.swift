@@ -1,8 +1,11 @@
 #if os(iOS)
 @preconcurrency import AVFoundation
 import Combine
+import CoreVideo
+import Metal
 import UIKit
 import BokehCore
+import BokehMetal
 
 /// 拍下来的一张带深度的照片（已降采样、深度已对齐），可以反复改光圈、改对焦点
 public struct CapturedDepthPhoto: Identifiable {
@@ -34,19 +37,17 @@ public struct CapturedDepthPhoto: Identifiable {
 ///    0.2 秒淡入
 ///  - 点数字时预览在 0.3 秒内平滑变焦过去
 ///
-/// 每帧在后台线程用纯 Swift 的 BokehRenderer 渲染虚化预览；拍照时连同深度一起拿到，交给 PhotoBokehEditor
+/// 每一帧：CPU 上的 LiveFrameAnalyzer 在深度图分辨率上做对焦、主体种子这些小活，GPU（MetalBokehRenderer）
+/// 直接读相机帧（不拷贝）做逐像素的虚化，写进屏幕要显示的纹理（PreviewDisplay / MetalPreviewView）。
+/// 省电：GPU 忙不过来就丢帧、画面静止时隔帧处理、系统发热时降帧降分辨率、人像分割按需跑。
+/// 拍照时连同深度一起拿到，交给 PhotoBokehEditor
 public final class DepthCameraController: NSObject, ObservableObject, @unchecked Sendable {
 
     // MARK: - 给 UI 的状态（只在主线程修改）
-    @Published public private(set) var previewImage: UIImage?
-    /// previewImage 的视场倍率（1× = 主摄）。界面用 `previewZoom / previewFrameZoom` 补上它和当前倍率之间的差
-    @Published public private(set) var previewFrameZoom: CGFloat = 1
-    /// 换相机时的上一帧（淡出用）；`routeTransitionID` 每换一次相机加一
-    @Published public private(set) var transitionImage: UIImage?
-    @Published public private(set) var transitionImageZoom: CGFloat = 1
-    @Published public private(set) var routeTransitionID = 0
-    /// transitionImage 开始淡出的时间（CACurrentMediaTime）
-    public private(set) var transitionStart: CFTimeInterval = 0
+    /// 预览显示（MetalPreviewView 用它画）。没有 Metal 时为 nil
+    public let display: PreviewDisplay?
+    /// 已经有画面了（之前界面显示转圈）
+    @Published public private(set) var hasPreviewFrame = false
     @Published public private(set) var statusText = "正在启动相机…"
     @Published public private(set) var lastPhoto: CapturedDepthPhoto?
     @Published public private(set) var isCapturing = false
@@ -133,7 +134,6 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
     private var zoomRevision = 0
     private var latestFrameRevision = -1
     private var glideToken = 0
-    private var transitionToken = 0
     /// 屏幕上那一帧相对它的相机画面裁了多少（点按对焦换算坐标用）
     private var displayedCrop: CGFloat = 1
 
@@ -153,8 +153,26 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
     private var isConfigured = false
 
     // MARK: - 每帧状态（只在 dataQueue 上访问）
-    /// 每帧的对焦、虚化、跨帧稳定（纯 Swift，云主机上的模拟测试跑的是同一份代码）
-    private let pipeline = LivePreviewPipeline()
+    /// 每帧在 CPU 上的分析（对焦、主体太近、分层、主体种子、手机是否在动），云主机上的模拟测试跑的是同一份代码
+    private let analyzer = LiveFrameAnalyzer()
+    /// GPU 渲染（着色器在后台编译好之前为 nil）
+    private var gpu: MetalBokehRenderer?
+    private let temporal = MetalTemporalState()
+    private var textureCache: CVMetalTextureCache?
+    /// 输出纹理（轮流用；换相机时整组换新的，屏幕上淡出的那一帧不会被覆盖）
+    private var outputs: [MTLTexture] = []
+    private var outputIndex = 0
+    /// 已经交给 GPU、还没算完的帧
+    private var framesInFlight = 0
+    private var frameCounter = 0
+    private var gpuTimes: [Double] = []
+    private var shownTimes: [CFTimeInterval] = []
+    /// 画面从什么时候开始静止（静止一会儿后隔帧处理）
+    private var stillSince: CFTimeInterval?
+    private var lastRenderInputs: (fNumber: Float, zoom: CGFloat)?
+    /// 系统压力（发热、耗电），由相机设备的 systemPressureState 更新（paramLock 保护）
+    private var _pressureLevel = 0
+    private var pressureObservation: NSKeyValueObservation?
     private var acceptedVideoOutput: AVCaptureVideoDataOutput?
     private var acceptedSynchronizer: AVCaptureDataOutputSynchronizer?
     private var tooCloseState = false
@@ -188,7 +206,31 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
     // 拍照时用：最近一帧的裁切
     private var lastFrameCrop: CGFloat = 1
 
-    public override init() { super.init() }
+    public override init() {
+        display = PreviewDisplay()
+        super.init()
+        display?.zoomProvider = { [weak self] in self?.previewZoom ?? 1 }
+        // 编译着色器（0.1–0.3 秒）放在数据队列上：相机出第一帧之前做完，帧处理也在这个队列上
+        dataQueue.async { self.setUpGPU() }
+    }
+
+    /// dataQueue
+    private func setUpGPU() {
+        guard let display else {
+            setStatus("这台设备不支持 Metal")
+            return
+        }
+        do {
+            let renderer = try MetalBokehRenderer(device: display.device)
+            var cache: CVMetalTextureCache?
+            CVMetalTextureCacheCreate(kCFAllocatorDefault, nil, display.device, nil, &cache)
+            gpu = renderer
+            textureCache = cache
+            display.attach(renderer)
+        } catch {
+            setStatus("GPU 着色器编译失败：\(error)")
+        }
+    }
 
     // MARK: - 启停
 
@@ -225,7 +267,11 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
         dataQueue.async {
             guard self.previewPaused != paused else { return }
             self.previewPaused = paused
-            if !paused { self.pipeline.resetHistory() }
+            if !paused {
+                self.analyzer.resetHistory()
+                self.temporal.reset()
+                self.stillSince = nil
+            }
         }
     }
 
@@ -334,13 +380,14 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
         glideTo = zoom
         paramLock.unlock()
         zoomFactor = zoom
-        if glide { markGliding() }
+        if glide { markGliding() } else { display?.requestRedraw() }
     }
 
     private func markGliding() {
         glideToken &+= 1
         let token = glideToken
         isZoomGliding = true
+        display?.animate(until: CACurrentMediaTime() + Self.glideDuration + 0.05)
         DispatchQueue.main.asyncAfter(deadline: .now() + Self.glideDuration + 0.05) {
             if self.glideToken == token { self.isZoomGliding = false }
         }
@@ -537,6 +584,7 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
         }
         session.addInput(input)
         self.device = device
+        observePressure(on: device)
 
         let pick = plan.format
         do {
@@ -669,6 +717,23 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
         return true
     }
 
+    /// sessionQueue：跟踪相机的系统压力（机身发热、电量）。压力上来时预览降帧、降分辨率，
+    /// 不等系统自己把相机降到很低的帧率甚至关掉
+    private func observePressure(on device: AVCaptureDevice) {
+        pressureObservation = device.observe(\.systemPressureState, options: [.initial, .new]) { [weak self] d, _ in
+            let level: Int
+            switch d.systemPressureState.level {
+            case .serious: level = 1
+            case .critical, .shutdown: level = 2
+            default: level = 0
+            }
+            guard let self else { return }
+            self.paramLock.lock()
+            self._pressureLevel = level
+            self.paramLock.unlock()
+        }
+    }
+
     /// 深度帧率默认可能比视频低（甚至是 0）：明确设成 30 fps（限制在深度格式支持的范围内）。
     /// 视频或深度格式一变它就会被重置，所以每次重建后都要设
     private func capDepthFrameRate(_ device: AVCaptureDevice) {
@@ -709,7 +774,9 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
 
     /// dataQueue：深度、对焦、时间平滑的历史都和具体的相机画面绑定
     private func resetDepthHistory() {
-        pipeline.resetHistory()
+        analyzer.resetHistory()
+        temporal.reset()
+        stillSince = nil
         lastMonoMap = nil
         monoRange = nil
         monoCounter = 0
@@ -729,12 +796,78 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
 
     // MARK: - 每一帧（dataQueue）
 
+    /// 省电档位：0 = 正常；1 = 隔帧处理、模糊部分降到 1/4 分辨率；2 = 每三帧处理一次、预览降到 1080
+    private func powerLevel() -> Int {
+        paramLock.lock()
+        let pressure = _pressureLevel
+        paramLock.unlock()
+        let thermal: Int
+        switch ProcessInfo.processInfo.thermalState {
+        case .serious: thermal = 1
+        case .critical: thermal = 2
+        default: thermal = 0
+        }
+        return max(pressure, thermal)
+    }
+
+    /// 画面静止多久以后开始隔帧处理（秒）。手机放在桌上不动时，每秒只算 15 帧
+    private static let stillThrottleDelay: CFTimeInterval = 1.5
+
+    private struct CameraTexture {
+        let texture: MTLTexture
+        let ref: CVMetalTexture
+    }
+
+    /// 相机帧直接当纹理用（不拷贝）。`.bgra8Unorm_srgb`：GPU 读出来已经是线性光
+    private func cameraTexture(_ pixelBuffer: CVPixelBuffer) -> CameraTexture? {
+        guard let cache = textureCache else { return nil }
+        let w = CVPixelBufferGetWidth(pixelBuffer), h = CVPixelBufferGetHeight(pixelBuffer)
+        var cv: CVMetalTexture?
+        guard CVMetalTextureCacheCreateTextureFromImage(kCFAllocatorDefault, cache, pixelBuffer, nil,
+                                                        .bgra8Unorm_srgb, w, h, 0, &cv) == kCVReturnSuccess,
+              let cv, let texture = CVMetalTextureGetTexture(cv) else { return nil }
+        return CameraTexture(texture: texture, ref: cv)
+    }
+
+    /// 输出纹理（4 张轮流用：GPU 上最多 2 帧，屏幕上显示的那张不会被正在算的帧覆盖）。
+    /// fresh = 换相机后的第一帧：整组换新的，旧的那张留在屏幕上淡出
+    private func nextOutput(width: Int, height: Int, fresh: Bool) -> MTLTexture? {
+        guard let gpu else { return nil }
+        if fresh || outputs.first.map({ $0.width != width || $0.height != height }) == true {
+            outputs = []
+            outputIndex = 0
+        }
+        if outputs.count < 4 {
+            let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm, width: width, height: height,
+                                                             mipmapped: false)
+            d.usage = [.shaderRead, .shaderWrite]
+            d.storageMode = .private
+            guard let t = gpu.device.makeTexture(descriptor: d) else { return nil }
+            outputs.append(t)
+            outputIndex = outputs.count - 1
+            return t
+        }
+        outputIndex = (outputIndex + 1) % outputs.count
+        return outputs[outputIndex]
+    }
+
     private func processFrame(_ sampleBuffer: CMSampleBuffer, depthData: AVDepthData?) {
         let timestamp = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
         guard !previewPaused,
               !minimumFrameTimestamp.isValid || CMTimeCompare(timestamp, minimumFrameTimestamp) >= 0,
               let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+        // 着色器还在编译
+        guard let gpu, let display else { return }
+        // GPU 上最多 2 帧：再来就丢掉这一帧（延迟不累积，也不白算）
+        guard framesInFlight < 2 else { return }
         let t0 = CACurrentMediaTime()
+
+        // 省电：画面静止一会儿以后隔帧处理；系统发热时处理得更少
+        let power = powerLevel()
+        frameCounter &+= 1
+        var interval = power >= 2 ? 3 : (power >= 1 ? 2 : 1)
+        if let still = stillSince, t0 - still > Self.stillThrottleDelay { interval = max(interval, 2) }
+        if routeReady, interval > 1, frameCounter % interval != 0 { return }
 
         // 1. 硬件深度。有的相机深度帧比视频少：只在同一条线路里短暂沿用上一张
         var hardware: FloatMap?
@@ -798,66 +931,118 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
         }
         let crop = max(1, zoomNow / max(streamZoom, 0.01))
         let frameZoom = streamZoom * crop
-        // 发热降频时减少每帧的计算量（模糊部分的分辨率降到 1/4，严重时预览也降到 1080），保持跟手
-        let thermal = ProcessInfo.processInfo.thermalState
-        let hot = thermal == .serious || thermal == .critical
-        let longSide = thermal == .critical ? min(previewLongSide, 1080) : previewLongSide
-        let image = ImageBridge.planarImage(from: pixelBuffer, longSide: longSide, crop: crop)
         lastFrameCrop = crop
 
-        guard let fullDisparity = disparity else {
-            // 没有深度（AI 模型还没准备好）：直接显示原图
-            publish(ImageBridge.uiImage(from: image, orientation: previewOrientation), zoom: frameZoom, crop: crop,
-                    firstRouteFrame: firstRouteFrame, source: source, text: noDepthText())
-            return
-        }
+        // 5. 输出尺寸固定（相机整帧缩到 previewLongSide，严重发热时 1080），裁出来的那块缩放进去：
+        //    拖刻度盘时尺寸不变，GPU 上的中间结果和跨帧历史都不用重建
+        let W = CVPixelBufferGetWidth(pixelBuffer), H = CVPixelBufferGetHeight(pixelBuffer)
+        let longSide = power >= 2 ? min(previewLongSide, 1080) : previewLongSide
+        let scale = min(1, Double(longSide) / Double(max(W, H)))
+        let outW = max(1, Int((Double(W) * scale).rounded())), outH = max(1, Int((Double(H) * scale).rounded()))
+        let cw = Double(W) / Double(crop), ch = Double(H) / Double(crop)
+        let region = MetalBokehRenderer.SourceRegion(x: Float((Double(W) - cw) / 2), y: Float((Double(H) - ch) / 2),
+                                                     width: Float(cw), height: Float(ch))
+        guard let camera = cameraTexture(pixelBuffer),
+              let output = nextOutput(width: outW, height: outH, fresh: firstRouteFrame),
+              let cb = gpu.commandQueue.makeCommandBuffer() else { return }
+        cb.label = "预览帧"
 
-        // 人像分割在单独的队列上跑（用上一次的结果，不增加这一帧的延迟）
-        if keepSubjectSharp { segmenter.update(with: pixelBuffer) }
+        let text: String
+        if let fullDisparity = disparity {
+            // 人像分割在单独的队列上跑（用上一次的结果，不增加这一帧的延迟；画面里一直没人时很少跑）
+            if keepSubjectSharp { segmenter.update(with: pixelBuffer, now: t0) }
 
-        // 对焦点（相机画面坐标）
-        paramLock.lock()
-        let p = _focusPoint
-        let tapped = focusResetPending
-        focusResetPending = false
-        paramLock.unlock()
-
-        var settings = pipeline.settings
-        settings.blurDownscale = hot ? max(blurDownscale, 4) : blurDownscale
-        settings.focusTolerance = focusTolerance
-        settings.lensModel = lensModel
-        settings.virtualFocalLength = virtualFocalLength
-        settings.keepSubjectSharp = keepSubjectSharp
-        settings.minSubjectDistance = minSubjectDistance
-        pipeline.settings = settings
-        let result = pipeline.process(LivePreviewPipeline.Frame(
-            image: image, disparity: fullDisparity, relativeDepth: relative, crop: Float(crop), fNumber: fNumber,
-            focusPoint: (Float(p.x), Float(p.y)), focusTapped: tapped, time: t0,
-            personMask: keepSubjectSharp ? segmenter.latestMask : nil))
-
-        if result.focusRecentered {
-            // 原来的对焦点已经裁到画面外：回到中心，镜头也回到连续自动对焦
+            // 对焦点（相机画面坐标）
             paramLock.lock()
-            if !focusResetPending && _focusPoint == p { _focusPoint = CGPoint(x: 0.5, y: 0.5) }
+            let p = _focusPoint
+            let tapped = focusResetPending
+            focusResetPending = false
             paramLock.unlock()
-            sessionQueue.async { self.focusDeviceAtCenter() }
-        }
-        if result.tooClose != tooCloseState {
-            tooCloseState = result.tooClose
-            let v = result.tooClose
-            DispatchQueue.main.async { self.isTooClose = v }
-        }
-        let ui = ImageBridge.uiImage(from: result.image, orientation: previewOrientation)
 
-        // 统计帧耗时
-        let ms = (CACurrentMediaTime() - t0) * 1000
-        frameTimes.append(ms)
+            var settings = analyzer.settings
+            settings.blurDownscale = power >= 1 ? max(blurDownscale, 4) : blurDownscale
+            settings.focusTolerance = focusTolerance
+            settings.lensModel = lensModel
+            settings.virtualFocalLength = virtualFocalLength
+            settings.keepSubjectSharp = keepSubjectSharp
+            settings.minSubjectDistance = minSubjectDistance
+            settings.layersPerSide = RenderQuality.preview.layersPerSide
+            analyzer.settings = settings
+            // 裁出来那块画面的小图（和裁切后的深度图一样大）：按颜色补主体边缘、判断手机 / 画面是不是在动
+            let dw = max(1, Int((Double(fullDisparity.width) / Double(crop)).rounded()))
+            let dh = max(1, Int((Double(fullDisparity.height) / Double(crop)).rounded()))
+            let colors = ImageBridge.planarImage(from: pixelBuffer, width: dw, height: dh, crop: crop)
+            let fNumber = self.fNumber
+            let plan = analyzer.analyze(LiveFrameAnalyzer.Frame(
+                disparity: fullDisparity, relativeDepth: relative, crop: Float(crop), fNumber: fNumber,
+                focusPoint: (Float(p.x), Float(p.y)), focusTapped: tapped, time: t0, colors: colors,
+                personMask: keepSubjectSharp ? segmenter.latestMask : nil, outputLongSide: max(outW, outH)))
+            gpu.encode(plan: plan, quality: .preview, refinePasses: 1, source: camera.texture, region: region,
+                       output: output, encodeSRGB: true, temporal: temporal, commandBuffer: cb)
+
+            if plan.focusRecentered {
+                // 原来的对焦点已经裁到画面外：回到中心，镜头也回到连续自动对焦
+                paramLock.lock()
+                if !focusResetPending && _focusPoint == p { _focusPoint = CGPoint(x: 0.5, y: 0.5) }
+                paramLock.unlock()
+                sessionQueue.async { self.focusDeviceAtCenter() }
+            }
+            if plan.tooClose != tooCloseState {
+                tooCloseState = plan.tooClose
+                let v = plan.tooClose
+                DispatchQueue.main.async { self.isTooClose = v }
+            }
+            // 画面静止：手机没动、画面里没东西在动、没点对焦、没改 ƒ、没变焦
+            let inputsChanged = lastRenderInputs.map { $0.fNumber != fNumber || abs($0.zoom - zoomNow) > 0.0005 } ?? true
+            lastRenderInputs = (fNumber, zoomNow)
+            let still = plan.cameraShift < 0.5 && !plan.cameraMoving && plan.changedFraction < 0.005
+                && !tapped && !inputsChanged && !firstRouteFrame
+            if !still {
+                stillSince = nil
+            } else if stillSince == nil {
+                stillSince = t0
+            }
+            let focusText = plan.focusDistance.map { String(format: "对焦 %.2f m", $0) } ?? source.label
+            text = statusLine(frameZoom: frameZoom, width: outW, height: outH, power: power, start: t0) + focusText
+        } else {
+            // 没有深度（AI 模型还没准备好）：直接显示原图
+            gpu.encodeCopy(source: camera.texture, region: region, output: output, encodeSRGB: true, commandBuffer: cb)
+            stillSince = nil
+            text = noDepthText()
+        }
+
+        framesInFlight += 1
+        let holdPrevious = firstRouteFrame
+        cb.addCompletedHandler { [weak self] buffer in
+            withExtendedLifetime(camera) {}   // 相机帧要等 GPU 读完才能还给相机
+            let ms = (buffer.gpuEndTime - buffer.gpuStartTime) * 1000
+            display.show(output, zoom: frameZoom, holdPrevious: holdPrevious)
+            guard let self else { return }
+            self.dataQueue.async {
+                self.framesInFlight -= 1
+                if ms > 0 && ms < 1000 {
+                    self.gpuTimes.append(ms)
+                    if self.gpuTimes.count > 20 { self.gpuTimes.removeFirst() }
+                }
+            }
+        }
+        cb.commit()
+        publish(zoom: frameZoom, crop: crop, source: source, text: text)
+    }
+
+    /// 状态行：倍率、分辨率、每帧 CPU / GPU 耗时、实际帧率
+    private func statusLine(frameZoom: CGFloat, width: Int, height: Int, power: Int, start: CFTimeInterval) -> String {
+        let now = CACurrentMediaTime()
+        frameTimes.append((now - start) * 1000)
         if frameTimes.count > 20 { frameTimes.removeFirst() }
-        let avg = frameTimes.reduce(0, +) / Double(frameTimes.count)
-        let focusText = result.focusDistance.map { String(format: "对焦 %.2f m", $0) } ?? source.label
-        let text = String(format: "%@× · %d×%d · %.0f ms/帧 · ", Self.zoomText(frameZoom), image.width, image.height, avg)
-            + focusText + (hot ? " · 降温中" : "")
-        publish(ui, zoom: frameZoom, crop: crop, firstRouteFrame: firstRouteFrame, source: source, text: text)
+        shownTimes.append(now)
+        shownTimes.removeAll { now - $0 > 1 }
+        let cpu = frameTimes.reduce(0, +) / Double(frameTimes.count)
+        let gpuMs = gpuTimes.isEmpty ? 0 : gpuTimes.reduce(0, +) / Double(gpuTimes.count)
+        var text = String(format: "%@× · %d×%d · CPU %.0f / GPU %.1f ms · %d fps · ",
+                          Self.zoomText(frameZoom), width, height, cpu, gpuMs, shownTimes.count)
+        if power > 0 { text += "降温中 · " }
+        return text
     }
 
     private func noDepthText() -> String {
@@ -874,9 +1059,8 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
         return abs(r - r.rounded()) < 0.01 ? String(format: "%.0f", r) : String(format: "%.1f", r)
     }
 
-    /// dataQueue → 主线程：把这一帧放到屏幕上
-    private func publish(_ ui: UIImage?, zoom: CGFloat, crop: CGFloat, firstRouteFrame: Bool,
-                         source: DepthSource, text: String) {
+    /// dataQueue → 主线程：这一帧的状态（画面本身由 GPU 算完后直接交给 PreviewDisplay）
+    private func publish(zoom: CGFloat, crop: CGFloat, source: DepthSource, text: String) {
         lastPublishedZoom = zoom
         let sourceChanged = reportedSource != source
         reportedSource = source
@@ -884,20 +1068,7 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
         notifyZoomFrame = false
         let revision = frameZoomRevision
         DispatchQueue.main.async {
-            if firstRouteFrame, let old = self.previewImage {
-                // 上一条线路的最后一帧淡出（0.2 秒）
-                self.transitionStart = CACurrentMediaTime()
-                self.transitionImage = old
-                self.transitionImageZoom = self.previewFrameZoom
-                self.routeTransitionID &+= 1
-                self.transitionToken &+= 1
-                let token = self.transitionToken
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
-                    if self.transitionToken == token { self.transitionImage = nil }
-                }
-            }
-            self.previewImage = ui
-            self.previewFrameZoom = zoom
+            if !self.hasPreviewFrame { self.hasPreviewFrame = true }
             self.displayedCrop = crop
             if sourceChanged, self.zoomRevision == revision { self.depthSourceLabel = source.label }
             if CACurrentMediaTime() >= self.statusHoldUntil { self.statusText = text }

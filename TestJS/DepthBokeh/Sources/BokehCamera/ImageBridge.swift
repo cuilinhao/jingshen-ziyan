@@ -33,6 +33,22 @@ public enum ImageBridge {
                                        layout: .bgra, longSide: longSide, crop: Float(crop))
     }
 
+    /// 相机帧中间的 1/crop 缩放到 width×height（小图：给 CPU 上的分析按颜色补主体边缘、判断画面在不在动）。
+    /// 每个输出像素在它覆盖的区域里取 2×2 个样本
+    public static func planarImage(from pixelBuffer: CVPixelBuffer, width: Int, height: Int, crop: CGFloat) -> PlanarImage {
+        CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
+        let w = CVPixelBufferGetWidth(pixelBuffer)
+        let h = CVPixelBufferGetHeight(pixelBuffer)
+        let bpr = CVPixelBufferGetBytesPerRow(pixelBuffer)
+        let base = CVPixelBufferGetBaseAddress(pixelBuffer)!
+        let c = crop.isFinite ? max(1, Double(crop)) : 1
+        let cw = Double(w) / c, ch = Double(h) / c
+        return PlanarImage(interleaved8: UnsafeRawPointer(base), width: w, height: h, bytesPerRow: bpr, layout: .bgra,
+                           outputWidth: max(1, width), outputHeight: max(1, height),
+                           sourceRect: (Float((Double(w) - cw) / 2), Float((Double(h) - ch) / 2), Float(cw), Float(ch)))
+    }
+
     /// 图像中间的 1/crop（传感器方向，任何旋转下都居中）
     public static func centerCrop(_ image: CGImage, by crop: CGFloat) -> CGImage {
         guard crop.isFinite, crop > 1.001 else { return image }

@@ -84,43 +84,32 @@ struct ContentView: View {
         }
     }
 
-    /// 预览：每一帧按它渲染时的倍率出图，这里再补上它和此刻倍率之间的差（拖动刻度时跟手、
-    /// 点数字时 0.3 秒平滑变焦、换相机期间最后一帧继续放大）。换相机时上一帧 0.2 秒淡出
+    /// 预览：GPU 渲染好的帧直接画在 Metal 视图上（MetalPreviewView）。每一帧按它渲染时的倍率出图，
+    /// 显示时补上它和此刻倍率之间的差（拖动刻度时跟手、点数字时 0.3 秒平滑变焦、换相机期间最后一帧继续放大），
+    /// 换相机时上一帧 0.2 秒淡出
     private var preview: some View {
         GeometryReader { geo in
-            TimelineView(.animation(paused: !camera.isZoomGliding && camera.transitionImage == nil)) { _ in
-                let zoom = camera.previewZoom
-                ZStack {
-                    if let img = camera.previewImage {
-                        Image(uiImage: img)
-                            .resizable()
-                            .scaledToFit()
-                            .scaleEffect(Self.residualScale(zoom, camera.previewFrameZoom))
-                    } else {
-                        ProgressView()
-                    }
-                    if let held = camera.transitionImage {
-                        Image(uiImage: held)
-                            .resizable()
-                            .scaledToFit()
-                            .scaleEffect(Self.residualScale(zoom, camera.transitionImageZoom))
-                            .opacity(max(0, 1 - (CACurrentMediaTime() - camera.transitionStart) / 0.2))
-                    }
-                    if let m = focusMarker {
-                        RoundedRectangle(cornerRadius: 2)
-                            .stroke(.yellow, lineWidth: 1.5)
-                            .frame(width: 70, height: 70)
-                            .position(m)
-                            .allowsHitTesting(false)
-                    }
+            ZStack {
+                if let display = camera.display {
+                    MetalPreviewView(display: display)
                 }
-                .frame(width: geo.size.width, height: geo.size.height)
-                .clipped()
-                .contentShape(Rectangle())
-                .gesture(SpatialTapGesture().onEnded { value in
-                    handleTap(at: value.location, in: geo.size)
-                })
+                if !camera.hasPreviewFrame {
+                    ProgressView()
+                }
+                if let m = focusMarker {
+                    RoundedRectangle(cornerRadius: 2)
+                        .stroke(.yellow, lineWidth: 1.5)
+                        .frame(width: 70, height: 70)
+                        .position(m)
+                        .allowsHitTesting(false)
+                }
             }
+            .frame(width: geo.size.width, height: geo.size.height)
+            .clipped()
+            .contentShape(Rectangle())
+            .gesture(SpatialTapGesture().onEnded { value in
+                handleTap(at: value.location, in: geo.size)
+            })
         }
         .aspectRatio(3.0 / 4.0, contentMode: .fit)
         .overlay(alignment: .topLeading) {
@@ -136,21 +125,9 @@ struct ContentView: View {
         }
     }
 
-    /// 帧的倍率比此刻小多少就放大多少（只放大，不缩小：裁过的帧补不出更广的画面）
-    private static func residualScale(_ zoom: CGFloat, _ frameZoom: CGFloat) -> CGFloat {
-        guard zoom.isFinite, frameZoom.isFinite, frameZoom > 0 else { return 1 }
-        return max(1, zoom / frameZoom)
-    }
-
-    /// 屏幕点击位置 -> 图片内归一化坐标 -> 传感器原始方向坐标
+    /// 屏幕点击位置 -> 屏幕上那一帧（传感器原始方向）里的归一化坐标（和显示用同一个变换，含补上的放大）
     private func handleTap(at location: CGPoint, in container: CGSize) {
-        guard let img = camera.previewImage else { return }
-        // 去掉上面补的放大（以中心为基准）
-        let s = Self.residualScale(camera.previewZoom, camera.previewFrameZoom)
-        let center = CGPoint(x: container.width / 2, y: container.height / 2)
-        let unscaled = CGPoint(x: center.x + (location.x - center.x) / s, y: center.y + (location.y - center.y) / s)
-        guard let p = ImageGeometry.normalizedPoint(unscaled, imageSize: img.size, container: container) else { return }
-        let raw = ImageBridge.rawPoint(fromDisplayed: p, orientation: img.imageOrientation)
+        guard let raw = camera.display?.framePoint(fromView: location, viewSize: container) else { return }
         camera.focus(atRawPoint: raw)
         withAnimation(.easeOut(duration: 0.15)) { focusMarker = location }
         Task {

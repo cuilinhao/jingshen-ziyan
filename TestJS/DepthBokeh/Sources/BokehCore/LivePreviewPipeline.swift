@@ -78,27 +78,23 @@ public final class LivePreviewPipeline {
 
     public var settings = Settings()
     /// 测试用：覆盖对焦稳定器的最长坚持时间
-    public var maxHoldOverride: Double?
+    public var maxHoldOverride: Double? {
+        get { analyzer.maxHoldOverride }
+        set { analyzer.maxHoldOverride = newValue }
+    }
+    /// CPU 上的分析（和 iOS 上的 Metal 渲染共用）
+    public let analyzer = LiveFrameAnalyzer()
     public let renderer = BokehRenderer()
     public let temporal = TemporalState()
-    private var stabilizer = FocusStabilizer()
-    private var effectAmount: Float = 1
-    private var tooClose = false
-    private var lastTime: Double?
-    private var smoothedNear: Float?
-    private var smoothedFar: Float?
-    private var movingUntil: Double = -1
+    /// 最近一帧的计划（测试用）
+    public private(set) var lastPlan: FramePlan?
 
     public init() {}
 
     /// 换了相机或相机倍率：所有和旧画面绑定的历史都不能再用
     public func resetHistory() {
         temporal.reset()
-        stabilizer = FocusStabilizer()
-        smoothedNear = nil
-        smoothedFar = nil
-        lastTime = nil
-        movingUntil = -1
+        analyzer.resetHistory()
     }
 
     public func process(_ frame: Frame) -> Result {
@@ -110,87 +106,49 @@ public final class LivePreviewPipeline {
             mark = t
         }
         let c = max(frame.crop, 1)
-        var p = frame.focusPoint
-        var recentered = false
-        // 对焦点被裁到画面外了：回到中心
-        if abs(p.x - 0.5) * c > 0.5 || abs(p.y - 0.5) * c > 0.5 {
-            p = (0.5, 0.5)
-            recentered = true
-        }
-        let moving = frame.time < movingUntil
         guard let full = frame.disparity else {
+            var p = frame.focusPoint
+            var recentered = false
+            if abs(p.x - 0.5) * c > 0.5 || abs(p.y - 0.5) * c > 0.5 { p = (0.5, 0.5); recentered = true }
             return Result(image: frame.image, focusPoint: p, focusRecentered: recentered, focusDisparity: nil,
-                          focusDistance: nil, tooClose: false, cameraMoving: moving, timings: timings)
+                          focusDistance: nil, tooClose: false, cameraMoving: false, timings: timings)
         }
-        let map = full.centerCropped(by: c)
-        lap("裁深度")
+        var a = analyzer.settings
+        a.blurDownscale = settings.blurDownscale
+        a.focusTolerance = settings.focusTolerance
+        a.lensModel = settings.lensModel
+        a.virtualFocalLength = settings.virtualFocalLength
+        a.keepSubjectSharp = settings.keepSubjectSharp
+        a.minSubjectDistance = settings.minSubjectDistance
+        a.layersPerSide = settings.quality.layersPerSide
+        a.matte = settings.matte
+        a.motionCutoff = temporal.motionCutoff
+        analyzer.settings = a
+        // 裁切后的那块画面的小图（和裁切后的深度图一样大）：按颜色补边、估计手机是否在动
+        let cw = max(1, Int((Float(full.width) / c).rounded())), ch = max(1, Int((Float(full.height) / c).rounded()))
+        let colors = frame.image.resized(width: cw, height: ch)
+        let plan = analyzer.analyze(LiveFrameAnalyzer.Frame(
+            disparity: full, relativeDepth: frame.relativeDepth, crop: c, fNumber: frame.fNumber,
+            focusPoint: frame.focusPoint, focusTapped: frame.focusTapped, time: frame.time,
+            colors: colors, personMask: frame.personMask, outputLongSide: frame.image.longSide))
+        lastPlan = plan
+        lap("分析")
 
-        // 1. 对焦（裁出来的画面坐标）。点按或回到中心时重新锁定；手机在动时变远也只坚持 0.3 秒
-        let fx = 0.5 + (p.x - 0.5) * c, fy = 0.5 + (p.y - 0.5) * c
-        if frame.focusTapped || recentered { stabilizer.reset() }
-        let dt = lastTime.map { min(0.2, max(0, frame.time - $0)) } ?? (1.0 / 30)
-        lastTime = frame.time
-        stabilizer.cameraMoving = moving
-        if let h = maxHoldOverride { stabilizer.maxHold = h }
-        let focusD = stabilizer.update(map: map, nx: fx, ny: fy, dt: dt)
-
-        // 2. 主体太近：关掉景深（0.15 秒淡出 / 淡入，进出留 12% 回差）。只有绝对深度能换算成米
-        let distance: Float? = frame.relativeDepth ? nil : 1 / max(focusD, 1e-3)
-        if let d = distance {
-            if tooClose {
-                if d > settings.minSubjectDistance * 1.12 { tooClose = false }
-            } else if d < settings.minSubjectDistance {
-                tooClose = true
-            }
-        } else {
-            tooClose = false
-        }
-        effectAmount += ((tooClose ? 0 : 1) - effectAmount) * Float(1 - exp(-dt / 0.15))
-
-        // 3. 相对深度：相对距离的分母用 max(d_f, 0.25 × (近端 − 远端))
-        var relativeScale: Float?
-        if frame.relativeDepth, let range = map.percentiles(0.05, 0.95) {
-            let near = smoothedNear.map { $0 + (range.high - $0) * 0.15 } ?? range.high
-            let far = smoothedFar.map { $0 + (range.low - $0) * 0.15 } ?? range.low
-            smoothedNear = near
-            smoothedFar = far
-            relativeScale = max(focusD, 0.25 * (near - far))
-        }
-        lap("对焦")
-
-        // 4. 双分辨率渲染
-        var lens = LensParameters(fNumber: frame.fNumber, focusDisparity: focusD, model: settings.lensModel,
-                                  focalLength35mm: settings.virtualFocalLength, focusTolerance: settings.focusTolerance,
-                                  relativeScale: relativeScale)
-        lens.blurK *= effectAmount
-        lens.maxBlurFraction *= effectAmount
-        let image = frame.image
         let out: PlanarImage
-        if effectAmount < 0.02 {
-            out = image
+        if !plan.renderEffect {
+            out = frame.image
         } else {
-            var hint: SubjectHint?
-            if settings.keepSubjectSharp {
-                var matte = settings.matte
-                // 按颜色补主体边缘只用在相对深度（双摄视差 / AI）上：LiDAR 的边缘本来就准，
-                // 补了反而可能把紧挨着主体、颜色相近的后面的东西（比如后面的人）也拉清晰
-                if !frame.relativeDepth { matte.colorGrowth = 0 }
-                hint = SubjectHint(point: (fx, fy), parameters: matte)
-                if let mask = frame.personMask {
-                    hint?.personMask = mask.centerCropped(by: c)
-                }
-            }
-            let lowSide = max(160, image.longSide / max(1, settings.blurDownscale))
-            out = renderer.renderDetailPreserving(full: image, disparity: map, lens: lens, lowLongSide: lowSide,
-                                                  quality: settings.quality, refinePasses: 1,
-                                                  temporal: temporal, subject: hint)
+            let hint = plan.seeds.map { SubjectHint(point: plan.focusPoint, parameters: plan.matte, seeds: $0) }
+            out = renderer.renderDetailPreserving(full: frame.image, disparity: plan.depth, lens: plan.lens,
+                                                  lowLongSide: plan.lowLongSide, quality: settings.quality,
+                                                  refinePasses: 1, temporal: temporal, subject: hint,
+                                                  layerCenters: plan.layerCenters, stillness: plan.stillness)
         }
         lap("渲染")
-        if effectAmount >= 0.02 { timings += renderer.stageTimings.map { ("渲染." + $0.0, $0.1) } }
-        // 扫镜头的判断留给下一帧的对焦用（延续 0.25 秒，避免两次扫之间的停顿又变回长时间坚持）
-        if temporal.cameraShift >= 2 { movingUntil = frame.time + 0.25 }
-        return Result(image: out, focusPoint: p, focusRecentered: recentered, focusDisparity: focusD,
-                      focusDistance: distance, tooClose: tooClose, cameraMoving: moving, timings: timings)
+        if plan.renderEffect { timings += renderer.stageTimings.map { ("渲染." + $0.0, $0.1) } }
+        return Result(image: out, focusPoint: plan.streamFocusPoint, focusRecentered: plan.focusRecentered,
+                      focusDisparity: plan.focusDisparity, focusDistance: plan.focusDistance,
+                      tooClose: plan.tooClose, cameraMoving: plan.cameraMoving, timings: timings)
     }
 
     static func now() -> Double {

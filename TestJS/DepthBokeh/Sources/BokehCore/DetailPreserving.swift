@@ -7,11 +7,14 @@ public struct SubjectHint {
     /// 人像分割遮罩（和视差图同一画面，任意分辨率，0…1）。对焦点落在人身上时，整个人保持清晰 ——
     /// 包括伸出脸外、深度根本测不到的眼镜框
     public var personMask: FloatMap?
+    /// 已经在深度图分辨率上算好的种子（LiveFrameAnalyzer 算好、CPU / GPU 渲染共用）；nil = 渲染时现算
+    public var seeds: SubjectSeeds?
     public init(point: (Float, Float)?, parameters: SubjectMatteParameters = SubjectMatteParameters(),
-                personMask: FloatMap? = nil) {
+                personMask: FloatMap? = nil, seeds: SubjectSeeds? = nil) {
         self.point = point
         self.parameters = parameters
         self.personMask = personMask
+        self.seeds = seeds
     }
 }
 
@@ -31,21 +34,29 @@ extension BokehRenderer {
     ///   - disparity: 任意分辨率的视差图（会被缩放、对齐到低分辨率图像）
     ///   - lowLongSide: 低分辨率的长边像素数（实时预览建议 360–480）
     ///   - temporal: 实时预览传同一个对象进来，跨帧稳定深度边缘和光斑；拍照编辑传 nil
+    ///   - layerCenters: 分层位置（LiveFrameAnalyzer 按深度范围算好，GPU 版用同一组）；nil = 按这张视差图现算
+    ///   - stillness: 画面整体静止的程度（LiveFrameAnalyzer 估计）；nil = TemporalState 自己估计
     public func renderDetailPreserving(full: PlanarImage, disparity: FloatMap, lens: LensParameters,
                                        lowLongSide: Int, quality: RenderQuality = .preview,
                                        refinePasses: Int = 1, temporal: TemporalState? = nil,
-                                       subject: SubjectHint? = nil) -> PlanarImage {
+                                       subject: SubjectHint? = nil, layerCenters: [Float]? = nil,
+                                       stillness: Float? = nil) -> PlanarImage {
         let scale = Float(lowLongSide) / Float(full.longSide)
+        // 主体种子：在深度图分辨率上算（和 GPU 版共用同一套规则）
+        var seeds = subject?.seeds
+        if let sh = subject, seeds == nil {
+            seeds = Self.computeSeeds(full: full, disparity: disparity, lens: lens, hint: sh)
+        }
         if scale >= 0.95 {
             let luma = full.perceptualLuma()
             var d = DepthRefiner.refine(disparity: disparity, guide: full, passes: refinePasses, guideLuma: luma)
-            if let t = temporal { d = t.prepare(luma: luma.values, disparity: d) }
-            if let sh = subject {
+            if let t = temporal { d = t.prepare(luma: luma.values, disparity: d, stillness: stillness) }
+            if let sh = subject, let seeds {
                 d = SubjectMatte.apply(disparity: d, image: full, focusDisparity: lens.focusDisparity,
-                                       focusPoint: sh.point, parameters: sh.parameters,
-                                         scale: lens.relativeScale, personMask: sh.personMask).0
+                                       parameters: sh.parameters, scale: lens.relativeScale, seeds: seeds).0
             }
-            return render(image: full, disparity: d, lens: lens, quality: quality, temporal: temporal)
+            return render(image: full, disparity: d, lens: lens, quality: quality, temporal: temporal,
+                          centers: layerCenters)
         }
         stageTimings.removeAll(keepingCapacity: true)
         var mark = DispatchTime.now().uptimeNanoseconds
@@ -61,17 +72,18 @@ extension BokehRenderer {
         lap("缩小")
         var dLow = DepthRefiner.refine(disparity: disparity, guide: low, passes: refinePasses, guideLuma: lowLuma)
         lap("深度对齐")
-        if let t = temporal { dLow = t.prepare(luma: lowLuma.values, disparity: dLow) }
+        if let t = temporal { dLow = t.prepare(luma: lowLuma.values, disparity: dLow, stillness: stillness) }
         lap("时间稳定")
+        let refined = captureDebugMaps ? dLow : nil
         var matte: FloatMap?
-        if let sh = subject {
+        if let sh = subject, let seeds {
             let res = SubjectMatte.apply(disparity: dLow, image: low, focusDisparity: lens.focusDisparity,
-                                         focusPoint: sh.point, parameters: sh.parameters,
-                                         scale: lens.relativeScale, personMask: sh.personMask)
+                                         parameters: sh.parameters, scale: lens.relativeScale, seeds: seeds)
             dLow = res.0; matte = res.1
         }
         lap("主体遮罩")
-        var bokeh = render(image: low, disparity: dLow, lens: lens, quality: quality, temporal: temporal)
+        var bokeh = render(image: low, disparity: dLow, lens: lens, quality: quality, temporal: temporal,
+                           centers: layerCenters)
         lap("虚化")
         stageTimings += renderTimings.map { ("虚化." + $0.0, $0.1) }
 
@@ -92,6 +104,9 @@ extension BokehRenderer {
             debugWeights = FloatMap(width: lw, height: lh, values: w)
             debugLowDisparity = dLow
             debugMatte = matte
+            debugLow = low
+            debugRefinedDisparity = refined
+            debugBokeh = bokeh
         }
 
         // 双线性插值表（像素中心对齐）
@@ -150,6 +165,15 @@ extension BokehRenderer {
         }}}}}}}}}}}}}}}}
         lap("合成")
         return out
+    }
+
+    /// 在深度图分辨率上算主体种子（颜色从原图缩小得到）
+    static func computeSeeds(full: PlanarImage, disparity: FloatMap, lens: LensParameters, hint: SubjectHint) -> SubjectSeeds {
+        let filled = DepthRefiner.fillInvalid(disparity)
+        let colors = full.resized(width: filled.width, height: filled.height)
+        return SubjectMatte.seeds(depth: filled, colors: colors, focusDisparity: lens.focusDisparity,
+                                  focusPoint: hint.point, parameters: hint.parameters, scale: lens.relativeScale,
+                                  personMask: hint.personMask)
     }
 
     /// 缩小到指定长边：整数倍时用盒式平均（快），否则用通用缩放

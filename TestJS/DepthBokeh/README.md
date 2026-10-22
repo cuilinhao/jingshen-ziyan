@@ -2,8 +2,9 @@
 
 这个项目复刻了 iPhone 相机「人像 → ƒ 景深」的效果：取景时可以实时拖动 ƒ 值、点按换对焦点，拍完以后还能重新调景深。
 
-- **BokehCore**：景深渲染引擎，**纯 Swift**，只依赖 Foundation / Dispatch，不调用 Core Image、Metal 或任何现成的模糊滤镜。iOS、macOS、Linux 都能编译。
-- **BokehCamera**：iOS 相机层，用 AVFoundation 同步采集视频帧和深度图，交给 BokehCore 渲染。
+- **BokehCore**：景深算法的 CPU 参考实现 + 每帧的分析（对焦、主体、分层），**纯 Swift**，只依赖 Foundation / Dispatch，不调用 Core Image 或任何现成的模糊滤镜。iOS、macOS、Linux 都能编译。
+- **BokehMetal**：同一套算法的 GPU 版（Metal 计算着色器，`BokehShaderSource.swift`），App 里实时预览和拍后编辑都用它。和 CPU 版逐步对比、结果一致（Mac 上 `swift test`）。
+- **BokehCamera**：iOS 相机层，用 AVFoundation 同步采集视频帧和深度图，CPU 上分析、GPU 上渲染，直接画到 Metal 视图上。
 - **App/**：SwiftUI 界面（取景、ƒ 滑块、点按对焦、快门、拍后编辑），3 个文件。
 - **bokeh-cli**：命令行工具，在电脑上用图片和深度图调试算法。
 
@@ -19,7 +20,7 @@
 4. Target → Info 里添加两个权限说明：
    - `Privacy - Camera Usage Description`（NSCameraUsageDescription），比如「拍摄带深度信息的照片」
    - `Privacy - Photo Library Additions Usage Description`（NSPhotoLibraryAddUsageDescription），比如「保存虚化后的照片」
-5. **Product → Scheme → Edit Scheme → Run → Build Configuration 改成 Release。** 这一步很重要：渲染器是纯 Swift 的 CPU 循环，Debug 模式不开优化，会慢 10 到 50 倍。
+5. **Product → Scheme → Edit Scheme → Run → Build Configuration 改成 Release。** 虚化在 GPU 上算，但每帧 CPU 上的分析（对焦、主体种子）是纯 Swift 循环，Debug 模式不开优化会慢很多、更耗电。
 6. 选你的 iPhone，运行。
 7. （可选，0.5× 超广角要用）把 `DepthAnythingV2SmallF16.mlpackage`（Apple 的 Core ML 版 Depth Anything V2，约 48 MB）拖进 App target。
    没打包的话，第一次切到 0.5× 时会从 Hugging Face（国内先试 hf-mirror.com）下载并在手机上编译。
@@ -39,10 +40,30 @@
 拖动时只裁当前相机的画面，往小拖超过当前相机 5% 才马上换相机；松手约 0.3 秒后换到这个倍率最合适的相机。
 换相机期间保留最后一帧，新相机出了 3 帧并且有深度（最多 0.8 秒）后淡入。路线规划在 `LensCatalog.swift`。
 
+## 实时预览怎么跑、怎么省电
+
+每一帧：
+
+1. **CPU**（`LiveFrameAnalyzer`，深度图分辨率 ≤ 320×240，几毫秒）：对焦稳定、主体太近、相对深度保护、分层位置、主体种子、手机 / 画面是不是在动，得到一份 `FramePlan`。
+2. **GPU**（`MetalBokehRenderer`）：相机帧直接当纹理用（`CVMetalTextureCache`，不拷贝），按 `FramePlan` 做缩小、深度对齐、跨帧稳定、主体遮罩、分层圆盘模糊、补洞、合成，写进屏幕要显示的纹理。
+3. **显示**（`MetalPreviewView`）：有新帧才画一次；只有点数字平滑变焦（0.3 秒）、换相机淡出（0.2 秒）期间连续刷新。
+
+省电措施（手机放在桌上不动时最明显）：
+
+| 情况 | 处理 |
+|---|---|
+| GPU 上已经有 2 帧没算完 | 丢掉新来的帧（不排队、延迟不累积） |
+| 画面静止超过 1.5 秒（手机没动、画面里没东西动、没点对焦、没改 ƒ、没变焦） | 隔帧处理（15 fps），一动马上回到 30 fps |
+| 系统压力 serious（`systemPressureState` / 发热） | 隔帧处理，模糊部分降到 1/4 分辨率 |
+| 系统压力 critical | 每 3 帧处理一次，预览降到 1080 |
+| 人像分割（Vision） | 画面里有人时每秒最多 10 次，一直没人时每秒 2 次 |
+
+取景界面顶部显示每帧 CPU / GPU 耗时和实际帧率。
+
 ## 在电脑上调试算法
 
 ```bash
-swift test                                   # 单元测试
+swift test                                   # 单元测试；在 Mac 上还会跑 GPU 和 CPU 的逐像素对比（BokehMetalTests）
 swift build -c release
 .build/release/bokeh-cli in.ppm disparity.pfm out.ppm --f 2.8 --focus 0.6,0.55
 ```
@@ -77,7 +98,7 @@ echo '{"img":"frame.ppm","depth":"depth.pfm","out":"out.ppm","f":1.4,"crop":1.5,
    - 前景层用加法累积，再整体盖到背景上，前景的虚化会自然地向外扩散、边缘变成半透明。
 6. **焦外光斑**：传感器上过曝的小亮点（灯珠、反光）在模糊前先提亮，模糊后才会变成明亮的光斑，而不是灰蒙蒙一片。大块的白色区域和锐化造成的边缘亮线不会被当成高光。
 
-## 性能（在 2 核的 Linux 云主机上实测，Release 构建）
+## CPU 参考实现的性能（在 2 核的 Linux 云主机上实测，Release 构建）
 
 | 场景 | 深度处理 | 渲染 |
 |---|---|---|
@@ -85,13 +106,14 @@ echo '{"img":"frame.ppm","depth":"depth.pfm","out":"out.ppm","f":1.4,"crop":1.5,
 | 照片 2048×1536，ƒ2.8 | 约 500 ms | 约 1.4 s |
 | 照片 2048×1536，ƒ1.4 | 约 500 ms | 约 1.0 s |
 
-iPhone 的核数更多、单核更快，实际应该比这快。我没在真机上测过，具体数字以你在设备上看到的为准：取景界面顶部会显示每帧耗时。
+App 里实时预览和拍后编辑已经改用 GPU 版；CPU 版留作参考实现（测试对比、电脑上调试、没有 Metal 时的后备）。
+GPU 版在 Mac 上的耗时 `swift test` 会打印（`[性能]` 那一行），手机上的以取景界面顶部显示的为准。
 
 ## 已知限制与可以改进的地方
 
 - **物体边缘**：深度图在边缘处是「混合像素」，过渡区可能出现一圈轻微的暗边或半虚化带。可以用 Vision 的人像分割（`VNGeneratePersonSegmentationRequest`）或主体分割（`VNGenerateForegroundInstanceMaskRequest`）先修正边缘处的深度。iPhone 系统相机也是这么做的。
 - **前景背后的内容是猜出来的**：摄像头没拍到被挡住的部分，只能外推。前景虚化越强，这一点越明显。
-- **CPU 实现**：如果要全分辨率 4K 实时，可以把 `diskBlur` 移植到 Metal compute shader，算法本身不用改（只是 shader 不是 Swift 写的）。
+- **GPU 版和 CPU 版要一起改**：改算法时两边都要改，`swift test` 在 Mac 上会逐步对比（低分辨率原图、对齐后的深度、主体遮罩、虚化、虚化程度、输出）。
 - **双摄视差是「相对精度」**（`depthDataAccuracy == .relative`），算出来的绝对虚化量不精确。可以把 `virtualFocalLength` 当成「虚化强度」来调。
 - **单摄机型**：没有硬件深度。可以换成 Core ML 的单目深度模型（比如 Depth Anything、Apple 的 Depth Pro）来输出视差图，后面的流程完全一样。
 - 处理时统一转成 sRGB，HEIC 照片的 P3 广色域会丢失；前置原深感摄像头没有接入（它的方向和镜像需要另外处理）。

@@ -38,23 +38,33 @@ final class PersonSegmenter: @unchecked Sendable {   // 可变状态都由 lock 
         lock.lock()
         mask = nil
         generation &+= 1
+        lastStart = -1
         lock.unlock()
     }
 
-    /// 用这一帧更新遮罩（异步）
-    func update(with pixelBuffer: CVPixelBuffer) {
+    /// 上一次开始分割的时间、最近一次看到人的时间
+    private var lastStart: TimeInterval = -1
+    private var lastPersonSeen: TimeInterval = -100
+
+    /// 用这一帧更新遮罩（异步）。省电：画面里有人（最近 3 秒看到过）时每秒最多 10 次，
+    /// 一直没人时每秒 2 次（只为了发现有人走进画面）
+    func update(with pixelBuffer: CVPixelBuffer, now: TimeInterval) {
         lock.lock()
-        if busy {
+        let interval: TimeInterval = now - lastPersonSeen < 3 ? 0.1 : 0.5
+        if busy || now - lastStart < interval {
             lock.unlock()
             return
         }
         busy = true
+        lastStart = now
         let gen = generation
         lock.unlock()
         queue.async {
             let result = self.segment(pixelBuffer)
+            let hasPerson = result.map { m in m.values.contains { $0 > 0.5 } } ?? false
             self.lock.lock()
-            if gen == self.generation { self.mask = result }
+            if gen == self.generation { self.mask = hasPerson ? result : nil }
+            if hasPerson { self.lastPersonSeen = now }
             self.busy = false
             self.lock.unlock()
         }

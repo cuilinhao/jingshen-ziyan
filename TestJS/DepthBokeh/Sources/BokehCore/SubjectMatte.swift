@@ -33,60 +33,104 @@ public struct SubjectMatteParameters: Equatable {
     public init() {}
 }
 
+/// 主体的「种子」：在深度图分辨率（≤ 320×240）上、用 CPU 算好的几张小遮罩。
+/// 需要「连通」「找最近」这类逐像素顺序依赖的计算都在这里做（数据量小，CPU 几毫秒），
+/// 低分辨率上的逐像素处理（引导滤波、修正视差）由 CPU 参考实现或 GPU（Metal）按同样的规则完成。
+public struct SubjectSeeds {
+    /// 和对焦点连通的深度核心（膨胀 1 像素）。nil = 不做连通限制（对焦点附近找不到核心）
+    public var connect: FloatMap?
+    /// 不看深度、直接算进主体的像素：按颜色补回的边、对焦的那个人
+    public var extra: FloatMap?
+    /// 对焦的那个人的软边遮罩（0…1），引导滤波之后再取最大值
+    public var person: FloatMap?
+
+    public init(connect: FloatMap? = nil, extra: FloatMap? = nil, person: FloatMap? = nil) {
+        self.connect = connect
+        self.extra = extra
+        self.person = person
+    }
+}
+
 public enum SubjectMatte {
 
-    /// 计算主体遮罩并修正视差。
+    /// 在深度图分辨率上算主体的种子。
     /// - Parameters:
-    ///   - disparity: 低分辨率、已经细化过的视差
-    ///   - image: 同尺寸的彩色图（线性光）
-    ///   - focusDisparity: 对焦视差
-    ///   - focusPoint: 对焦点（归一化坐标），用于连通性
-    ///   - scale: 相对距离的分母（见 LensParameters.relativeScale），nil = 对焦视差
-    ///   - personMask: 人像分割（任意分辨率，和视差图同一画面）。对焦点在人身上时，和对焦点连着的那个人整体清晰
+    ///   - depth: 已裁切、已补洞的视差图（深度图分辨率）
+    ///   - colors: 同一块画面、同样尺寸的彩色图（线性光），按颜色补边用；nil = 不补
+    ///   - focusPoint: 对焦点（归一化坐标）
+    ///   - scale: 相对距离的分母（LensParameters.relativeScale），nil = 对焦视差
+    ///   - personMask: 人像分割（同一块画面，任意分辨率）
+    public static func seeds(depth: FloatMap, colors: PlanarImage?, focusDisparity df: Float,
+                             focusPoint: (Float, Float)?, parameters p: SubjectMatteParameters,
+                             scale: Float? = nil, personMask: FloatMap? = nil) -> SubjectSeeds {
+        let w = depth.width, h = depth.height, n = w * h
+        var result = SubjectSeeds()
+        guard df > 0, n > 0 else { return result }
+        let d = depth.values
+        let norm = max(scale ?? df, 1e-3)
+        var core = [Float](repeating: 0, count: n)
+        for i in 0..<n where abs((d[i] - df) / norm) < p.band { core[i] = 1 }
+        var connected = core
+        if p.connectToFocus, let fp = focusPoint, let c = connectedComponent(core, width: w, height: h, near: fp,
+                                                                            searchFraction: p.seedSearch) {
+            connected = c
+            // 膨胀 1 像素：放大到低分辨率后，细化过的深度边缘可能比这里宽一点
+            result.connect = FloatMap(width: w, height: h, values: maxFilter(c, width: w, height: h, radius: 1))
+        }
+        var extra = [Float](repeating: 0, count: n)
+        var hasExtra = false
+        if p.colorGrowth > 0, let colors, colors.width == w, colors.height == h {
+            let grown = growByColor(core: connected, disparity: d, focusDisparity: df, norm: norm, band: p.band,
+                                    image: colors, width: w, height: h, fraction: p.colorGrowth)
+            for i in 0..<n where grown[i] > 0.5 { extra[i] = 1; hasExtra = true }
+        }
+        if let mask = personMask, let person = personRegion(mask, width: w, height: h, focusPoint: focusPoint) {
+            result.person = FloatMap(width: w, height: h, values: person)
+            for i in 0..<n where person[i] > 0.5 { extra[i] = 1; hasExtra = true }
+        }
+        if hasExtra { result.extra = FloatMap(width: w, height: h, values: extra) }
+        return result
+    }
+
+    /// 低分辨率上：按种子定出主体核心，彩色引导滤波得到遮罩 α，修正视差。
+    /// 规则（GPU 版一模一样）：
+    ///   深度核心 = |相对距离| < band 且（没有连通限制 或 connect ≥ 0.5）
+    ///   核心 = 深度核心 或 extra ≥ 0.5
+    ///   α = smoothstep(0.25, 0.75, 彩色引导滤波(核心))，再和 smoothstep(0.3, 0.7, person) 取最大
+    ///   视差 = d + α(d_f − d)；深度核心里但 α 低的（深度渗出来的），推向附近更远的视差
     /// - Returns: (修正后的视差, 遮罩 α)
     public static func apply(disparity: FloatMap, image: PlanarImage, focusDisparity df: Float,
-                             focusPoint: (Float, Float)?, parameters p: SubjectMatteParameters,
-                             scale: Float? = nil, personMask: FloatMap? = nil) -> (FloatMap, FloatMap) {
+                             parameters p: SubjectMatteParameters, scale: Float? = nil,
+                             seeds: SubjectSeeds) -> (FloatMap, FloatMap) {
         let w = disparity.width, h = disparity.height, n = w * h
         precondition(image.width == w && image.height == h)
         guard df > 0 else { return (disparity, FloatMap(width: w, height: h)) }
         let d = disparity.values
         let norm = max(scale ?? df, 1e-3)
+        let connect = seeds.connect.map { sampleAt($0, width: w, height: h) }
+        let extra = seeds.extra.map { sampleAt($0, width: w, height: h) }
+        let person = seeds.person.map { sampleAt($0, width: w, height: h) }
 
-        // 1. 核心：对焦面附近的深度
+        var depthCore = [Float](repeating: 0, count: n)
         var core = [Float](repeating: 0, count: n)
         for i in 0..<n {
-            let rel = (d[i] - df) / norm
-            if abs(rel) < p.band { core[i] = 1 }
-        }
-        if p.connectToFocus, let fp = focusPoint {
-            core = keepConnected(core, width: w, height: h, near: fp, searchFraction: p.seedSearch)
-        }
-        let depthCore = core
-        // 深度边界往里缩的那一圈：按颜色补回主体
-        if p.colorGrowth > 0 {
-            let grown = growByColor(core: core, disparity: d, focusDisparity: df, norm: norm, band: p.band,
-                                    image: image, width: w, height: h, fraction: p.colorGrowth)
-            for i in 0..<n where grown[i] > 0.5 { core[i] = 1 }
-        }
-        // 对焦在人身上：和对焦点连着的那个人整个算主体（人像分割比深度更懂「哪些是这个人」：眼镜、头发边缘）
-        let person = personMask.flatMap { personRegion($0, width: w, height: h, focusPoint: focusPoint) }
-        if let person {
-            for i in 0..<n where person[i] > 0.5 { core[i] = 1 }
+            let inBand = abs((d[i] - df) / norm) < p.band
+            let dc: Float = inBand && (connect == nil || connect![i] >= 0.5) ? 1 : 0
+            depthCore[i] = dc
+            core[i] = dc > 0 || (extra != nil && extra![i] >= 0.5) ? 1 : 0
         }
 
-        // 2. 彩色引导滤波（三个通道分别做引导，取平均，比只用亮度更能区分肤色和粉色屏幕这类亮度接近的颜色）
-        let r = max(2, Int(Float(max(w, h)) * p.radiusFraction))
+        // 彩色引导滤波（三个通道分别做引导，取平均，比只用亮度更能区分肤色和粉色屏幕这类亮度接近的颜色）
+        let r = radius(width: w, height: h, parameters: p)
         var alpha = colorGuidedAverage(image: image, input: core, width: w, height: h, radius: r, epsilon: p.epsilon)
-        // 收紧过渡带，边缘更利落
         for i in 0..<n { alpha[i] = smoothstep(0.25, 0.75, alpha[i]) }
         if let person {
             for i in 0..<n { alpha[i] = max(alpha[i], smoothstep(0.3, 0.7, person[i])) }
         }
 
-        // 3. 修正视差
+        // 修正视差
         //    α 高：拉到对焦面（主体整体清晰，包括深度缺掉的边）
-        //    核心内但 α 低（颜色说不是主体，是深度渗出来的）：换成附近较远的视差，按背景虚化
+        //    深度核心内但 α 低（颜色说不是主体，是深度渗出来的）：换成附近较远的视差，按背景虚化
         let farNearby = minFilter(d, width: w, height: h, radius: r)
         var out = d
         for i in 0..<n {
@@ -99,6 +143,32 @@ public enum SubjectMatte {
             out[i] = v
         }
         return (FloatMap(width: w, height: h, values: out), FloatMap(width: w, height: h, values: alpha))
+    }
+
+    /// 兼容旧接口：在给定分辨率上同时算种子和遮罩（照片编辑、测试用）
+    public static func apply(disparity: FloatMap, image: PlanarImage, focusDisparity df: Float,
+                             focusPoint: (Float, Float)?, parameters p: SubjectMatteParameters,
+                             scale: Float? = nil, personMask: FloatMap? = nil) -> (FloatMap, FloatMap) {
+        let s = seeds(depth: disparity, colors: image, focusDisparity: df, focusPoint: focusPoint,
+                      parameters: p, scale: scale, personMask: personMask)
+        return apply(disparity: disparity, image: image, focusDisparity: df, parameters: p, scale: scale, seeds: s)
+    }
+
+    /// 引导滤波 / 最小值滤波的半径（低分辨率像素）
+    public static func radius(width w: Int, height h: Int, parameters p: SubjectMatteParameters) -> Int {
+        max(2, Int(Float(max(w, h)) * p.radiusFraction))
+    }
+
+    /// 把种子遮罩按像素中心双线性采样到 w×h（和 GPU 的线性采样一致）
+    static func sampleAt(_ m: FloatMap, width w: Int, height h: Int) -> [Float] {
+        if m.width == w && m.height == h { return m.values }
+        var out = [Float](repeating: 0, count: w * h)
+        let sx = Float(m.width) / Float(w), sy = Float(m.height) / Float(h)
+        for y in 0..<h {
+            let fy = (Float(y) + 0.5) * sy
+            for x in 0..<w { out[y * w + x] = m.sampleBilinear(x: (Float(x) + 0.5) * sx, y: fy) }
+        }
+        return out
     }
 
     /// 三个颜色通道分别做引导滤波（引导图是 sqrt(线性光)，近似感知亮度），结果取平均。
@@ -153,40 +223,29 @@ public enum SubjectMatte {
         return alpha
     }
 
-    /// 主体边缘按颜色补回：在 1/2 分辨率上，对主体（core）外面 D 以内、不比对焦面更近的像素，
+    /// 主体边缘按颜色补回（在给定分辨率上，通常是深度图分辨率）：对主体（core）外面 D 以内、不比对焦面更近的像素，
     /// 分别找附近颜色最接近的「主体像素」和「D 以外的背景像素」，明显更像主体的算回主体。
     /// 背景样本只取 D 以外的，因为 D 以内的深度本身就不可信（正是要修的那一圈）
     static func growByColor(core: [Float], disparity d: [Float], focusDisparity df: Float, norm: Float, band: Float,
                             image: PlanarImage, width w: Int, height h: Int, fraction: Float) -> [Float] {
-        let hw = max(1, w / 2), hh = max(1, h / 2), hn = hw * hh
+        let hw = w, hh = h, hn = hw * hh
         var out = [Float](repeating: 0, count: w * h)
         guard hw >= 16, hh >= 12 else { return out }
-        // 1/2 分辨率：主体、颜色（sqrt 线性光 ≈ 感知）、相对距离
+        // 主体、颜色（sqrt 线性光 ≈ 感知）、相对距离
         var c = [Float](repeating: 0, count: hn)
         var cr = [Float](repeating: 0, count: hn), cg = cr, cb = cr
         var rel = [Float](repeating: 0, count: hn)
-        for y in 0..<hh {
-            for x in 0..<hw {
-                var sc: Float = 0, sr: Float = 0, sg: Float = 0, sb: Float = 0, sd: Float = 0, nd: Float = 0
-                for yy in 0..<2 {
-                    for xx in 0..<2 {
-                        let i = min(h - 1, 2 * y + yy) * w + min(w - 1, 2 * x + xx)
-                        sc += core[i]; sr += image.r[i]; sg += image.g[i]; sb += image.b[i]
-                        if d[i].isFinite { sd += d[i]; nd += 1 }
-                    }
-                }
-                let j = y * hw + x
-                c[j] = sc >= 2 ? 1 : 0
-                cr[j] = sqrtf(max(0, sr / 4)); cg[j] = sqrtf(max(0, sg / 4)); cb[j] = sqrtf(max(0, sb / 4))
-                rel[j] = nd > 0 ? (sd / nd - df) / norm : -1
-            }
+        for j in 0..<hn {
+            c[j] = core[j] > 0.5 ? 1 : 0
+            cr[j] = sqrtf(max(0, image.r[j])); cg[j] = sqrtf(max(0, image.g[j])); cb[j] = sqrtf(max(0, image.b[j]))
+            rel[j] = d[j].isFinite ? (d[j] - df) / norm : -1
         }
         let D = max(3, Int(Float(max(hw, hh)) * fraction))
         // 离主体 D 以内（方形窗口近似）
         let near = maxFilter(c, width: hw, height: hh, radius: D)
         guard c.contains(1) else { return out }
-        // 每 4×4 一格，分别记主体像素和背景样本（D 以外）的平均颜色
-        let cs = 4, gw = (hw + cs - 1) / cs, gh = (hh + cs - 1) / cs, gn = gw * gh
+        // 每 cs×cs 一格（约长边的 1/60），分别记主体像素和背景样本（D 以外）的平均颜色
+        let cs = max(2, max(hw, hh) / 60), gw = (hw + cs - 1) / cs, gh = (hh + cs - 1) / cs, gn = gw * gh
         var fC = [Float](repeating: 0, count: gn * 3), fN = [Float](repeating: 0, count: gn)
         var bC = [Float](repeating: 0, count: gn * 3), bN = [Float](repeating: 0, count: gn)
         for y in 0..<hh {
@@ -237,12 +296,7 @@ public enum SubjectMatte {
         var seedMask = grown
         for j in 0..<hn where c[j] > 0 { seedMask[j] = 1 }
         let connected = keepConnectedAll(seedMask, from: c, width: hw, height: hh)
-        for y in 0..<h {
-            for x in 0..<w {
-                let j = min(hh - 1, y / 2) * hw + min(hw - 1, x / 2)
-                if grown[j] > 0 && connected[j] > 0 { out[y * w + x] = 1 }
-            }
-        }
+        for j in 0..<hn where grown[j] > 0 && connected[j] > 0 { out[j] = 1 }
         return out
     }
 
@@ -293,6 +347,12 @@ public enum SubjectMatte {
     /// 找不到就不做连通限制
     static func keepConnected(_ core: [Float], width w: Int, height h: Int,
                               near fp: (Float, Float), searchFraction: Float) -> [Float] {
+        connectedComponent(core, width: w, height: h, near: fp, searchFraction: searchFraction) ?? core
+    }
+
+    /// 和对焦点连通的那块（4 连通）；对焦点附近找不到核心像素时返回 nil
+    static func connectedComponent(_ core: [Float], width w: Int, height h: Int,
+                                   near fp: (Float, Float), searchFraction: Float) -> [Float]? {
         let cx = min(w - 1, max(0, Int(fp.0 * Float(w)))), cy = min(h - 1, max(0, Int(fp.1 * Float(h))))
         let R = max(1, Int(Float(max(w, h)) * searchFraction))
         var seed = -1
@@ -303,7 +363,7 @@ public enum SubjectMatte {
                 if dd < best { best = dd; seed = y * w + x }
             }
         }
-        guard seed >= 0 else { return core }
+        guard seed >= 0 else { return nil }
         var out = [Float](repeating: 0, count: w * h)
         var stack = [seed]
         out[seed] = 1

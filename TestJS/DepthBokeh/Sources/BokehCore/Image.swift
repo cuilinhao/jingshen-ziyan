@@ -89,11 +89,8 @@ public struct FloatMap {
 
     public func resized(width newW: Int, height newH: Int) -> FloatMap {
         if newW == width && newH == height { return self }
-        var src = self
         // 缩小超过 2 倍时先盒式降采样
-        while src.width >= newW * 2 && src.height >= newH * 2 {
-            src = src.halved()
-        }
+        let src = halvedToFit(width: newW, height: newH)
         var out = [Float](repeating: 0, count: newW * newH)
         let sx = Float(src.width) / Float(newW)
         let sy = Float(src.height) / Float(newH)
@@ -149,6 +146,15 @@ public struct FloatMap {
         let lo = sample[min(sample.count - 1, Int(Float(sample.count) * lower))]
         let hi = sample[min(sample.count - 1, Int(Float(sample.count) * upper))]
         return (lo, hi)
+    }
+
+    /// `resized` 的第一步：目标尺寸不到一半时先反复 2×2 盒式缩小（GPU 版在 CPU 上先做这一步，再在 GPU 上双线性缩放）
+    public func halvedToFit(width newW: Int, height newH: Int) -> FloatMap {
+        var src = self
+        while src.width >= newW * 2 && src.height >= newH * 2 {
+            src = src.halved()
+        }
+        return src
     }
 
     func halved() -> FloatMap {

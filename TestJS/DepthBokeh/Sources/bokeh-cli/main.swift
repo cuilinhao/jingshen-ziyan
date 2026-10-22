@@ -142,7 +142,7 @@ if args.first == "--live" {
         var info: [String: Any] = ["out": job["out"] as? String ?? "", "w": r.image.width, "h": r.image.height,
                                    "fx": r.focusPoint.x, "fy": r.focusPoint.y, "recentered": r.focusRecentered,
                                    "tooClose": r.tooClose, "moving": r.cameraMoving,
-                                   "shift": pipeline.temporal.cameraShift,
+                                   "shift": pipeline.lastPlan?.cameraShift ?? 0,
                                    "ms_frame": (t1 - t0) * 1000, "ms_pipeline": (t2 - t1) * 1000]
         if let d = r.focusDisparity { info["focusD"] = d }
         if let d = r.focusDistance { info["focusM"] = d }
