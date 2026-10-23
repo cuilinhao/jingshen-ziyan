@@ -90,11 +90,20 @@ public final class LiveFrameAnalyzer {
         public var outputLongSide: Int
         /// 深度是几帧之前的（这一帧没有新深度、沿用了旧的）。0 = 这一帧的
         public var depthAge: Int
+        /// 物体分割的标签图（Vision 前景实例，整个相机画面，任意分辨率；0 = 背景，1…N = 各个物体）。
+        /// 对焦点落在某个物体上、深度也对得上时，整个物体保持清晰（和人像遮罩一样）：
+        /// 斜着看到的盒子顶面在深度图里拿到的是背景的深度，靠它补回来
+        public var objectLabels: FloatMap?
+        /// 算物体分割那一帧的画面（同 personMaskColors）
+        public var objectColors: PlanarImage?
 
         public init(disparity: FloatMap, relativeDepth: Bool, crop: Float, fNumber: Float,
                     focusPoint: (x: Float, y: Float), focusTapped: Bool, time: Double,
                     colors: PlanarImage?, personMask: FloatMap?, outputLongSide: Int,
-                    personMaskColors: PlanarImage? = nil, depthAge: Int = 0) {
+                    personMaskColors: PlanarImage? = nil, depthAge: Int = 0,
+                    objectLabels: FloatMap? = nil, objectColors: PlanarImage? = nil) {
+            self.objectLabels = objectLabels
+            self.objectColors = objectColors
             self.disparity = disparity
             self.relativeDepth = relativeDepth
             self.crop = crop
@@ -223,9 +232,8 @@ public final class LiveFrameAnalyzer {
 
         // 6. 主体种子（深度图分辨率）
         var matte = settings.matte
-        // 按颜色补主体边缘只用在相对深度（双摄视差 / AI）上：LiDAR 的边缘本来就准，
-        // 补了反而可能把紧挨着主体、颜色相近的后面的东西（比如后面的人）也拉清晰
-        if !frame.relativeDepth { matte.colorGrowth = 0 }
+        // 按颜色补主体边缘：LiDAR 的边缘比双摄准，只补窄一点的一圈（盒子顶面这种只有十来个深度像素高的面）
+        if !frame.relativeDepth { matte.colorGrowth = matte.absoluteColorGrowth }
         var seeds: SubjectSeeds?
         if settings.keepSubjectSharp {
             let colors = frame.colors.map { $0.width == map.width && $0.height == map.height
@@ -233,6 +241,15 @@ public final class LiveFrameAnalyzer {
             var person = frame.personMask?.centerCropped(by: c)
             if let pm = person, let then = frame.personMaskColors?.centerCropped(by: c), let colors {
                 person = Self.dropStaleMask(pm, maskColors: then, colors: colors)
+            }
+            // 对焦的那个物体（在整个相机画面上按对焦点选，再裁）
+            if let labels = frame.objectLabels, let inst = SubjectMatte.instanceAt(labels, point: p) {
+                var object = inst.centerCropped(by: c).resized(width: map.width, height: map.height)
+                if let then = frame.objectColors?.centerCropped(by: c), let colors {
+                    object = Self.dropStaleMask(object, maskColors: then, colors: colors)
+                }
+                person = Self.addObject(object, to: person, depth: map, focusDisparity: focusD,
+                                        norm: max(relativeScale ?? focusD, 1e-3), matte: matte)
             }
             seeds = SubjectMatte.seeds(depth: map, colors: colors, focusDisparity: focusD, focusPoint: (fx, fy),
                                        parameters: matte, scale: relativeScale, personMask: person)
@@ -243,6 +260,19 @@ public final class LiveFrameAnalyzer {
                          cameraShift: shift, stillness: stillness, renderEffect: effectAmount >= 0.02,
                          layerCenters: centers, seeds: seeds, matte: matte, depth: map, lowLongSide: lowLongSide,
                          changedFraction: changed, depthAge: depthAge)
+    }
+
+    /// 物体遮罩（和深度图一样大）的深度和对焦面对得上，就并进人像遮罩（两者取大）；对不上原样返回人像遮罩
+    static func addObject(_ object: FloatMap, to person: FloatMap?, depth: FloatMap, focusDisparity df: Float,
+                          norm: Float, matte: SubjectMatteParameters) -> FloatMap? {
+        let agree = SubjectMatte.depthAgreement(object.values, depth: depth.values, focusDisparity: df, norm: norm,
+                                                band: matte.band)
+        guard agree >= matte.objectDepthAgreement else { return person }
+        guard let person else { return object }
+        let pm = person.resized(width: object.width, height: object.height)
+        var v = object.values
+        for i in 0..<v.count { v[i] = max(v[i], pm.values[i]) }
+        return FloatMap(width: object.width, height: object.height, values: v)
     }
 
     /// 人像遮罩是几帧之前的画面算的：从那以后画面变了的地方（人在动，手离开的地方）不再相信遮罩。
@@ -266,7 +296,7 @@ public final class LiveFrameAnalyzer {
     /// 拍下来的照片：没有时间历史，对焦点直接取中位数
     public static func stillPlan(disparity: FloatMap, relativeDepth: Bool, colors: PlanarImage?, fNumber: Float,
                                  focusPoint: (x: Float, y: Float), personMask: FloatMap?, outputLongSide: Int,
-                                 settings: Settings) -> FramePlan {
+                                 settings: Settings, objectLabels: FloatMap? = nil) -> FramePlan {
         let map = DepthRefiner.fillInvalid(disparity)
         let lowLongSide = max(320, outputLongSide / max(1, settings.blurDownscale))
         let focusD = DepthRefiner.focusDisparity(in: map, nx: focusPoint.x, ny: focusPoint.y)
@@ -284,13 +314,18 @@ public final class LiveFrameAnalyzer {
         let sMax = max(0, lens.signedBlurRadius(disparity: dMax, imageLongSide: lowLongSide))
         let centers = BokehRenderer.layerCenters(sMin: sMin, sMax: sMax, perSide: settings.layersPerSide)
         var matte = settings.matte
-        if !relativeDepth { matte.colorGrowth = 0 }
+        if !relativeDepth { matte.colorGrowth = matte.absoluteColorGrowth }
         var seeds: SubjectSeeds?
         if settings.keepSubjectSharp {
             let c = colors.map { $0.width == map.width && $0.height == map.height
                 ? $0 : $0.resized(width: map.width, height: map.height) }
+            var person = personMask
+            if let labels = objectLabels, let inst = SubjectMatte.instanceAt(labels, point: focusPoint) {
+                person = addObject(inst.resized(width: map.width, height: map.height), to: personMask, depth: map,
+                                   focusDisparity: focusD, norm: max(relativeScale ?? focusD, 1e-3), matte: matte)
+            }
             seeds = SubjectMatte.seeds(depth: map, colors: c, focusDisparity: focusD, focusPoint: focusPoint,
-                                       parameters: matte, scale: relativeScale, personMask: personMask)
+                                       parameters: matte, scale: relativeScale, personMask: person)
         }
         return FramePlan(lens: lens, focusPoint: focusPoint, streamFocusPoint: focusPoint, focusRecentered: false,
                          focusDisparity: focusD, focusDistance: relativeDepth ? nil : 1 / max(focusD, 1e-3),

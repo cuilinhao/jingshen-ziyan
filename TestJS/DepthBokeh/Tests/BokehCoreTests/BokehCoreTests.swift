@@ -371,4 +371,54 @@ final class BokehCoreTests: XCTestCase {
         let same = LiveFrameAnalyzer.dropStaleMask(mask, maskColors: image(10), colors: image(10))
         XCTAssertEqual(same[15, 30], 1, accuracy: 1e-4, "没动")
     }
+
+    /// 物体标签图里按对焦点选物体：点在物体上、点在物体旁边一点点、点离物体很远
+    func testInstanceAt() {
+        let w = 100, h = 80
+        var v = [Float](repeating: 0, count: w * h)
+        for y in 20..<40 { for x in 10..<30 { v[y * w + x] = 1 } }
+        for y in 30..<60 { for x in 50..<80 { v[y * w + x] = 2 } }
+        let labels = FloatMap(width: w, height: h, values: v)
+        let a = SubjectMatte.instanceAt(labels, point: (0.65, 0.55))
+        XCTAssertEqual(a?[60, 40], 1); XCTAssertEqual(a?[20, 30], 0)
+        let near = SubjectMatte.instanceAt(labels, point: (0.31, 0.3))   // 物体 1 右边一个像素
+        XCTAssertEqual(near?[15, 25], 1)
+        XCTAssertNil(SubjectMatte.instanceAt(labels, point: (0.5, 0.9)))
+    }
+
+    /// 斜着看到的盒子顶面在深度图里拿到的是背景的深度：物体分割把整个盒子（包括顶面）补成主体；
+    /// 深度大部分对不上的「物体」（一路延伸到远处的桌面）不用
+    func testObjectMaskKeepsBoxTop() {
+        let w = 80, h = 60
+        var d = [Float](repeating: 0.4, count: w * h)          // 背景 2.5 m
+        var labels = [Float](repeating: 0, count: w * h)
+        for y in 20..<50 {
+            for x in 30..<50 {
+                labels[y * w + x] = 1
+                d[y * w + x] = y < 26 ? 0.5 : 2.2                  // 顶面（前 6 行）深度错成背景
+            }
+        }
+        // 桌面：从近处一路到远处，深度大部分不在对焦面附近
+        for y in 50..<60 { for x in 0..<w { labels[y * w + x] = 2; d[y * w + x] = 0.4 + Float(y - 50) * 0.02 } }
+        for y in 56..<60 { for x in 0..<w { d[y * w + x] = 2.2 } }
+        var img = PlanarImage(width: w, height: h)
+        for i in 0..<(w * h) { img.r[i] = 0.3; img.g[i] = 0.3; img.b[i] = 0.3 }
+        let analyzer = LiveFrameAnalyzer()
+        func plan(_ fx: Float, _ fy: Float) -> FramePlan {
+            analyzer.resetHistory()
+            return analyzer.analyze(LiveFrameAnalyzer.Frame(
+                disparity: FloatMap(width: w, height: h, values: d), relativeDepth: false, crop: 1, fNumber: 1.4,
+                focusPoint: (fx, fy), focusTapped: true, time: 0, colors: img, personMask: nil, outputLongSide: 480,
+                objectLabels: FloatMap(width: w, height: h, values: labels)))
+        }
+        let box = plan(0.5, 0.6)
+        let person = box.seeds?.person
+        XCTAssertNotNil(person, "对焦在盒子上，应该用上物体遮罩")
+        XCTAssertGreaterThan(person?[40, 22] ?? 0, 0.5, "盒子顶面")
+        XCTAssertGreaterThan(box.seeds?.extra?[40, 22] ?? 0, 0.5, "盒子顶面算进主体核心")
+        XCTAssertLessThan(person?[10, 22] ?? 1, 0.5, "盒子外面")
+        // 对焦在桌面近处：桌面这个「物体」深度大部分对不上，不用
+        let table = plan(0.5, 0.97)
+        XCTAssertNil(table.seeds?.person)
+    }
 }

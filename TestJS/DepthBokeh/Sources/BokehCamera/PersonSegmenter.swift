@@ -11,15 +11,35 @@ import BokehCore
 /// 于是镜框和镜片被当成背景虚化掉，看起来蒙了一层。系统相机人像模式也是靠人像分割把整个人（包括眼镜、头发边缘）
 /// 留在清晰范围里。对焦点落在人身上时，SubjectMatte 用这张遮罩把和对焦点连着的那个人整体保持清晰。
 ///
+/// 物体也一样：斜着看到的盒子顶面在深度图里只有十来个像素高，靠后的部分拿到的是背景的深度，被虚化得像蒙了一层；
+/// 系统相机的盒子却干干净净。所以再跑一个「前景物体」分割（VNGenerateForegroundInstanceMaskRequest，
+/// 和相册「抠图」是同一个），对焦点落在某个物体上、深度也对得上时，整个物体保持清晰。
+///
 /// 实时预览：在单独的队列上跑，每帧用上一次算好的结果，不增加这一帧的延迟；上一次还没算完就跳过这一帧。
 final class PersonSegmenter: @unchecked Sendable {   // 可变状态都由 lock 保护
+    /// 最近一次的分割结果（都是传感器方向、整个相机画面），和算它们用的那一帧的小图
+    /// （遮罩总是晚几帧：拿小图和当前画面比，变了的地方不再相信遮罩）
+    struct Masks {
+        /// 人像遮罩（0…1）；画面里没人时为 nil
+        var person: FloatMap?
+        var personColors: PlanarImage?
+        /// 物体标签图（0 = 背景，1…N = 各个物体）；没有物体时为 nil
+        var objects: FloatMap?
+        var objectColors: PlanarImage?
+    }
+
     private let queue = DispatchQueue(label: "depthbokeh.segmentation", qos: .userInitiated)
     private let lock = NSLock()
     private var busy = false
     private var mask: FloatMap?
     /// 算遮罩那一帧的小图（整个相机画面，线性光）
     private var maskColors: PlanarImage?
+    private var objects: FloatMap?
+    private var objectColors: PlanarImage?
     private var generation = 0
+    /// 物体分割比人像慢、物体一般也不怎么动：每秒约 3 次
+    private let objectInterval: TimeInterval = 0.3
+    private var lastObjectStart: TimeInterval = -1
     private let handler = VNSequenceRequestHandler()
     private let request: VNGeneratePersonSegmentationRequest = {
         let request = VNGeneratePersonSegmentationRequest()
@@ -35,11 +55,11 @@ final class PersonSegmenter: @unchecked Sendable {   // 可变状态都由 lock 
         return mask
     }
 
-    /// 最近一次的遮罩，和算它用的那一帧的小图（遮罩总是晚几帧：拿小图和当前画面比，变了的地方不再相信遮罩）
-    var latest: (mask: FloatMap, colors: PlanarImage?)? {
+    /// 最近一次的人像 / 物体分割
+    var latest: Masks {
         lock.lock()
         defer { lock.unlock() }
-        return mask.map { ($0, maskColors) }
+        return Masks(person: mask, personColors: maskColors, objects: objects, objectColors: objectColors)
     }
 
     /// 换了相机：旧画面的遮罩不能再用
@@ -47,8 +67,11 @@ final class PersonSegmenter: @unchecked Sendable {   // 可变状态都由 lock 
         lock.lock()
         mask = nil
         maskColors = nil
+        objects = nil
+        objectColors = nil
         generation &+= 1
         lastStart = -1
+        lastObjectStart = -1
         lock.unlock()
     }
 
@@ -66,22 +89,47 @@ final class PersonSegmenter: @unchecked Sendable {   // 可变状态都由 lock 
         }
         busy = true
         lastStart = now
+        let doObjects = now - lastObjectStart >= objectInterval
+        if doObjects { lastObjectStart = now }
         let gen = generation
         lock.unlock()
         queue.async {
             let result = self.segment(pixelBuffer)
             let hasPerson = result.map { m in m.values.contains { $0 > 0.5 } } ?? false
+            let labels = doObjects ? Self.objectLabels(pixelBuffer) : nil
+            let hasObjects = labels.map { m in m.values.contains { $0 > 0.5 } } ?? false
             // 同一帧的小图（160 长边够判断哪里变了）
-            let thumb = hasPerson ? Self.thumbnail(pixelBuffer) : nil
+            let thumb = hasPerson || hasObjects ? Self.thumbnail(pixelBuffer) : nil
             self.lock.lock()
             if gen == self.generation {
                 self.mask = hasPerson ? result : nil
-                self.maskColors = thumb
+                self.maskColors = hasPerson ? thumb : nil
+                if doObjects {
+                    self.objects = hasObjects ? labels : nil
+                    self.objectColors = hasObjects ? thumb : nil
+                }
             }
             if hasPerson { self.lastPersonSeen = now }
             self.busy = false
             self.lock.unlock()
         }
+    }
+
+    /// 前景物体分割（传感器方向的标签图）。不支持的设备（没有神经网络引擎）返回 nil
+    static func objectLabels(_ pixelBuffer: CVPixelBuffer) -> FloatMap? {
+        let request = VNGenerateForegroundInstanceMaskRequest()
+        let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .right, options: [:])
+        guard (try? handler.perform([request])) != nil, let obs = request.results?.first else { return nil }
+        let landscape = CVPixelBufferGetWidth(pixelBuffer) >= CVPixelBufferGetHeight(pixelBuffer)
+        return sensorMask(obs.instanceMask, sensorLandscape: landscape, labels: true)
+    }
+
+    /// 拍下来的照片（传感器方向）的物体标签图
+    static func photoObjects(_ image: CGImage) -> FloatMap? {
+        let request = VNGenerateForegroundInstanceMaskRequest()
+        let handler = VNImageRequestHandler(cgImage: image, orientation: .right, options: [:])
+        guard (try? handler.perform([request])) != nil, let obs = request.results?.first else { return nil }
+        return sensorMask(obs.instanceMask, sensorLandscape: image.width >= image.height, labels: true)
     }
 
     private func segment(_ pixelBuffer: CVPixelBuffer) -> FloatMap? {
@@ -115,23 +163,30 @@ final class PersonSegmenter: @unchecked Sendable {   // 可变状态都由 lock 
     }
 
     /// Vision 输出的遮罩可能是竖的（按竖拍方向）：转回传感器方向（横）。
-    /// 传感器 (x, y) 顺时针转 90° 后在竖图的 (列 = 竖图宽 − 1 − y, 行 = x)
-    static func sensorMask(_ buffer: CVPixelBuffer, sensorLandscape: Bool) -> FloatMap? {
-        guard CVPixelBufferGetPixelFormatType(buffer) == kCVPixelFormatType_OneComponent8 else { return nil }
+    /// 传感器 (x, y) 顺时针转 90° 后在竖图的 (列 = 竖图宽 − 1 − y, 行 = x)。
+    /// labels = true：标签图，保留原始整数值（不除以 255）
+    static func sensorMask(_ buffer: CVPixelBuffer, sensorLandscape: Bool, labels: Bool = false) -> FloatMap? {
+        let format = CVPixelBufferGetPixelFormatType(buffer)
+        // 人像遮罩是 8 位；物体标签图一般也是 8 位（每个像素是物体编号），以防万一也认 32 位浮点
+        let isFloat = labels && format == kCVPixelFormatType_OneComponent32Float
+        guard format == kCVPixelFormatType_OneComponent8 || isFloat else { return nil }
         CVPixelBufferLockBaseAddress(buffer, .readOnly)
         defer { CVPixelBufferUnlockBaseAddress(buffer, .readOnly) }
         guard let base = CVPixelBufferGetBaseAddress(buffer) else { return nil }
         let mw = CVPixelBufferGetWidth(buffer), mh = CVPixelBufferGetHeight(buffer)
         let bpr = CVPixelBufferGetBytesPerRow(buffer)
         guard mw > 1, mh > 1 else { return nil }
-        let src = base.assumingMemoryBound(to: UInt8.self)
         let rotated = (mw >= mh) != sensorLandscape
         let ow = rotated ? mh : mw, oh = rotated ? mw : mh
         var values = [Float](repeating: 0, count: ow * oh)
+        func read(_ row: Int, _ col: Int) -> Float {
+            if isFloat { return base.advanced(by: row * bpr).assumingMemoryBound(to: Float.self)[col] }
+            return Float(base.advanced(by: row * bpr).assumingMemoryBound(to: UInt8.self)[col])
+        }
         for y in 0..<oh {
             for x in 0..<ow {
-                let v = rotated ? src[x * bpr + (mw - 1 - y)] : src[y * bpr + x]
-                values[y * ow + x] = Float(v) / 255
+                let v = rotated ? read(x, mw - 1 - y) : read(y, x)
+                values[y * ow + x] = labels ? v : v / 255
             }
         }
         return FloatMap(width: ow, height: oh, values: values)

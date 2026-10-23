@@ -50,10 +50,16 @@ public final class LivePreviewPipeline {
         public var personMaskColors: PlanarImage?
         /// 深度是几帧之前的（沿用旧深度）。0 = 这一帧的
         public var depthAge: Int
+        /// 物体分割的标签图（整个相机画面，0 = 背景，1…N = 各个物体）和算它那一帧的画面
+        public var objectLabels: FloatMap?
+        public var objectColors: PlanarImage?
 
         public init(image: PlanarImage, disparity: FloatMap?, relativeDepth: Bool, crop: Float, fNumber: Float,
                     focusPoint: (x: Float, y: Float), focusTapped: Bool, time: Double, personMask: FloatMap? = nil,
-                    personMaskColors: PlanarImage? = nil, depthAge: Int = 0) {
+                    personMaskColors: PlanarImage? = nil, depthAge: Int = 0,
+                    objectLabels: FloatMap? = nil, objectColors: PlanarImage? = nil) {
+            self.objectLabels = objectLabels
+            self.objectColors = objectColors
             self.personMaskColors = personMaskColors
             self.depthAge = depthAge
             self.image = image
@@ -138,7 +144,8 @@ public final class LivePreviewPipeline {
             disparity: full, relativeDepth: frame.relativeDepth, crop: c, fNumber: frame.fNumber,
             focusPoint: frame.focusPoint, focusTapped: frame.focusTapped, time: frame.time,
             colors: colors, personMask: frame.personMask, outputLongSide: frame.image.longSide,
-            personMaskColors: frame.personMaskColors, depthAge: frame.depthAge))
+            personMaskColors: frame.personMaskColors, depthAge: frame.depthAge,
+            objectLabels: frame.objectLabels, objectColors: frame.objectColors))
         lastPlan = plan
         lap("分析")
 

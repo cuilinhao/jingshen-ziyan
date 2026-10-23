@@ -104,7 +104,8 @@ func readPPMBytes(_ path: String) throws -> (bytes: [UInt8], width: Int, height:
 // 实时预览模拟：bokeh-cli --live -
 // 每行一个 JSON：{"img": 相机整帧.ppm, "depth": 整帧视差.pfm 或 "", "out": 输出.ppm, "f": 1.4, "crop": 1.0,
 //               "rel": false, "fx": 0.5, "fy": 0.5, "tap": false, "t": 秒, "reset": false, "mask": 人像遮罩.pfm 或 "",
-//               "maskimg": 算遮罩那一帧的画面.ppm 或 "", "age": 深度是几帧之前的, "mindist": 米, "long": 1440}
+//               "maskimg": 算遮罩那一帧的画面.ppm 或 "", "age": 深度是几帧之前的, "mindist": 米,
+//               "objects": 物体分割标签图.pfm 或 "", "long": 1440}
 // 和 App 的 DepthCameraController 走同一个 LivePreviewPipeline。每帧输出一行 JSON（对焦、耗时）
 if args.first == "--live" {
     args.removeFirst()
@@ -115,6 +116,7 @@ if args.first == "--live" {
         let t0 = Double(DispatchTime.now().uptimeNanoseconds) / 1e9
         if job["reset"] as? Bool == true { pipeline.resetHistory() }
         if let g = job["grow"] as? Double { pipeline.settings.matte.colorGrowth = Float(g) }
+        if let g = job["growabs"] as? Double { pipeline.settings.matte.absoluteColorGrowth = Float(g) }
         if let m = job["motion"] as? Double { pipeline.temporal.motionCutoff = Float(m) }
         if let v = job["tstrength"] as? Double { pipeline.temporal.strength = Float(v) }
         if let v = job["bstrength"] as? Double { pipeline.temporal.backgroundStrength = Float(v) }
@@ -142,12 +144,15 @@ if args.first == "--live" {
             }
         }
         if let v = job["mindist"] as? Double { pipeline.settings.minSubjectDistance = Float(v) }
+        let objectsPath = job["objects"] as? String ?? ""
+        let objects = objectsPath.isEmpty ? nil : try readPFM(objectsPath)
         let input = LivePreviewPipeline.Frame(
             image: image, disparity: disparity, relativeDepth: job["rel"] as? Bool ?? false, crop: crop,
             fNumber: Float(job["f"] as? Double ?? 2.8),
             focusPoint: (Float(job["fx"] as? Double ?? 0.5), Float(job["fy"] as? Double ?? 0.5)),
             focusTapped: job["tap"] as? Bool ?? false, time: job["t"] as? Double ?? 0, personMask: mask,
-            personMaskColors: maskColors, depthAge: job["age"] as? Int ?? 0)
+            personMaskColors: maskColors, depthAge: job["age"] as? Int ?? 0,
+            objectLabels: objects, objectColors: nil)
         let dbg = job["dbg"] as? String ?? ""
         pipeline.renderer.captureDebugMaps = !dbg.isEmpty
         let r = pipeline.process(input)
@@ -156,6 +161,8 @@ if args.first == "--live" {
             if let m = pipeline.renderer.debugRefinedDisparity { try writePFM(m, dbg + "_refined.pfm") }
             if let m = pipeline.renderer.debugLowDisparity { try writePFM(m, dbg + "_final.pfm") }
             if let m = pipeline.temporal.debugUnreliable { try writePFM(m, dbg + "_u.pfm") }
+            if let m = pipeline.renderer.debugMatte { try writePFM(m, dbg + "_matte.pfm") }
+            if let m = pipeline.renderer.debugWeights { try writePFM(m, dbg + "_w.pfm") }
         }
         if let out = job["out"] as? String, !out.isEmpty { try writePPM(r.image, out) }
         var info: [String: Any] = ["out": job["out"] as? String ?? "", "w": r.image.width, "h": r.image.height,

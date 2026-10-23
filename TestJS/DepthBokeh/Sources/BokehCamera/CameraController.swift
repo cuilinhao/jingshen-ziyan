@@ -24,6 +24,8 @@ public struct CapturedDepthPhoto: Identifiable {
     public let isRelativeDepth: Bool
     /// 人像分割遮罩（传感器方向，0…1），画面里没人时为 nil
     public let personMask: FloatMap?
+    /// 物体分割的标签图（传感器方向，0 = 背景，1…N = 各个物体）；编辑器里按对焦点选物体
+    public var objectLabels: FloatMap? = nil
 }
 
 /// 实时景深相机。
@@ -995,13 +997,14 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
             let dh = max(1, Int((Double(fullDisparity.height) / Double(crop)).rounded()))
             let colors = ImageBridge.planarImage(from: pixelBuffer, width: dw, height: dh, crop: crop)
             let fNumber = self.fNumber
-            // 人像遮罩是几帧之前算的：连同那一帧的小图一起交给分析，画面从那以后变了的地方（人在动）不再相信遮罩
-            let person = keepSubjectSharp ? segmenter.latest : nil
+            // 人像 / 物体遮罩是几帧之前算的：连同那一帧的小图一起交给分析，画面从那以后变了的地方（在动）不再相信遮罩
+            let masks = keepSubjectSharp ? segmenter.latest : nil
             let plan = analyzer.analyze(LiveFrameAnalyzer.Frame(
                 disparity: fullDisparity, relativeDepth: relative, crop: Float(crop), fNumber: fNumber,
                 focusPoint: (Float(p.x), Float(p.y)), focusTapped: tapped, time: t0, colors: colors,
-                personMask: person?.mask, outputLongSide: max(outW, outH),
-                personMaskColors: person?.colors, depthAge: depthAge))
+                personMask: masks?.person, outputLongSide: max(outW, outH),
+                personMaskColors: masks?.personColors, depthAge: depthAge,
+                objectLabels: masks?.objects, objectColors: masks?.objectColors))
             gpu.encode(plan: plan, quality: .preview, refinePasses: 1, source: camera.texture, region: region,
                        output: output, encodeSRGB: true, temporal: temporal, commandBuffer: cb)
 
@@ -1184,12 +1187,13 @@ extension DepthCameraController: AVCapturePhotoCaptureDelegate {
             }
             // 没有深度（光线太暗、AI 模型没准备好）：整张图当作在对焦面上
             let hasDepth = disparity != nil
-            // 人像分割（高质量）：对焦在人身上时整个人保持清晰，和预览一致
+            // 人像分割（高质量）：对焦在人身上时整个人保持清晰；物体分割：对焦的物体整个保持清晰。和预览一致
             let person = hasDepth ? PersonSegmenter.photoMask(cg) : nil
+            let objects = hasDepth ? PersonSegmenter.photoObjects(cg) : nil
             let captured = CapturedDepthPhoto(image: image,
                                               disparity: disparity ?? FloatMap(width: 64, height: 48, repeating: 1),
                                               orientation: orientation, focusPoint: focus, fNumber: fNumber,
-                                              isRelativeDepth: relative, personMask: person)
+                                              isRelativeDepth: relative, personMask: person, objectLabels: objects)
             DispatchQueue.main.async {
                 self.lastPhoto = captured
                 self.isCapturing = false

@@ -27,8 +27,15 @@ public struct SubjectMatteParameters: Equatable {
     /// 按颜色把主体边缘补回来的最大宽度（占长边比例，0 = 关闭）。双摄视差（尤其 4× 长焦）分辨率低、边缘糊，
     /// 主体的深度边界会往里缩一圈：盒子顶面、侧边这一圈拿到的是背景的深度，被虚化成一层「蒙层」。
     /// 这一圈里的像素，颜色更像旁边的主体、不像更外面的背景时，算回主体
-    /// LiDAR 的深度边缘本身就准，LivePreviewPipeline 只在相对深度（双摄 / AI）时打开
+    /// 相对深度（双摄 / AI）时用 colorGrowth；LiDAR 用 absoluteColorGrowth（见下）
     public var colorGrowth: Float = 1.0 / 24
+    /// LiDAR（绝对深度）的按颜色补边宽度。LiDAR 的边缘大体是准的，但系统滤波会在物体和远处背景之间抹出几个像素的过渡：
+    /// 斜着看到的盒子顶面在深度图里只有十来个像素高，靠后的那一半拿到的是「半路」的深度，被当成背景虚化，
+    /// 盒子顶上像蒙了一层。补的范围比双摄窄一些，免得把紧挨着主体、颜色相近的后面的东西拉清晰
+    public var absoluteColorGrowth: Float = 1.0 / 40
+    /// 物体分割（Vision 前景实例）里对焦的那个物体：深度在 ±band 以内的像素至少占这么多，才把整个物体当主体。
+    /// 物体分割有时会把一大片（比如一路延伸到远处的桌面）当成一个物体，深度对不上就不用它
+    public var objectDepthAgreement: Float = 0.6
 
     public init() {}
 }
@@ -298,6 +305,39 @@ public enum SubjectMatte {
         let connected = keepConnectedAll(seedMask, from: c, width: hw, height: hh)
         for j in 0..<hn where grown[j] > 0 && connected[j] > 0 { out[j] = 1 }
         return out
+    }
+
+    /// 物体分割的标签图（0 = 背景，1…N = 各个物体，任意分辨率）里对焦点所在的那个物体：同样大小的 0/1 遮罩。
+    /// 对焦点落在背景上时，在附近（长边的 2%）找最近的物体；找不到返回 nil
+    public static func instanceAt(_ labels: FloatMap, point: (Float, Float)) -> FloatMap? {
+        let w = labels.width, h = labels.height
+        guard w > 0, h > 0 else { return nil }
+        let cx = min(w - 1, max(0, Int(point.0 * Float(w)))), cy = min(h - 1, max(0, Int(point.1 * Float(h))))
+        var label = Int(labels[cx, cy].rounded())
+        if label <= 0 {
+            let r = max(1, max(w, h) / 50)
+            var best = Int.max
+            for y in max(0, cy - r)...min(h - 1, cy + r) {
+                for x in max(0, cx - r)...min(w - 1, cx + r) {
+                    let l = Int(labels[x, y].rounded())
+                    let d2 = (x - cx) * (x - cx) + (y - cy) * (y - cy)
+                    if l > 0 && d2 < best { best = d2; label = l }
+                }
+            }
+        }
+        guard label > 0 else { return nil }
+        return FloatMap(width: w, height: h, values: labels.values.map { Int($0.rounded()) == label ? 1 : 0 })
+    }
+
+    /// 物体遮罩（和深度图一样大）的深度是不是和对焦面对得上：遮罩里 |相对距离| < band 的像素占多少
+    public static func depthAgreement(_ mask: [Float], depth: [Float], focusDisparity df: Float, norm: Float,
+                                      band: Float) -> Float {
+        var n = 0, inBand = 0
+        for i in 0..<min(mask.count, depth.count) where mask[i] > 0.5 {
+            n += 1
+            if depth[i].isFinite && abs((depth[i] - df) / norm) < band { inBand += 1 }
+        }
+        return n >= 12 ? Float(inBand) / Float(n) : 0
     }
 
     /// 从所有种子（seeds > 0 的像素）出发，在 mask > 0 的区域里 4 连通扩散
