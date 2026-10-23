@@ -53,11 +53,14 @@ public final class LivePreviewPipeline {
         /// 物体分割的标签图（整个相机画面，0 = 背景，1…N = 各个物体）和算它那一帧的画面
         public var objectLabels: FloatMap?
         public var objectColors: PlanarImage?
+        /// 物体标签图的版本号（没变时分析直接用上次选好的物体）；0 = 每帧重新选
+        public var objectRevision: Int
 
         public init(image: PlanarImage, disparity: FloatMap?, relativeDepth: Bool, crop: Float, fNumber: Float,
                     focusPoint: (x: Float, y: Float), focusTapped: Bool, time: Double, personMask: FloatMap? = nil,
                     personMaskColors: PlanarImage? = nil, depthAge: Int = 0,
-                    objectLabels: FloatMap? = nil, objectColors: PlanarImage? = nil) {
+                    objectLabels: FloatMap? = nil, objectColors: PlanarImage? = nil, objectRevision: Int = 0) {
+            self.objectRevision = objectRevision
             self.objectLabels = objectLabels
             self.objectColors = objectColors
             self.personMaskColors = personMaskColors
@@ -145,7 +148,8 @@ public final class LivePreviewPipeline {
             focusPoint: frame.focusPoint, focusTapped: frame.focusTapped, time: frame.time,
             colors: colors, personMask: frame.personMask, outputLongSide: frame.image.longSide,
             personMaskColors: frame.personMaskColors, depthAge: frame.depthAge,
-            objectLabels: frame.objectLabels, objectColors: frame.objectColors))
+            objectLabels: frame.objectLabels, objectColors: frame.objectColors,
+            objectRevision: frame.objectRevision))
         lastPlan = plan
         lap("分析")
 

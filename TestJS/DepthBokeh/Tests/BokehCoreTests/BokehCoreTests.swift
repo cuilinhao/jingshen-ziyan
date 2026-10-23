@@ -372,6 +372,38 @@ final class BokehCoreTests: XCTestCase {
         XCTAssertEqual(same[15, 30], 1, accuracy: 1e-4, "没动")
     }
 
+    /// Vision 的结果（竖图）转回传感器方向：正方形（物体分割的标签图总是 512×512）也要转
+    func testVisionOrientationSensorFromRight() {
+        // 竖图 宽 3、高 4，值 = 行 × 10 + 列
+        var p = [Float](repeating: 0, count: 12)
+        for r in 0..<4 { for c in 0..<3 { p[r * 3 + c] = Float(r * 10 + c) } }
+        let s = VisionOrientation.sensorFromRight(p, width: 3, height: 4)
+        XCTAssertEqual(s.width, 4); XCTAssertEqual(s.height, 3)
+        // 传感器 (x, y) = 竖图 (行 x, 列 宽 − 1 − y)
+        XCTAssertEqual(s[0, 0], 2); XCTAssertEqual(s[1, 0], 12); XCTAssertEqual(s[3, 2], 30); XCTAssertEqual(s[3, 0], 32)
+        // 正方形：竖图左上角的标记转到传感器的左下角
+        var q = [Float](repeating: 0, count: 16)
+        q[0] = 1
+        let t = VisionOrientation.sensorFromRight(q, width: 4, height: 4)
+        XCTAssertEqual(t[0, 3], 1); XCTAssertEqual(t[0, 0], 0)
+    }
+
+    /// 0/1 图的快速膨胀和逐像素取最大值结果一样（各种半径、贴边）
+    func testDilateBinaryMatchesMaxFilter() {
+        let w = 67, h = 41
+        var v = [Float](repeating: 0, count: w * h)
+        var seed: UInt32 = 12345
+        for i in 0..<(w * h) {
+            seed = seed &* 1664525 &+ 1013904223
+            if seed >> 28 == 0 { v[i] = 1 }
+        }
+        v[0] = 1; v[w * h - 1] = 1
+        for r in [1, 2, 5, 8, 40, 80] {
+            XCTAssertEqual(SubjectMatte.dilateBinary(v, width: w, height: h, radius: r),
+                           SubjectMatte.maxFilter(v, width: w, height: h, radius: r), "r = \(r)")
+        }
+    }
+
     /// 物体标签图里按对焦点选物体：点在物体上、点在物体旁边一点点、点离物体很远
     func testInstanceAt() {
         let w = 100, h = 80
@@ -422,6 +454,37 @@ final class BokehCoreTests: XCTestCase {
         XCTAssertNil(table.seeds?.person)
     }
 
+    /// 物体分割把盒子后面挨着的罐子也算进了同一个物体：罐子（深度对不上、成块）不能被当成主体保持清晰；
+    /// 盒子顶面（深度对不上、但只是贴着盒子的一条）照样补回来
+    func testObjectRefineDropsMergedNeighbour() {
+        let w = 80, h = 60
+        var d = [Float](repeating: 0.4, count: w * h)         // 背景
+        var obj = [Float](repeating: 0, count: w * h)
+        for y in 20..<50 {
+            for x in 40..<60 {
+                obj[y * w + x] = 1
+                d[y * w + x] = y < 24 ? 0.4 : 2.8              // 盒子，顶面 4 行深度错成背景
+            }
+        }
+        // 罐子：在盒子左边、连着，深度在后面（1.6），成块
+        for y in 26..<46 { for x in 18..<40 { obj[y * w + x] = 1; d[y * w + x] = 1.6 } }
+        let out = LiveFrameAnalyzer.refineObject(FloatMap(width: w, height: h, values: obj),
+                                                 depth: FloatMap(width: w, height: h, values: d),
+                                                 focusDisparity: 2.8, norm: 2.8, band: 0.25, reach: 3)
+        XCTAssertEqual(out[50, 22], 1, "盒子顶面保留")
+        XCTAssertEqual(out[50, 35], 1, "盒子本身")
+        XCTAssertEqual(out[25, 35], 0, "罐子中间去掉")
+        XCTAssertEqual(out[38, 35], 0, "罐子贴着盒子的地方也去掉")
+        // 顶面很厚、整个拿到了背景的深度：也是物体
+        var d2 = d, obj2 = obj
+        for y in 8..<20 { for x in 40..<60 { obj2[y * w + x] = 1; d2[y * w + x] = 0.4 } }
+        let out2 = LiveFrameAnalyzer.refineObject(FloatMap(width: w, height: h, values: obj2),
+                                                  depth: FloatMap(width: w, height: h, values: d2),
+                                                  focusDisparity: 2.8, norm: 2.8, band: 0.25, reach: 3)
+        XCTAssertEqual(out2[50, 10], 1, "厚的顶面，深度和背景一样")
+        XCTAssertEqual(out2[25, 35], 0, "罐子还是去掉")
+    }
+
     /// 长焦手持：算遮罩那一帧和现在整体错开两三个像素（盒子顶边是强边缘），遮罩不能因此被扔掉；
     /// 盒子真的被拿走了才扔
     func testStaleMaskToleratesShake() {
@@ -444,11 +507,19 @@ final class BokehCoreTests: XCTestCase {
         for y in 20..<50 { for x in 30..<54 { mv[y * w + x] = 1 } }
         let mask = FloatMap(width: w, height: h, values: mv)
         let then = image(dx: 0, dy: 0, boxX: 30)
-        let shaken = LiveFrameAnalyzer.dropStaleMask(mask, maskColors: then, colors: image(dx: 2, dy: 1, boxX: 30))
+        // 整幅画面往右下挪了 (2, 1)：遮罩跟着挪过去，没有被扔掉，也不用重新分割
+        let shaken = LiveFrameAnalyzer.alignMask(mask, maskColors: then, colors: image(dx: 2, dy: 1, boxX: 30))
         var kept: Float = 0
-        for y in 20..<50 { for x in 30..<54 { kept += shaken[x, y] } }
+        for y in 21..<51 { for x in 32..<56 { kept += shaken.mask[x, y] } }
         XCTAssertGreaterThan(kept / Float(30 * 24), 0.9, "手抖不算「变了」")
-        let moved = LiveFrameAnalyzer.dropStaleMask(mask, maskColors: then, colors: image(dx: 0, dy: 0, boxX: 2))
-        XCTAssertLessThan(moved[45, 35], 0.1, "盒子被拿走了")
+        XCTAssertLessThan(shaken.mask[31, 35], 0.2, "遮罩跟着画面挪了（左边原来的位置现在是背景）")
+        XCTAssertGreaterThan(shaken.mask[55, 35], 0.8, "遮罩跟着画面挪了（右边）")
+        XCTAssertLessThan(shaken.changed, LiveFrameAnalyzer.maskStaleFraction, "手抖不用重新分割")
+        let moved = LiveFrameAnalyzer.alignMask(mask, maskColors: then, colors: image(dx: 0, dy: 0, boxX: 2))
+        XCTAssertLessThan(moved.mask[45, 35], 0.1, "盒子被拿走了")
+        XCTAssertGreaterThan(moved.changed, LiveFrameAnalyzer.maskStaleFraction, "盒子被拿走了：该重新分割")
+        let same = LiveFrameAnalyzer.alignMask(mask, maskColors: then, colors: then)
+        XCTAssertEqual(same.changed, 0, accuracy: 1e-4)
+        XCTAssertEqual(same.mask[40, 35], 1, accuracy: 1e-4)
     }
 }

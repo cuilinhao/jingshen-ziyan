@@ -82,7 +82,7 @@ public enum SubjectMatte {
                                                                             searchFraction: p.seedSearch) {
             connected = c
             // 膨胀 1 像素：放大到低分辨率后，细化过的深度边缘可能比这里宽一点
-            result.connect = FloatMap(width: w, height: h, values: maxFilter(c, width: w, height: h, radius: 1))
+            result.connect = FloatMap(width: w, height: h, values: dilateBinary(c, width: w, height: h, radius: 1))
         }
         var extra = [Float](repeating: 0, count: n)
         var hasExtra = false
@@ -242,29 +242,49 @@ public enum SubjectMatte {
         var c = [Float](repeating: 0, count: hn)
         var cr = [Float](repeating: 0, count: hn), cg = cr, cb = cr
         var rel = [Float](repeating: 0, count: hn)
-        for j in 0..<hn {
-            c[j] = core[j] > 0.5 ? 1 : 0
-            cr[j] = sqrtf(max(0, image.r[j])); cg[j] = sqrtf(max(0, image.g[j])); cb[j] = sqrtf(max(0, image.b[j]))
-            rel[j] = d[j].isFinite ? (d[j] - df) / norm : -1
-        }
+        // 每帧都跑（LiDAR 也开了）：用指针、按行并行，省掉数组越界检查
+        core.withUnsafeBufferPointer { kP in d.withUnsafeBufferPointer { dP in
+        image.r.withUnsafeBufferPointer { rP in image.g.withUnsafeBufferPointer { gP in image.b.withUnsafeBufferPointer { bP in
+        c.withUnsafeMutableBufferPointer { cP in rel.withUnsafeMutableBufferPointer { relP in
+        cr.withUnsafeMutableBufferPointer { crP in cg.withUnsafeMutableBufferPointer { cgP in cb.withUnsafeMutableBufferPointer { cbP in
+            let K = kP.baseAddress!, Dd = dP.baseAddress!, R = rP.baseAddress!, Gi = gP.baseAddress!, B = bP.baseAddress!
+            let C = cP.baseAddress!, Rl = relP.baseAddress!, CR = crP.baseAddress!, CG = cgP.baseAddress!, CB = cbP.baseAddress!
+            parallelFor(hh) { y in
+                for j in (y * hw)..<(y * hw + hw) {
+                    C[j] = K[j] > 0.5 ? 1 : 0
+                    CR[j] = sqrtf(max(0, R[j])); CG[j] = sqrtf(max(0, Gi[j])); CB[j] = sqrtf(max(0, B[j]))
+                    Rl[j] = Dd[j].isFinite ? (Dd[j] - df) / norm : -1
+                }
+            }
+        }}}}}}}}}}
         let D = max(3, Int(Float(max(hw, hh)) * fraction))
         // 离主体 D 以内（方形窗口近似）
-        let near = maxFilter(c, width: hw, height: hh, radius: D)
+        let near = dilateBinary(c, width: hw, height: hh, radius: D)
         guard c.contains(1) else { return out }
         // 每 cs×cs 一格（约长边的 1/60），分别记主体像素和背景样本（D 以外）的平均颜色
         let cs = max(2, max(hw, hh) / 60), gw = (hw + cs - 1) / cs, gh = (hh + cs - 1) / cs, gn = gw * gh
         var fC = [Float](repeating: 0, count: gn * 3), fN = [Float](repeating: 0, count: gn)
         var bC = [Float](repeating: 0, count: gn * 3), bN = [Float](repeating: 0, count: gn)
-        for y in 0..<hh {
-            for x in 0..<hw {
-                let j = y * hw + x, g = (y / cs) * gw + x / cs
-                if c[j] > 0 {
-                    fC[3 * g] += cr[j]; fC[3 * g + 1] += cg[j]; fC[3 * g + 2] += cb[j]; fN[g] += 1
-                } else if near[j] == 0 {
-                    bC[3 * g] += cr[j]; bC[3 * g + 1] += cg[j]; bC[3 * g + 2] += cb[j]; bN[g] += 1
+        // 每一行格子由一个线程累加（同一格里加的顺序和逐行扫描一样）
+        fC.withUnsafeMutableBufferPointer { fCP in fN.withUnsafeMutableBufferPointer { fNP in
+        bC.withUnsafeMutableBufferPointer { bCP in bN.withUnsafeMutableBufferPointer { bNP in
+        c.withUnsafeBufferPointer { cP in near.withUnsafeBufferPointer { nP in
+        cr.withUnsafeBufferPointer { crP in cg.withUnsafeBufferPointer { cgP in cb.withUnsafeBufferPointer { cbP in
+            let FC = fCP.baseAddress!, FN = fNP.baseAddress!, BC = bCP.baseAddress!, BN = bNP.baseAddress!
+            let C = cP.baseAddress!, N = nP.baseAddress!, CR = crP.baseAddress!, CG = cgP.baseAddress!, CB = cbP.baseAddress!
+            parallelFor(gh) { gy in
+                for y in (gy * cs)..<min(hh, gy * cs + cs) {
+                    for x in 0..<hw {
+                        let j = y * hw + x, g = gy * gw + x / cs
+                        if C[j] > 0 {
+                            FC[3 * g] += CR[j]; FC[3 * g + 1] += CG[j]; FC[3 * g + 2] += CB[j]; FN[g] += 1
+                        } else if N[j] == 0 {
+                            BC[3 * g] += CR[j]; BC[3 * g + 1] += CG[j]; BC[3 * g + 2] += CB[j]; BN[g] += 1
+                        }
+                    }
                 }
             }
-        }
+        }}}}}}}}}
         for g in 0..<gn {
             if fN[g] > 0 { let k = 1 / fN[g]; fC[3 * g] *= k; fC[3 * g + 1] *= k; fC[3 * g + 2] *= k }
             if bN[g] > 0 { let k = 1 / bN[g]; bC[3 * g] *= k; bC[3 * g + 1] *= k; bC[3 * g + 2] *= k }
@@ -356,6 +376,57 @@ public enum SubjectMatte {
     }
 
     /// 方形窗口最大值（可分离）
+    /// 0/1 图的方形窗口膨胀（窗口里有 > 0 的像素就是 1），和 maxFilter 对 0/1 图的结果一样。
+    /// 按行、按列各数一遍窗口里有几个（滑动计数），每个像素的开销和半径无关
+    static func dilateBinary(_ src: [Float], width w: Int, height h: Int, radius r: Int) -> [Float] {
+        let n = w * h
+        guard n > 0 else { return [] }
+        var tmp = [Int32](repeating: 0, count: n)
+        var out = [Float](repeating: 0, count: n)
+        src.withUnsafeBufferPointer { sp in
+        tmp.withUnsafeMutableBufferPointer { tp in
+            let S = sp.baseAddress!, T = tp.baseAddress!
+            parallelFor(h) { y in
+                let row = S + y * w, dst = T + y * w
+                var acc: Int32 = 0
+                for x in 0...min(r, w - 1) where row[x] > 0 { acc += 1 }
+                for x in 0..<w {
+                    dst[x] = acc > 0 ? 1 : 0
+                    let add = x + r + 1, sub = x - r
+                    if add < w && row[add] > 0 { acc += 1 }
+                    if sub >= 0 && row[sub] > 0 { acc -= 1 }
+                }
+            }
+        }}
+        tmp.withUnsafeBufferPointer { tp in
+        out.withUnsafeMutableBufferPointer { op in
+            let T = tp.baseAddress!, O = op.baseAddress!
+            // 按列分块，每块维护一行「列计数」逐行往下滑（按行连续访问内存）
+            let bands = max(1, min(8, w / 32))
+            DispatchQueue.concurrentPerform(iterations: bands) { band in
+                let x0 = band * w / bands, x1 = (band + 1) * w / bands
+                let bw = x1 - x0
+                guard bw > 0 else { return }
+                var col = [Int32](repeating: 0, count: bw)
+                col.withUnsafeMutableBufferPointer { cp in
+                    let C = cp.baseAddress!
+                    for y in 0...min(r, h - 1) {
+                        let row = T + y * w + x0
+                        for x in 0..<bw { C[x] += row[x] }
+                    }
+                    for y in 0..<h {
+                        let dst = O + y * w + x0
+                        for x in 0..<bw { dst[x] = C[x] > 0 ? 1 : 0 }
+                        let add = y + r + 1, sub = y - r
+                        if add < h { let row = T + add * w + x0; for x in 0..<bw { C[x] += row[x] } }
+                        if sub >= 0 { let row = T + sub * w + x0; for x in 0..<bw { C[x] -= row[x] } }
+                    }
+                }
+            }
+        }}
+        return out
+    }
+
     static func maxFilter(_ src: [Float], width w: Int, height h: Int, radius r: Int) -> [Float] {
         let neg = src.map { -$0 }
         return minFilter(neg, width: w, height: h, radius: r).map { -$0 }

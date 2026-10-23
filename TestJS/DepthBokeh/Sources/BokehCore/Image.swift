@@ -62,6 +62,29 @@ public struct PlanarImage {
 }
 
 /// 单通道浮点图（视差图、亮度图、遮罩等）
+/// Vision 的结果在交给它的方向里（这里总是按竖拍方向 .right 交给它）：转回传感器方向（横）。
+/// 传感器 (x, y) 顺时针转 90° 后在竖图的 (列 = 竖图宽 − 1 − y, 行 = x)。
+/// 不能按宽高比判断要不要转：物体分割的标签图总是 512×512 的正方形（整幅竖图拉伸成方的），
+/// 按宽高比判断时正方形不会被转，遮罩就整个转错了 90°。
+/// 返回的图按归一化坐标对应整个传感器画面（宽高比可以和画面不一样，用的时候都会按画面尺寸重采样）
+public enum VisionOrientation {
+    /// portrait：竖图的值（行优先，宽 pw、高 ph）。返回宽 ph、高 pw 的传感器方向图
+    public static func sensorFromRight(_ portrait: [Float], width pw: Int, height ph: Int) -> FloatMap {
+        precondition(portrait.count == pw * ph)
+        var out = [Float](repeating: 0, count: pw * ph)
+        portrait.withUnsafeBufferPointer { src in
+            out.withUnsafeMutableBufferPointer { dst in
+                // 传感器图宽 ph、高 pw：传感器 (x, y) = 竖图 (行 x, 列 pw − 1 − y)
+                for y in 0..<pw {
+                    let col = pw - 1 - y
+                    for x in 0..<ph { dst[y * ph + x] = src[x * pw + col] }
+                }
+            }
+        }
+        return FloatMap(width: ph, height: pw, values: out)
+    }
+}
+
 public struct FloatMap {
     public let width: Int
     public let height: Int

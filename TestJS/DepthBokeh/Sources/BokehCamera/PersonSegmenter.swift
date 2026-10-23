@@ -26,6 +26,8 @@ final class PersonSegmenter: @unchecked Sendable {   // 可变状态都由 lock 
         /// 物体标签图（0 = 背景，1…N = 各个物体）；没有物体时为 nil
         var objects: FloatMap?
         var objectColors: PlanarImage?
+        /// 物体标签图每更新一次加 1（分析时按它缓存选出来的物体，不用每帧重新选）
+        var objectRevision = 0
     }
 
     private let queue = DispatchQueue(label: "depthbokeh.segmentation", qos: .userInitiated)
@@ -36,10 +38,23 @@ final class PersonSegmenter: @unchecked Sendable {   // 可变状态都由 lock 
     private var maskColors: PlanarImage?
     private var objects: FloatMap?
     private var objectColors: PlanarImage?
+    private var objectRevision = 0
     private var generation = 0
-    /// 物体分割比人像慢、物体一般也不怎么动：每秒约 3 次
-    private let objectInterval: TimeInterval = 0.3
+    /// 最近一秒每次分割的开始时间和耗时（毫秒），状态栏显示
+    private var runs: [(start: TimeInterval, ms: Double)] = []
+    // 什么时候跑（Vision 跑在神经网络引擎 / GPU 上，跑得越勤越热）。折中：对焦的那个主体在动时和以前一样勤，
+    // 不动、或者不是对焦的主体时少跑一些（遮罩本来就用上一次的结果，分析时还会按整体平移挪到这一帧的位置）：
+    //  - 点了对焦、换了相机 → 人像、物体都马上跑一次
+    //  - 人像：对焦在人身上，人在动（遮罩那块变了）→ 每秒 10 次，没动 → 每秒 5 次；
+    //    画面里有人但对焦点不在人身上 → 每秒 2 次；最近 1.5 秒没见过人 → 每秒 2 次（看有没有人进来）
+    //  - 物体：对焦点在人身上时不跑（人像遮罩已经管了）。对焦的物体那块变了 → 每秒约 3 次，没变 → 每秒 1 次；
+    //    对焦点上没有物体：画面在动 → 每秒 2 次，静止 → 每秒 1 次，动完停下来 → 马上再跑一次
     private var lastObjectStart: TimeInterval = -1
+    private var objectsPending = true
+    private var personPending = true
+    private var movedSinceObjects = false
+    /// 物体分割的请求（只在 queue 上用；重复用同一个，不用每次重新准备模型）
+    private let objectRequest = VNGenerateForegroundInstanceMaskRequest()
     private let handler = VNSequenceRequestHandler()
     private let request: VNGeneratePersonSegmentationRequest = {
         let request = VNGeneratePersonSegmentationRequest()
@@ -59,7 +74,24 @@ final class PersonSegmenter: @unchecked Sendable {   // 可变状态都由 lock 
     var latest: Masks {
         lock.lock()
         defer { lock.unlock() }
-        return Masks(person: mask, personColors: maskColors, objects: objects, objectColors: objectColors)
+        return Masks(person: mask, personColors: maskColors, objects: objects, objectColors: objectColors,
+                     objectRevision: objectRevision)
+    }
+
+    /// 最近一秒跑了几次分割、平均每次多少毫秒（状态栏）
+    func recentLoad(now: TimeInterval) -> (count: Int, ms: Double) {
+        lock.lock()
+        defer { lock.unlock() }
+        runs.removeAll { now - $0.start > 1 }
+        return (runs.count, runs.isEmpty ? 0 : runs.map(\.ms).reduce(0, +) / Double(runs.count))
+    }
+
+    /// 点了新的对焦点：马上重新分一次人像和物体
+    func focusChanged() {
+        lock.lock()
+        objectsPending = true
+        personPending = true
+        lock.unlock()
     }
 
     /// 换了相机：旧画面的遮罩不能再用
@@ -69,9 +101,13 @@ final class PersonSegmenter: @unchecked Sendable {   // 可变状态都由 lock 
         maskColors = nil
         objects = nil
         objectColors = nil
+        objectRevision &+= 1
         generation &+= 1
         lastStart = -1
         lastObjectStart = -1
+        objectsPending = true
+        personPending = true
+        movedSinceObjects = false
         lock.unlock()
     }
 
@@ -79,49 +115,101 @@ final class PersonSegmenter: @unchecked Sendable {   // 可变状态都由 lock 
     private var lastStart: TimeInterval = -1
     private var lastPersonSeen: TimeInterval = -100
 
-    /// 用这一帧更新遮罩（异步）。每秒最多 10 次（遮罩本来就用上一次的结果，10 次足够跟上人的动作）
-    func update(with pixelBuffer: CVPixelBuffer, now: TimeInterval) {
+    /// 用这一帧更新遮罩（异步，按上面的规则决定这一帧跑不跑、跑哪个）。
+    /// - Parameters:
+    ///   - moving: 画面在动（手机在动或画面里有东西在动，上一帧的分析结果）
+    ///   - personChanged: 上一帧分析时，人像遮罩那块变了不少（FramePlan.personMaskStale）；nil = 不知道
+    ///   - objectChanged: 同上，对焦的物体（FramePlan.objectMaskStale）；nil = 对焦点上没有物体
+    ///   - focusPoint: 对焦点（相机画面坐标）：落在人身上时不分物体
+    func update(with pixelBuffer: CVPixelBuffer, now: TimeInterval, moving: Bool, personChanged: Bool?,
+                objectChanged: Bool?, focusPoint: (Float, Float)) {
         lock.lock()
-        let interval: TimeInterval = 0.1
-        if busy || now - lastStart < interval {
+        if busy {
+            if moving { movedSinceObjects = true }
+            lock.unlock()
+            return
+        }
+        // 对焦点在人身上（允许偏一点：点在眼镜、头发边上）
+        let onPerson = mask.map { m in
+            let cx = min(m.width - 1, max(0, Int(focusPoint.0 * Float(m.width))))
+            let cy = min(m.height - 1, max(0, Int(focusPoint.1 * Float(m.height))))
+            let r = max(1, max(m.width, m.height) / 100)
+            for y in max(0, cy - r)...min(m.height - 1, cy + r) {
+                for x in max(0, cx - r)...min(m.width - 1, cx + r) where m[x, y] > 0.5 { return true }
+            }
+            return false
+        } ?? false
+        let personInterval: TimeInterval
+        if !onPerson || now - lastPersonSeen > 1.5 {
+            personInterval = 0.5
+        } else {
+            personInterval = (personChanged ?? moving) ? 0.1 : 0.2
+        }
+        let doPerson = personPending || now - lastStart >= personInterval
+        if moving { movedSinceObjects = true }
+        var doObjects = false
+        if !onPerson {
+            if objectsPending {
+                doObjects = true
+            } else if let changed = objectChanged {
+                doObjects = now - lastObjectStart >= (changed ? 0.3 : 1)
+            } else if moving {
+                doObjects = now - lastObjectStart >= 0.5
+            } else {
+                doObjects = movedSinceObjects || now - lastObjectStart >= 1
+            }
+        }
+        guard doPerson || doObjects else {
             lock.unlock()
             return
         }
         busy = true
-        lastStart = now
-        let doObjects = now - lastObjectStart >= objectInterval
-        if doObjects { lastObjectStart = now }
+        if doPerson {
+            lastStart = now
+            personPending = false
+        }
+        if doObjects {
+            lastObjectStart = now
+            objectsPending = false
+            if !moving { movedSinceObjects = false }
+        }
         let gen = generation
+        let runObjects = doObjects
         lock.unlock()
         queue.async {
-            let result = self.segment(pixelBuffer)
+            let t0 = Date().timeIntervalSinceReferenceDate
+            let result = doPerson ? self.segment(pixelBuffer) : nil
             let hasPerson = result.map { m in m.values.contains { $0 > 0.5 } } ?? false
-            let labels = doObjects ? Self.objectLabels(pixelBuffer) : nil
+            let labels = runObjects ? Self.objectLabels(pixelBuffer, request: self.objectRequest) : nil
             let hasObjects = labels.map { m in m.values.contains { $0 > 0.5 } } ?? false
             // 同一帧的小图（160 长边够判断哪里变了）
             let thumb = hasPerson || hasObjects ? Self.thumbnail(pixelBuffer) : nil
+            let ms = (Date().timeIntervalSinceReferenceDate - t0) * 1000
             self.lock.lock()
             if gen == self.generation {
-                self.mask = hasPerson ? result : nil
-                self.maskColors = hasPerson ? thumb : nil
-                if doObjects {
+                if doPerson {
+                    self.mask = hasPerson ? result : nil
+                    self.maskColors = hasPerson ? thumb : nil
+                }
+                if runObjects {
                     self.objects = hasObjects ? labels : nil
                     self.objectColors = hasObjects ? thumb : nil
+                    self.objectRevision &+= 1
                 }
             }
             if hasPerson { self.lastPersonSeen = now }
+            self.runs.append((now, ms))
             self.busy = false
             self.lock.unlock()
         }
     }
 
     /// 前景物体分割（传感器方向的标签图）。不支持的设备（没有神经网络引擎）返回 nil
-    static func objectLabels(_ pixelBuffer: CVPixelBuffer) -> FloatMap? {
-        let request = VNGenerateForegroundInstanceMaskRequest()
+    static func objectLabels(_ pixelBuffer: CVPixelBuffer,
+                             request: VNGenerateForegroundInstanceMaskRequest = VNGenerateForegroundInstanceMaskRequest()) -> FloatMap? {
         let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .right, options: [:])
         guard (try? handler.perform([request])) != nil, let obs = request.results?.first else { return nil }
-        let landscape = CVPixelBufferGetWidth(pixelBuffer) >= CVPixelBufferGetHeight(pixelBuffer)
-        return sensorMask(obs.instanceMask, sensorLandscape: landscape, labels: true)
+        return sensorMask(obs.instanceMask, labels: true)
     }
 
     /// 拍下来的照片（传感器方向）的物体标签图
@@ -129,7 +217,7 @@ final class PersonSegmenter: @unchecked Sendable {   // 可变状态都由 lock 
         let request = VNGenerateForegroundInstanceMaskRequest()
         let handler = VNImageRequestHandler(cgImage: image, orientation: .right, options: [:])
         guard (try? handler.perform([request])) != nil, let obs = request.results?.first else { return nil }
-        return sensorMask(obs.instanceMask, sensorLandscape: image.width >= image.height, labels: true)
+        return sensorMask(obs.instanceMask, labels: true)
     }
 
     private func segment(_ pixelBuffer: CVPixelBuffer) -> FloatMap? {
@@ -137,8 +225,7 @@ final class PersonSegmenter: @unchecked Sendable {   // 可变状态都由 lock 
             // 按竖拍方向交给 Vision（.right），它才认得出人
             try handler.perform([request], on: pixelBuffer, orientation: .right)
             guard let out = request.results?.first?.pixelBuffer else { return nil }
-            let landscape = CVPixelBufferGetWidth(pixelBuffer) >= CVPixelBufferGetHeight(pixelBuffer)
-            return Self.sensorMask(out, sensorLandscape: landscape)
+            return Self.sensorMask(out)
         } catch {
             return nil
         }
@@ -159,13 +246,12 @@ final class PersonSegmenter: @unchecked Sendable {   // 可变状态都由 lock 
         request.outputPixelFormat = kCVPixelFormatType_OneComponent8
         let handler = VNImageRequestHandler(cgImage: image, orientation: .right, options: [:])
         guard (try? handler.perform([request])) != nil, let out = request.results?.first?.pixelBuffer else { return nil }
-        return sensorMask(out, sensorLandscape: image.width >= image.height)
+        return sensorMask(out)
     }
 
-    /// Vision 输出的遮罩可能是竖的（按竖拍方向）：转回传感器方向（横）。
-    /// 传感器 (x, y) 顺时针转 90° 后在竖图的 (列 = 竖图宽 − 1 − y, 行 = x)。
+    /// Vision 输出的遮罩（在交给它的竖拍方向 .right 里）转回传感器方向（横），见 VisionOrientation。
     /// labels = true：标签图，保留原始整数值（不除以 255）
-    static func sensorMask(_ buffer: CVPixelBuffer, sensorLandscape: Bool, labels: Bool = false) -> FloatMap? {
+    static func sensorMask(_ buffer: CVPixelBuffer, labels: Bool = false) -> FloatMap? {
         let format = CVPixelBufferGetPixelFormatType(buffer)
         // 人像遮罩是 8 位；物体标签图一般也是 8 位（每个像素是物体编号），以防万一也认 32 位浮点
         let isFloat = labels && format == kCVPixelFormatType_OneComponent32Float
@@ -176,20 +262,19 @@ final class PersonSegmenter: @unchecked Sendable {   // 可变状态都由 lock 
         let mw = CVPixelBufferGetWidth(buffer), mh = CVPixelBufferGetHeight(buffer)
         let bpr = CVPixelBufferGetBytesPerRow(buffer)
         guard mw > 1, mh > 1 else { return nil }
-        let rotated = (mw >= mh) != sensorLandscape
-        let ow = rotated ? mh : mw, oh = rotated ? mw : mh
-        var values = [Float](repeating: 0, count: ow * oh)
-        func read(_ row: Int, _ col: Int) -> Float {
-            if isFloat { return base.advanced(by: row * bpr).assumingMemoryBound(to: Float.self)[col] }
-            return Float(base.advanced(by: row * bpr).assumingMemoryBound(to: UInt8.self)[col])
-        }
-        for y in 0..<oh {
-            for x in 0..<ow {
-                let v = rotated ? read(x, mw - 1 - y) : read(y, x)
-                values[y * ow + x] = labels ? v : v / 255
+        var portrait = [Float](repeating: 0, count: mw * mh)
+        let scale: Float = labels ? 1 : 1.0 / 255
+        for row in 0..<mh {
+            let line = base.advanced(by: row * bpr)
+            if isFloat {
+                let p = line.assumingMemoryBound(to: Float.self)
+                for col in 0..<mw { portrait[row * mw + col] = p[col] }
+            } else {
+                let p = line.assumingMemoryBound(to: UInt8.self)
+                for col in 0..<mw { portrait[row * mw + col] = Float(p[col]) * scale }
             }
         }
-        return FloatMap(width: ow, height: oh, values: values)
+        return VisionOrientation.sensorFromRight(portrait, width: mw, height: mh)
     }
 }
 #endif

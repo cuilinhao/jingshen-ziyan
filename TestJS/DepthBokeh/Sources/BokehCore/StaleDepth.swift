@@ -77,53 +77,96 @@ public enum StaleDepth {
     /// 用在几帧之前算的人像 / 物体遮罩上：长焦手持时整幅画面会抖几个像素，强边缘（盒子顶边和后面的暗背景）
     /// 一抖就会被当成「变了」，遮罩在那一圈被扔掉，盒子顶上就忽清忽糊、像一层波纹。手挥走这种大变化照样看得出来
     public static func changedAllowingShift(_ now: PlanarImage, since old: PlanarImage, shiftRadius R: Int = 3) -> [Float] {
+        changeAndShift(now, since: old, shiftRadius: R).changed
+    }
+
+    /// 同上，另外给出估计到的整体平移（像素，带小数）：now(x, y) ≈ old(x + shift.x, y + shift.y)。
+    /// 几帧之前的遮罩按它挪到这一帧的位置（手持时遮罩跟着画面走，不用为了跟上手抖频繁地重新分割）
+    public static func changeAndShift(_ now: PlanarImage, since old: PlanarImage,
+                                      shiftRadius R: Int = 3) -> (changed: [Float], shift: (x: Float, y: Float)) {
         let w = now.width, h = now.height, n = w * h
         guard old.width == w, old.height == h, w > 2 * R + 2, h > 2 * R + 2 else {
-            return [Float](repeating: 1, count: n)
+            return ([Float](repeating: 1, count: n), (0, 0))
         }
-        // 先各自做 3×3 平均：纹理在亚像素错位下的差别抹掉，整块东西挪走的大变化留着
+        // 先各自做 3×3 平均：纹理在亚像素错位下的差别抹掉，整块东西挪走的大变化留着。
+        // 每帧对人像、物体遮罩各跑一次，用指针写，省掉数组越界检查
         func smoothed(_ img: PlanarImage) -> [Float] {
-            let c = sqrtColors(img)
             var out = [Float](repeating: 0, count: n * 3)
-            for ch in 0..<3 {
-                let m = BoxFilter.mean((0..<n).map { c[3 * $0 + ch] }, width: w, height: h, radius: 1)
-                for i in 0..<n { out[3 * i + ch] = m[i] }
+            for (ch, plane) in [img.r, img.g, img.b].enumerated() {
+                var sq = [Float](repeating: 0, count: n)
+                plane.withUnsafeBufferPointer { pp in
+                    sq.withUnsafeMutableBufferPointer { sp in
+                        for i in 0..<n { sp[i] = sqrtf(max(pp[i], 0)) }
+                    }
+                }
+                let m = BoxFilter.mean(sq, width: w, height: h, radius: 1)
+                m.withUnsafeBufferPointer { mp in
+                    out.withUnsafeMutableBufferPointer { op in
+                        for i in 0..<n { op[3 * i + ch] = mp[i] }
+                    }
+                }
             }
             return out
         }
-        let a = smoothed(now), b = smoothed(old)
-        @inline(__always) func d(_ i: Int, _ j: Int) -> Float {
-            max(abs(a[3 * i] - b[3 * j]), max(abs(a[3 * i + 1] - b[3 * j + 1]), abs(a[3 * i + 2] - b[3 * j + 2])))
-        }
-        // 整体平移：中间区域的平均差最小的（先算不平移，平局时不动）
-        func cost(_ sx: Int, _ sy: Int) -> Float {
-            var s: Float = 0
-            for y in R..<(h - R) { for x in R..<(w - R) { s += d(y * w + x, (y + sy) * w + x + sx) } }
-            return s
-        }
-        var best = cost(0, 0), bx = 0, by = 0
-        for sy in -R...R {
-            for sx in -R...R where sx != 0 || sy != 0 {
-                let c = cost(sx, sy)
-                if c < best { best = c; bx = sx; by = sy }
-            }
-        }
-        // 每个像素：平移后再在 3×3 里找最像的
+        let sa = smoothed(now), sb = smoothed(old)
         var diff = [Float](repeating: 0, count: n)
-        for y in 0..<h {
-            for x in 0..<w {
-                var m = Float.infinity
-                for oy in -1...1 {
-                    for ox in -1...1 {
-                        let qx = min(max(x + bx + ox, 0), w - 1), qy = min(max(y + by + oy, 0), h - 1)
-                        m = min(m, d(y * w + x, qy * w + qx))
-                    }
-                }
-                diff[y * w + x] = m
+        var subShift: (x: Float, y: Float) = (0, 0)
+        sa.withUnsafeBufferPointer { ap in
+        sb.withUnsafeBufferPointer { bp in
+        diff.withUnsafeMutableBufferPointer { dp in
+            let A = ap.baseAddress!, B = bp.baseAddress!, Df = dp.baseAddress!
+            @inline(__always) func d(_ i: Int, _ j: Int) -> Float {
+                max(abs(A[3 * i] - B[3 * j]), max(abs(A[3 * i + 1] - B[3 * j + 1]), abs(A[3 * i + 2] - B[3 * j + 2])))
             }
-        }
+            // 整体平移：中间区域的平均差最小的（先算不平移，平局时不动）
+            func cost(_ sx: Int, _ sy: Int) -> Float {
+                var s: Float = 0
+                // 隔一个像素取一个（已经平均过，够估计整体平移，便宜 4 倍）
+                for y in stride(from: R, to: h - R, by: 2) {
+                    for x in stride(from: R, to: w - R, by: 2) { s += d(y * w + x, (y + sy) * w + x + sx) }
+                }
+                return s
+            }
+            let side = 2 * R + 1
+            var costs = [Float](repeating: 0, count: side * side)
+            for sy in -R...R { for sx in -R...R { costs[(sy + R) * side + sx + R] = cost(sx, sy) } }
+            var best = costs[R * side + R], bx = 0, by = 0
+            for sy in -R...R {
+                for sx in -R...R where sx != 0 || sy != 0 {
+                    let c = costs[(sy + R) * side + sx + R]
+                    if c < best { best = c; bx = sx; by = sy }
+                }
+            }
+            // 小数部分：最小值两边的代价按 V 字形插值（差的绝对值加起来，最小值附近是 V 字不是抛物线）
+            func refine(_ cm: Float, _ c0: Float, _ cp: Float) -> Float {
+                let den = 2 * (max(cm, cp) - c0)
+                return den > 1e-6 ? min(0.5, max(-0.5, (cm - cp) / den)) : 0
+            }
+            var fx = Float(bx), fy = Float(by)
+            if bx > -R && bx < R {
+                fx += refine(costs[(by + R) * side + bx + R - 1], best, costs[(by + R) * side + bx + R + 1])
+            }
+            if by > -R && by < R {
+                fy += refine(costs[(by + R - 1) * side + bx + R], best, costs[(by + R + 1) * side + bx + R])
+            }
+            subShift = (fx, fy)
+            // 每个像素：平移后再在 3×3 里找最像的
+            for y in 0..<h {
+                for x in 0..<w {
+                    var m = Float.infinity
+                    for oy in -1...1 {
+                        let qy = min(max(y + by + oy, 0), h - 1)
+                        for ox in -1...1 {
+                            let qx = min(max(x + bx + ox, 0), w - 1)
+                            m = min(m, d(y * w + x, qy * w + qx))
+                        }
+                    }
+                    Df[y * w + x] = m
+                }
+            }
+        }}}
         // 变了的地方往外扩 2 像素（长边 80 时约 1/40 画面）：手挥走后边上残留的一条旧遮罩也去掉
-        return maxSmoothstep(diff, width: w, height: h, radius: 2)
+        return (maxSmoothstep(diff, width: w, height: h, radius: 2), subShift)
     }
 
     /// √线性光（三个通道交错存放：r, g, b, r, g, b…）

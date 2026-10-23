@@ -24,7 +24,7 @@ import Foundation
 public struct LensParameters: Equatable {
     /// 默认景深虚化强度：调整预览和照片的虚化时，只需修改这里。
     //public static let defaultBlurK: Float = 0.015
-    public static let defaultBlurK: Float = 0.015 + 0.003
+    public static let defaultBlurK: Float = 0.015 + 0.001
 
     public enum Model: Equatable { case system, thinLens }
 

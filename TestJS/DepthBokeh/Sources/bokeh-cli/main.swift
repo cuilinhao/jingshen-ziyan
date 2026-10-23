@@ -162,7 +162,7 @@ if args.first == "--live" {
             focusPoint: (Float(job["fx"] as? Double ?? 0.5), Float(job["fy"] as? Double ?? 0.5)),
             focusTapped: job["tap"] as? Bool ?? false, time: job["t"] as? Double ?? 0, personMask: mask,
             personMaskColors: maskColors, depthAge: job["age"] as? Int ?? 0,
-            objectLabels: objects, objectColors: objectColors)
+            objectLabels: objects, objectColors: objectColors, objectRevision: job["objrev"] as? Int ?? 0)
         let dbg = job["dbg"] as? String ?? ""
         pipeline.renderer.captureDebugMaps = !dbg.isEmpty
         let r = pipeline.process(input)
@@ -180,6 +180,8 @@ if args.first == "--live" {
                                    "tooClose": r.tooClose, "moving": r.cameraMoving,
                                    "shift": pipeline.lastPlan?.cameraShift ?? 0,
                                    "ms_frame": (t1 - t0) * 1000, "ms_pipeline": (t2 - t1) * 1000]
+        if let v = pipeline.lastPlan?.personMaskStale { info["personStale"] = v }
+        if let v = pipeline.lastPlan?.objectMaskStale { info["objectStale"] = v }
         if let d = r.focusDisparity { info["focusD"] = d }
         if let d = r.focusDistance { info["focusM"] = d }
         for (k, v) in r.timings { info["ms_" + k] = v }

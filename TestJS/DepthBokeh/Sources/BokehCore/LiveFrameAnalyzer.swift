@@ -37,6 +37,11 @@ public struct FramePlan {
     /// 深度是几帧之前的（这一帧没有新深度、沿用了旧的）。≥ 1 时渲染不用旧深度，而是把上一帧对齐好的深度
     /// 按这一帧的画面再对齐一次（StaleDepth）。0 = 深度是这一帧的，或者和上一帧裁得不一样、没法对齐
     public var depthAge: Int = 0
+    /// 人像遮罩算的那一帧到现在，人那块（往外扩一点）画面变了不少（人在动），该重新分割了。
+    /// 手抖造成的整体平移不算（遮罩已经跟着挪过来了）。nil = 没有人像遮罩
+    public var personMaskStale: Bool?
+    /// 同上，对焦的那个物体。nil = 对焦点上没有物体
+    public var objectMaskStale: Bool?
 }
 
 /// 实时预览每一帧在 CPU 上的分析：对焦稳定、主体太近、相对深度保护、分层范围、主体种子、手机是否在动。
@@ -96,14 +101,17 @@ public final class LiveFrameAnalyzer {
         public var objectLabels: FloatMap?
         /// 算物体分割那一帧的画面（同 personMaskColors）
         public var objectColors: PlanarImage?
+        /// 物体标签图的版本号（每次重新分割加 1）：版本、对焦点、裁切都没变时直接用上一帧选好的物体。0 = 每帧重新选
+        public var objectRevision: Int
 
         public init(disparity: FloatMap, relativeDepth: Bool, crop: Float, fNumber: Float,
                     focusPoint: (x: Float, y: Float), focusTapped: Bool, time: Double,
                     colors: PlanarImage?, personMask: FloatMap?, outputLongSide: Int,
                     personMaskColors: PlanarImage? = nil, depthAge: Int = 0,
-                    objectLabels: FloatMap? = nil, objectColors: PlanarImage? = nil) {
+                    objectLabels: FloatMap? = nil, objectColors: PlanarImage? = nil, objectRevision: Int = 0) {
             self.objectLabels = objectLabels
             self.objectColors = objectColors
+            self.objectRevision = objectRevision
             self.disparity = disparity
             self.relativeDepth = relativeDepth
             self.crop = crop
@@ -133,6 +141,9 @@ public final class LiveFrameAnalyzer {
     private var previousLumaSize = (0, 0)
     /// 上一帧的裁切比例：裁得不一样，上一帧的深度就没法直接和这一帧对齐
     private var lastCrop: Float?
+    /// 上一次选出来的物体（已裁切、缩放到深度图大小）和那一帧的小图（已裁切）。标签图没更新、对焦点和裁切没变时直接用
+    private var objectCache: (revision: Int, point: (Float, Float), crop: Float, w: Int, h: Int,
+                              mask: FloatMap?, colors: PlanarImage?)?
 
     public init() {}
 
@@ -146,6 +157,7 @@ public final class LiveFrameAnalyzer {
         previousLuma = []
         previousLumaSize = (0, 0)
         lastCrop = nil
+        objectCache = nil
     }
 
     public func analyze(_ frame: Frame) -> FramePlan {
@@ -235,21 +247,49 @@ public final class LiveFrameAnalyzer {
         // 按颜色补主体边缘：LiDAR 的边缘比双摄准，只补窄一点的一圈（盒子顶面这种只有十来个深度像素高的面）
         if !frame.relativeDepth { matte.colorGrowth = matte.absoluteColorGrowth }
         var seeds: SubjectSeeds?
+        var personStale: Bool?, objectStale: Bool?
         if settings.keepSubjectSharp {
             let colors = frame.colors.map { $0.width == map.width && $0.height == map.height
                 ? $0 : $0.resized(width: map.width, height: map.height) }
+            // 人像、物体遮罩的小图一般一样大：这一帧缩小到比较尺寸只做一次
+            var colorsSmall: PlanarImage?
+            func small(for then: PlanarImage, _ colors: PlanarImage) -> PlanarImage {
+                let (cw, ch) = Self.compareSize(then)
+                if let s = colorsSmall, s.width == cw, s.height == ch { return s }
+                let s = colors.resized(width: cw, height: ch)
+                colorsSmall = s
+                return s
+            }
             var person = frame.personMask?.centerCropped(by: c)
             if let pm = person, let then = frame.personMaskColors?.centerCropped(by: c), let colors {
-                person = Self.dropStaleMask(pm, maskColors: then, colors: colors)
+                let aligned = Self.alignMask(pm, maskColors: then, colors: colors, colorsSmall: small(for: then, colors))
+                person = aligned.mask
+                personStale = aligned.changed >= Self.maskStaleFraction
             }
-            // 对焦的那个物体（在整个相机画面上按对焦点选，再裁）
-            if let labels = frame.objectLabels, let inst = SubjectMatte.instanceAt(labels, point: p) {
-                var object = inst.centerCropped(by: c).resized(width: map.width, height: map.height)
-                if let then = frame.objectColors?.centerCropped(by: c), let colors {
-                    object = Self.dropStaleMask(object, maskColors: then, colors: colors)
+            // 对焦的那个物体（在整个相机画面上按对焦点选，再裁）。标签图几秒才更新一次：没变就用上次选好的
+            var selected: (mask: FloatMap?, colors: PlanarImage?) = (nil, nil)
+            if let labels = frame.objectLabels {
+                if let k = objectCache, frame.objectRevision != 0, k.revision == frame.objectRevision,
+                   k.point == p, k.crop == c, k.w == map.width, k.h == map.height {
+                    selected = (k.mask, k.colors)
+                } else {
+                    let inst = SubjectMatte.instanceAt(labels, point: p)
+                    selected = (inst?.centerCropped(by: c).resized(width: map.width, height: map.height),
+                                frame.objectColors?.centerCropped(by: c))
+                    objectCache = (frame.objectRevision, p, c, map.width, map.height, selected.mask, selected.colors)
                 }
+            }
+            if var object = selected.mask {
+                if let then = selected.colors, let colors {
+                    let aligned = Self.alignMask(object, maskColors: then, colors: colors,
+                                                 colorsSmall: small(for: then, colors))
+                    object = aligned.mask
+                    objectStale = aligned.changed >= Self.maskStaleFraction
+                }
+                // 细条最宽：整张深度图长边的 1/40（裁切后按原来的像素算，320 宽时 8 像素）
+                let reach = max(2, Int((Float(max(frame.disparity.width, frame.disparity.height)) / 40).rounded()))
                 person = Self.addObject(object, to: person, depth: map, focusDisparity: focusD,
-                                        norm: max(relativeScale ?? focusD, 1e-3), matte: matte)
+                                        norm: max(relativeScale ?? focusD, 1e-3), matte: matte, reach: reach)
             }
             seeds = SubjectMatte.seeds(depth: map, colors: colors, focusDisparity: focusD, focusPoint: (fx, fy),
                                        parameters: matte, scale: relativeScale, personMask: person)
@@ -259,15 +299,17 @@ public final class LiveFrameAnalyzer {
                          focusDisparity: focusD, focusDistance: distance, tooClose: tooClose, cameraMoving: moving,
                          cameraShift: shift, stillness: stillness, renderEffect: effectAmount >= 0.02,
                          layerCenters: centers, seeds: seeds, matte: matte, depth: map, lowLongSide: lowLongSide,
-                         changedFraction: changed, depthAge: depthAge)
+                         changedFraction: changed, depthAge: depthAge, personMaskStale: personStale,
+                         objectMaskStale: objectStale)
     }
 
     /// 物体遮罩（和深度图一样大）的深度和对焦面对得上，就并进人像遮罩（两者取大）；对不上原样返回人像遮罩
     static func addObject(_ object: FloatMap, to person: FloatMap?, depth: FloatMap, focusDisparity df: Float,
-                          norm: Float, matte: SubjectMatteParameters) -> FloatMap? {
+                          norm: Float, matte: SubjectMatteParameters, reach: Int = 8) -> FloatMap? {
         let agree = SubjectMatte.depthAgreement(object.values, depth: depth.values, focusDisparity: df, norm: norm,
                                                 band: matte.band)
         guard agree >= matte.objectDepthAgreement else { return person }
+        let object = refineObject(object, depth: depth, focusDisparity: df, norm: norm, band: matte.band, reach: reach)
         guard let person else { return object }
         let pm = person.resized(width: object.width, height: object.height)
         var v = object.values
@@ -275,22 +317,158 @@ public final class LiveFrameAnalyzer {
         return FloatMap(width: object.width, height: object.height, values: v)
     }
 
+    /// 物体遮罩里深度对不上（不在对焦面 ±band 里）的部分，哪些还算物体：
+    ///  - 细条（贴着深度对得上的那部分、不到 2·reach 宽）：盒子顶面这种，深度被滤波抹成了到背景的过渡，正要靠物体分割补回来；
+    ///  - 成块、但深度和旁边的背景一样：也是深度从背景渗进来的（顶面整个拿到了背景的深度），算物体；
+    ///  - 成块、深度既不是对焦面也不是旁边的背景：是另一个东西。Vision 会把画面上挨着的东西算进同一个物体
+    ///    （盒子后面的罐子），它有自己的深度，应该照常虚化，去掉。
+    /// reach：细条最宽多少（深度图像素，按整张深度图算，裁切后也一样）
+    static func refineObject(_ object: FloatMap, depth: FloatMap, focusDisparity df: Float, norm: Float,
+                             band: Float, reach: Int) -> FloatMap {
+        let w = object.width, h = object.height, n = w * h
+        guard depth.width == w, depth.height == h, n > 0 else { return object }
+        let o = object.values, d = depth.values
+        var inBand = [Float](repeating: 0, count: n), outside = [Float](repeating: 0, count: n)
+        var notOutside = [Float](repeating: 1, count: n)
+        var anyOutside = false
+        for i in 0..<n where o[i] > 0.5 {
+            if d[i].isFinite && abs((d[i] - df) / norm) < band {
+                inBand[i] = 1
+            } else {
+                outside[i] = 1; notOutside[i] = 0; anyOutside = true
+            }
+        }
+        guard anyOutside else { return object }
+        let r = max(1, reach)
+        // 腐蚀 reach 以后还剩下的：比 2·reach 宽的成块部分
+        let notEroded = SubjectMatte.dilateBinary(notOutside, width: w, height: h, radius: r)
+        let near = SubjectMatte.dilateBinary(inBand, width: w, height: h, radius: r)
+        var keep = inBand
+        var label = [Int32](repeating: 0, count: n)
+        var next: Int32 = 0
+        func median(_ v: inout [Float]) -> Float? {
+            guard !v.isEmpty else { return nil }
+            v.sort()
+            return v[v.count / 2]
+        }
+        for start in 0..<n where outside[start] > 0 && label[start] == 0 {
+            // 4 连通的一块
+            next += 1
+            var members: [Int] = [start]
+            label[start] = next
+            var k = 0
+            while k < members.count {
+                let i = members[k]; k += 1
+                let x = i % w, y = i / w
+                for (q, ok) in [(i - 1, x > 0), (i + 1, x < w - 1), (i - w, y > 0), (i + w, y < h - 1)]
+                where ok && outside[q] > 0 && label[q] == 0 {
+                    label[q] = next
+                    members.append(q)
+                }
+            }
+            let thick = members.contains { notEroded[$0] == 0 }
+            var keepAll = !thick
+            if thick {
+                // 和旁边（物体外面 3 像素以内）的背景比深度
+                var own = members.compactMap { d[$0].isFinite ? d[$0] : nil }
+                var ring: [Float] = []
+                var seen = Set<Int>()
+                for i in members {
+                    let x = i % w, y = i / w
+                    for yy in max(0, y - 3)...min(h - 1, y + 3) {
+                        for xx in max(0, x - 3)...min(w - 1, x + 3) {
+                            let j = yy * w + xx
+                            if o[j] <= 0.5, d[j].isFinite, seen.insert(j).inserted { ring.append(d[j]) }
+                        }
+                    }
+                }
+                if let dc = median(&own), let dr = median(&ring) {
+                    keepAll = abs(dc - dr) < 0.5 * band * norm
+                }
+            }
+            for i in members where keepAll && (thick || near[i] > 0) { keep[i] = 1 }
+        }
+        // 往外留 1 像素：遮罩缩放后的软边
+        let soft = SubjectMatte.dilateBinary(keep, width: w, height: h, radius: 1)
+        var v = o
+        for i in 0..<n where soft[i] == 0 || (outside[i] > 0 && keep[i] == 0) { v[i] = 0 }
+        return FloatMap(width: w, height: h, values: v)
+    }
+
+    /// 遮罩那块（往外扩一点）里变了的比例达到多少算「该重新分割了」
+    static let maskStaleFraction: Float = 0.02
+
     /// 人像遮罩是几帧之前的画面算的：从那以后画面变了的地方（人在动，手离开的地方）不再相信遮罩。
     /// 不然手挥走以后，手原来的位置还被当成「人」保持清晰，背景在那里清清楚楚地露出来，像重影。
     /// 返回和 colors 一样大的遮罩
     static func dropStaleMask(_ mask: FloatMap, maskColors: PlanarImage, colors: PlanarImage) -> FloatMap {
+        alignMask(mask, maskColors: maskColors, colors: colors).mask
+    }
+
+    /// 几帧之前算的遮罩对到这一帧：整幅画面平移了（手抖）就把遮罩跟着挪过去，变了的地方扔掉。
+    /// - Returns: 对齐后的遮罩（和 colors 一样大）；遮罩那块（往外扩一点）里有多少变了（0…1，决定要不要重新分割）
+    static func alignMask(_ mask: FloatMap, maskColors: PlanarImage, colors: PlanarImage,
+                          colorsSmall: PlanarImage? = nil) -> (mask: FloatMap, changed: Float) {
         let w = colors.width, h = colors.height
         let m = mask.resized(width: w, height: h)
         // 在很小的尺寸上比（长边约 80）：两张图的分辨率、取样位置不一样，边缘上的细微差别不算「变了」；
         // 手抖造成的整体平移、一两个像素的错位也不算（长焦手持时一直在抖）。人挥手这种大变化照样看得出来
+        let (cw, ch) = compareSize(maskColors)
+        let now = colorsSmall.flatMap { $0.width == cw && $0.height == ch ? $0 : nil }
+            ?? colors.resized(width: cw, height: ch)
+        let r = StaleDepth.changeAndShift(now, since: maskColors.resized(width: cw, height: ch))
+        // 遮罩跟着整体平移挪过来（遮罩是那一帧的位置：现在的 (x, y) 对应那一帧的 (x + 平移, y + 平移)）。
+        // 不到 1/4 像素的不挪（估计本身就有这么大的误差）
+        var dx = r.shift.x * Float(w) / Float(cw), dy = r.shift.y * Float(h) / Float(ch)
+        if abs(dx) < 0.25 { dx = 0 }
+        if abs(dy) < 0.25 { dy = 0 }
+        let shifted = Self.translated(m, dx: dx, dy: dy)
+        var v = shifted.values
+        // 哪儿都没变（画面静止时的常态）：不用放大变化图
+        if r.changed.contains(where: { $0 > 0 }) {
+            let u = FloatMap(width: cw, height: ch, values: r.changed).resized(width: w, height: h).values
+            for i in 0..<(w * h) { v[i] *= 1 - u[i] }
+        }
+        // 遮罩那块往外扩 2 个小图像素，里面变了多少
+        let ms = shifted.resized(width: cw, height: ch).values
+        var region: Float = 0, hit: Float = 0
+        for y in 0..<ch {
+            for x in 0..<cw {
+                var inside = false
+                for yy in max(0, y - 2)...min(ch - 1, y + 2) where !inside {
+                    for xx in max(0, x - 2)...min(cw - 1, x + 2) where ms[yy * cw + xx] > 0.5 { inside = true; break }
+                }
+                if inside { region += 1; hit += r.changed[y * cw + x] }
+            }
+        }
+        return (FloatMap(width: w, height: h, values: v), region > 0 ? hit / region : 0)
+    }
+
+    /// 和算遮罩那一帧的小图比较时用的尺寸（长边约 80）
+    static func compareSize(_ maskColors: PlanarImage) -> (Int, Int) {
         let s = min(1, 80 / Float(max(maskColors.width, maskColors.height, 1)))
-        let cw = max(8, Int((Float(maskColors.width) * s).rounded())), ch = max(8, Int((Float(maskColors.height) * s).rounded()))
-        let small = StaleDepth.changedAllowingShift(colors.resized(width: cw, height: ch),
-                                                    since: maskColors.resized(width: cw, height: ch))
-        let u = FloatMap(width: cw, height: ch, values: small).resized(width: w, height: h).values
-        var v = m.values
-        for i in 0..<(w * h) { v[i] *= 1 - u[i] }
-        return FloatMap(width: w, height: h, values: v)
+        return (max(8, Int((Float(maskColors.width) * s).rounded())), max(8, Int((Float(maskColors.height) * s).rounded())))
+    }
+
+    /// 整张图平移（双线性，取样点 (x + dx, y + dy)，出界取边上的值）
+    static func translated(_ m: FloatMap, dx: Float, dy: Float) -> FloatMap {
+        guard abs(dx) > 1e-3 || abs(dy) > 1e-3 else { return m }
+        let w = m.width, h = m.height
+        var out = [Float](repeating: 0, count: w * h)
+        m.values.withUnsafeBufferPointer { src in
+            for y in 0..<h {
+                let sy = min(max(Float(y) + dy, 0), Float(h - 1))
+                let y0 = Int(sy), y1 = min(y0 + 1, h - 1), ty = sy - Float(y0)
+                for x in 0..<w {
+                    let sx = min(max(Float(x) + dx, 0), Float(w - 1))
+                    let x0 = Int(sx), x1 = min(x0 + 1, w - 1), tx = sx - Float(x0)
+                    let a = src[y0 * w + x0] + (src[y0 * w + x1] - src[y0 * w + x0]) * tx
+                    let b = src[y1 * w + x0] + (src[y1 * w + x1] - src[y1 * w + x0]) * tx
+                    out[y * w + x] = a + (b - a) * ty
+                }
+            }
+        }
+        return FloatMap(width: w, height: h, values: out)
     }
 
     /// 拍下来的照片：没有时间历史，对焦点直接取中位数
@@ -322,7 +500,8 @@ public final class LiveFrameAnalyzer {
             var person = personMask
             if let labels = objectLabels, let inst = SubjectMatte.instanceAt(labels, point: focusPoint) {
                 person = addObject(inst.resized(width: map.width, height: map.height), to: personMask, depth: map,
-                                   focusDisparity: focusD, norm: max(relativeScale ?? focusD, 1e-3), matte: matte)
+                                   focusDisparity: focusD, norm: max(relativeScale ?? focusD, 1e-3), matte: matte,
+                                   reach: max(2, Int((Float(max(map.width, map.height)) / 40).rounded())))
             }
             seeds = SubjectMatte.seeds(depth: map, colors: c, focusDisparity: focusD, focusPoint: focusPoint,
                                        parameters: matte, scale: relativeScale, personMask: person)

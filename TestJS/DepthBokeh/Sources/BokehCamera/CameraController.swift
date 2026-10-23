@@ -194,6 +194,11 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
     private var cachedDepthTime = CMTime.invalid
     /// 沿用的深度已经用了几帧（0 = 这一帧有新深度）。渲染时把上一帧的深度搬到这一帧（StaleDepth）
     private var cachedDepthAge = 0
+    /// 上一帧画面在不在动（决定人像 / 物体分割跑多勤）
+    private var sceneMoving = true
+    /// 上一帧分析时，人像 / 对焦物体的遮罩那块是不是变了不少（分割跑多勤）
+    private var personMaskStale: Bool?
+    private var objectMaskStale: Bool?
     /// 最近一秒：新深度到了几次、深度被丢了几次（状态栏显示，看深度是不是跟得上画面）
     private var freshDepthTimes: [CFTimeInterval] = []
     private var droppedDepthTimes: [CFTimeInterval] = []
@@ -973,15 +978,20 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
 
         let text: String
         if let fullDisparity = disparity {
-            // 人像分割在单独的队列上跑（用上一次的结果，不增加这一帧的延迟；画面里一直没人时很少跑）
-            if keepSubjectSharp { segmenter.update(with: pixelBuffer, now: t0) }
-
             // 对焦点（相机画面坐标）
             paramLock.lock()
             let p = _focusPoint
             let tapped = focusResetPending
             focusResetPending = false
             paramLock.unlock()
+
+            // 人像 / 物体分割在单独的队列上跑（用上一次的结果，不增加这一帧的延迟）。
+            // 跑多勤看画面动不动、有没有人、对焦点在哪儿（PersonSegmenter.update）：静止时很少跑，省电
+            if keepSubjectSharp {
+                if tapped || firstRouteFrame { segmenter.focusChanged() }
+                segmenter.update(with: pixelBuffer, now: t0, moving: sceneMoving, personChanged: personMaskStale,
+                                 objectChanged: objectMaskStale, focusPoint: (Float(p.x), Float(p.y)))
+            }
 
             var settings = analyzer.settings
             settings.blurDownscale = blurDownscale
@@ -1004,7 +1014,12 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
                 focusPoint: (Float(p.x), Float(p.y)), focusTapped: tapped, time: t0, colors: colors,
                 personMask: masks?.person, outputLongSide: max(outW, outH),
                 personMaskColors: masks?.personColors, depthAge: depthAge,
-                objectLabels: masks?.objects, objectColors: masks?.objectColors))
+                objectLabels: masks?.objects, objectColors: masks?.objectColors,
+                objectRevision: masks?.objectRevision ?? 0))
+            // 下一帧决定分割跑多勤用：手机在动或画面里有东西在动
+            sceneMoving = plan.cameraShift >= 0.5 || plan.cameraMoving || plan.changedFraction >= 0.005
+            personMaskStale = plan.personMaskStale
+            objectMaskStale = plan.objectMaskStale
             gpu.encode(plan: plan, quality: .preview, refinePasses: 1, source: camera.texture, region: region,
                        output: output, encodeSRGB: true, temporal: temporal, commandBuffer: cb)
 
@@ -1075,6 +1090,13 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
             droppedDepthTimes.removeAll { now - $0 > 1 }
             text += "深度 \(freshDepthTimes.count)/s"
             if !droppedDepthTimes.isEmpty { text += "（丢 \(droppedDepthTimes.count)）" }
+            text += " · "
+        }
+        // 人像 / 物体分割（Vision）最近一秒跑了几次、每次多少毫秒：跑得越勤越热
+        if keepSubjectSharp {
+            let load = segmenter.recentLoad(now: now)
+            text += String(format: "分割 %d/s", load.count)
+            if load.count > 0 { text += String(format: " %.0f ms", load.ms) }
             text += " · "
         }
         if power > 0 { text += power >= 2 ? "机身很热 · " : "机身发热 · " }
