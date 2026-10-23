@@ -267,11 +267,15 @@ enum LensCatalog {
     private static let depthPixelTypes: [OSType] = [kCVPixelFormatType_DisparityFloat16, kCVPixelFormatType_DisparityFloat32,
                                                     kCVPixelFormatType_DepthFloat16, kCVPixelFormatType_DepthFloat32]
 
-    /// Highest-resolution companion depth format.
+    /// Highest-resolution companion depth format, preferring ones that keep up with 30 fps video:
+    /// a depth stream slower than the video leaves frames without fresh depth (moving things then
+    /// drag a stale depth outline behind them).
     private static func largestDepthFormat(of format: AVCaptureDevice.Format) -> AVCaptureDevice.Format? {
-        format.supportedDepthDataFormats.filter {
+        let usable = format.supportedDepthDataFormats.filter {
             depthPixelTypes.contains(CMFormatDescriptionGetMediaSubType($0.formatDescription))
-        }.max {
+        }
+        let fast = usable.filter { $0.videoSupportedFrameRateRanges.contains { $0.maxFrameRate >= 29.9 } }
+        return (fast.isEmpty ? usable : fast).max {
             CMVideoFormatDescriptionGetDimensions($0.formatDescription).width
                 < CMVideoFormatDescriptionGetDimensions($1.formatDescription).width
         }

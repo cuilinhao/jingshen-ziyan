@@ -34,6 +34,13 @@ public final class TemporalState {
     public var motionCutoff: Float = 2
     /// 当前帧整体还能沿用上一帧的比例（1 = 静止，0 = 在扫镜头）
     var stillness: Float = 1
+    /// 测试用：最近一次重新对齐时「变了」的区域
+    public private(set) var debugUnreliable: FloatMap?
+    /// 上一帧的低分辨率画面（线性光）：沿用旧深度时，和这一帧比哪里变了、东西往哪儿动
+    var colors: PlanarImage?
+    /// 从上一张新深度以来，被重新对齐过的区域（各帧「变了」的最大值）。新深度来的那一帧，这些地方不沿用上一帧的深度：
+    /// 搬过来的深度难免有错，时间平滑会把错的再拖好几帧
+    var suspect: [Float] = []
 
     public init() {}
 
@@ -42,6 +49,28 @@ public final class TemporalState {
         luma = []; disparity = []; boost = []; blend = []
         bokehR = []; bokehG = []; bokehB = []
         cameraShift = 0; stillness = 1
+        colors = nil; suspect = []
+    }
+
+    /// 这一帧没有新深度（depthAge ≥ 1，沿用旧的）时：不用那张旧深度，而是把上一帧已经对齐好的深度
+    /// 按这一帧的画面再对齐一次（StaleDepth）。每次只差一帧，手挥得快也追得上；新深度一来就重新开始。
+    /// 没有上一帧（第一帧、刚换相机）就原样返回
+    func realignStaleDepth(_ d: FloatMap, colors now: PlanarImage, guideLuma: FloatMap, gfRadius: Int,
+                           depthAge: Int) -> FloatMap {
+        let previous = colors
+        colors = now
+        let n = d.width * d.height
+        guard depthAge > 0, strength > 0, width == d.width, height == d.height, disparity.count == n, let previous,
+              previous.width == d.width, previous.height == d.height else { return d }
+        let r = StaleDepth.realign(depth: FloatMap(width: width, height: height, values: disparity), now: now,
+                                   previous: previous, guideLuma: guideLuma, gfRadius: gfRadius)
+        debugUnreliable = FloatMap(width: d.width, height: d.height, values: r.changed)
+        if suspect.count == n {
+            for i in 0..<n { suspect[i] = max(suspect[i], r.changed[i]) }
+        } else {
+            suspect = r.changed
+        }
+        return r.depth
     }
 
     /// 低分辨率虚化结果的时间平滑。w 是每个像素的虚化程度（0 清晰 … 1 完全虚化）
@@ -68,9 +97,14 @@ public final class TemporalState {
     }
 
     /// 根据这一帧的亮度算出 blend，并把视差向上一帧靠拢。返回稳定后的视差
-    /// - Parameter stillness: 外面已经估计好的「画面整体静止程度」（LiveFrameAnalyzer），nil = 这里自己估计
-    func prepare(luma now: [Float], disparity d: FloatMap, stillness given: Float? = nil) -> FloatMap {
+    /// - Parameters:
+    ///   - stillness: 外面已经估计好的「画面整体静止程度」（LiveFrameAnalyzer），nil = 这里自己估计
+    ///   - freshDepth: 这一帧的深度是新的（不是沿用、重新对齐的）。之前被重新对齐过的区域这一帧不沿用上一帧
+    func prepare(luma now: [Float], disparity d: FloatMap, stillness given: Float? = nil,
+                 freshDepth: Bool = true) -> FloatMap {
         let n = d.width * d.height
+        let gate = freshDepth && suspect.count == n ? suspect : nil
+        if freshDepth { suspect = [] }
         guard strength > 0, width == d.width, height == d.height, luma.count == n, disparity.count == n else {
             width = d.width; height = d.height
             blend = [Float](repeating: 0, count: n)
@@ -93,7 +127,8 @@ public final class TemporalState {
         let s = strength * stillness, inv = 1 / sigma
         for i in 0..<n {
             let x = dm[i] * inv
-            let b = s * expf(-x * x)
+            var b = s * expf(-x * x)
+            if let gate { b *= 1 - gate[i] }
             blend[i] = b
             out[i] += b * (disparity[i] - out[i])
         }

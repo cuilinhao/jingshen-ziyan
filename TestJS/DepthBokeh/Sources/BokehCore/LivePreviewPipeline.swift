@@ -46,9 +46,16 @@ public final class LivePreviewPipeline {
         public var time: Double
         /// 人像分割遮罩（整个相机画面，任意分辨率，0…1）；对焦点落在人身上时，整个人（包括眼镜）保持清晰
         public var personMask: FloatMap?
+        /// 算人像遮罩那一帧的画面（整个相机画面，任意小尺寸）；画面从那以后变了的地方不再相信遮罩
+        public var personMaskColors: PlanarImage?
+        /// 深度是几帧之前的（沿用旧深度）。0 = 这一帧的
+        public var depthAge: Int
 
         public init(image: PlanarImage, disparity: FloatMap?, relativeDepth: Bool, crop: Float, fNumber: Float,
-                    focusPoint: (x: Float, y: Float), focusTapped: Bool, time: Double, personMask: FloatMap? = nil) {
+                    focusPoint: (x: Float, y: Float), focusTapped: Bool, time: Double, personMask: FloatMap? = nil,
+                    personMaskColors: PlanarImage? = nil, depthAge: Int = 0) {
+            self.personMaskColors = personMaskColors
+            self.depthAge = depthAge
             self.image = image
             self.disparity = disparity
             self.relativeDepth = relativeDepth
@@ -130,7 +137,8 @@ public final class LivePreviewPipeline {
         let plan = analyzer.analyze(LiveFrameAnalyzer.Frame(
             disparity: full, relativeDepth: frame.relativeDepth, crop: c, fNumber: frame.fNumber,
             focusPoint: frame.focusPoint, focusTapped: frame.focusTapped, time: frame.time,
-            colors: colors, personMask: frame.personMask, outputLongSide: frame.image.longSide))
+            colors: colors, personMask: frame.personMask, outputLongSide: frame.image.longSide,
+            personMaskColors: frame.personMaskColors, depthAge: frame.depthAge))
         lastPlan = plan
         lap("分析")
 
@@ -142,7 +150,8 @@ public final class LivePreviewPipeline {
             out = renderer.renderDetailPreserving(full: frame.image, disparity: plan.depth, lens: plan.lens,
                                                   lowLongSide: plan.lowLongSide, quality: settings.quality,
                                                   refinePasses: 1, temporal: temporal, subject: hint,
-                                                  layerCenters: plan.layerCenters, stillness: plan.stillness)
+                                                  layerCenters: plan.layerCenters, stillness: plan.stillness,
+                                                  depthAge: plan.depthAge)
         }
         lap("渲染")
         if plan.renderEffect { timings += renderer.stageTimings.map { ("渲染." + $0.0, $0.1) } }

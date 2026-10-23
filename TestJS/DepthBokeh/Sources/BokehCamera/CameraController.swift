@@ -190,6 +190,11 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
     private var cachedDepth: FloatMap?
     private var cachedDepthRelative = false
     private var cachedDepthTime = CMTime.invalid
+    /// 沿用的深度已经用了几帧（0 = 这一帧有新深度）。渲染时把上一帧的深度搬到这一帧（StaleDepth）
+    private var cachedDepthAge = 0
+    /// 最近一秒：新深度到了几次、深度被丢了几次（状态栏显示，看深度是不是跟得上画面）
+    private var freshDepthTimes: [CFTimeInterval] = []
+    private var droppedDepthTimes: [CFTimeInterval] = []
     private var lastFrameUsedHardwareDepth: Bool?
     private var lastMonoMap: FloatMap?
     private var monoRange: DepthRange?
@@ -636,7 +641,8 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
         if let depthFormat = pick?.depthFormat, session.canAddOutput(depthOutput) {
             session.addOutput(depthOutput)
             depthOutput.isFilteringEnabled = true            // 系统做补洞 + 时域平滑
-            depthOutput.alwaysDiscardsLateDepthData = true
+            // 不丢晚到的深度：丢了这一帧就只能沿用旧深度，动的东西会错位（采集工具也是这样设的，录下来的深度每帧都对得上）
+            depthOutput.alwaysDiscardsLateDepthData = false
             depthOutput.connection(with: .depthData)?.isEnabled = true
             if device.activeDepthDataFormat != depthFormat, (try? device.lockForConfiguration()) != nil {
                 device.activeDepthDataFormat = depthFormat
@@ -650,7 +656,7 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
             session.addOutput(photoOutput)
             photoReady = true
         }
-        // 所有输出都保持传感器方向、不镜像：画面和深度图逐像素对得上
+        // 所有输出都保持传感器方向、不镜像、不防抖：画面和深度图逐像素对得上（防抖会挪画面，深度不跟着挪）
         for output in [videoOutput, depthOutput] as [AVCaptureOutput] {
             for connection in output.connections {
                 if connection.isVideoMirroringSupported {
@@ -658,6 +664,7 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
                     connection.isVideoMirrored = false
                 }
                 if connection.isVideoRotationAngleSupported(0) { connection.videoRotationAngle = 0 }
+                if connection.isVideoStabilizationSupported { connection.preferredVideoStabilizationMode = .off }
             }
         }
         if photoReady {
@@ -752,6 +759,9 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
         lastFrameUsedHardwareDepth = nil
         cachedDepth = nil
         cachedDepthTime = .invalid
+        cachedDepthAge = 0
+        freshDepthTimes.removeAll()
+        droppedDepthTimes.removeAll()
         frameZoomRevision = revision
         minimumFrameTimestamp = minimumTimestamp
         notifyZoomFrame = true
@@ -871,15 +881,19 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
         if throttleWhenStill, routeReady, let still = stillSince, t0 - still > Self.stillThrottleDelay,
            frameCounter % 2 != 0 { return }
 
-        // 1. 硬件深度。有的相机深度帧比视频少：只在同一条线路里短暂沿用上一张
+        // 1. 硬件深度。有的帧没有新深度（晚到被丢、深度帧率比视频低）：只在同一条线路里短暂沿用上一张，
+        //    渲染时按画面的变化把上一帧的深度搬过来（depthAge），不然动的东西会拖着一块错的深度（重影）
         var hardware: FloatMap?
         var relative = false
+        var depthAge = 0
         if let depthData {
             hardware = ImageBridge.disparityMap(from: depthData)
             relative = depthData.depthDataAccuracy == .relative
             cachedDepth = hardware
             cachedDepthRelative = relative
             cachedDepthTime = timestamp
+            cachedDepthAge = 0
+            freshDepthTimes.append(t0)
         } else if depthEnabled, let cached = cachedDepth, cachedDepthTime.isValid {
             // 这条线路本来就有深度：晚到时用上一张撑过去，而不是切到 AI 深度再切回来（每次切换都会清空历史）
             let maxAge = depthExpected ? 0.5 : 0.1
@@ -887,6 +901,8 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
             if age.isFinite && age >= 0 && age <= maxAge {
                 hardware = cached
                 relative = cachedDepthRelative
+                cachedDepthAge += 1
+                depthAge = cachedDepthAge
             }
         }
         let hardwareFrame = hardware != nil
@@ -897,14 +913,18 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
         var disparity = hardware
         if disparity == nil, !depthExpected, let estimator = DepthModelStore.shared.estimator {
             monoCounter &+= 1
+            var estimated = false
             if lastMonoMap == nil || monoCounter % 2 == 0,
                let result = estimator.estimate(pixelBuffer, previous: monoRange) {
                 lastMonoMap = result.map
                 monoRange = result.range
+                estimated = true
             }
             if let map = lastMonoMap {
                 disparity = map
                 relative = true
+                // 隔帧估计：没估计的那帧用的是上一帧的深度
+                depthAge = estimated ? 0 : 1
             }
         }
         let source: DepthSource = hardwareFrame ? hardwareSource : (disparity != nil ? .monocular : .unavailable)
@@ -975,10 +995,13 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
             let dh = max(1, Int((Double(fullDisparity.height) / Double(crop)).rounded()))
             let colors = ImageBridge.planarImage(from: pixelBuffer, width: dw, height: dh, crop: crop)
             let fNumber = self.fNumber
+            // 人像遮罩是几帧之前算的：连同那一帧的小图一起交给分析，画面从那以后变了的地方（人在动）不再相信遮罩
+            let person = keepSubjectSharp ? segmenter.latest : nil
             let plan = analyzer.analyze(LiveFrameAnalyzer.Frame(
                 disparity: fullDisparity, relativeDepth: relative, crop: Float(crop), fNumber: fNumber,
                 focusPoint: (Float(p.x), Float(p.y)), focusTapped: tapped, time: t0, colors: colors,
-                personMask: keepSubjectSharp ? segmenter.latestMask : nil, outputLongSide: max(outW, outH)))
+                personMask: person?.mask, outputLongSide: max(outW, outH),
+                personMaskColors: person?.colors, depthAge: depthAge))
             gpu.encode(plan: plan, quality: .preview, refinePasses: 1, source: camera.texture, region: region,
                        output: output, encodeSRGB: true, temporal: temporal, commandBuffer: cb)
 
@@ -1043,6 +1066,14 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
         let gpuMs = gpuTimes.isEmpty ? 0 : gpuTimes.reduce(0, +) / Double(gpuTimes.count)
         var text = String(format: "%@× · %d×%d · CPU %.0f / GPU %.1f ms · %d fps · ",
                           Self.zoomText(frameZoom), width, height, cpu, gpuMs, shownTimes.count)
+        // 每秒到了几张新深度（和 fps 一样 = 每帧都有新深度；少了的那些帧是把上一帧的深度搬过来用的）
+        if depthEnabled {
+            freshDepthTimes.removeAll { now - $0 > 1 }
+            droppedDepthTimes.removeAll { now - $0 > 1 }
+            text += "深度 \(freshDepthTimes.count)/s"
+            if !droppedDepthTimes.isEmpty { text += "（丢 \(droppedDepthTimes.count)）" }
+            text += " · "
+        }
         if power > 0 { text += power >= 2 ? "机身很热 · " : "机身发热 · " }
         return text
     }
@@ -1094,9 +1125,12 @@ extension DepthCameraController: AVCaptureDataOutputSynchronizerDelegate, AVCapt
               !syncedVideo.sampleBufferWasDropped else { return }
         var depthData: AVDepthData?
         if let depth = synchronizer.dataOutputs.first(where: { $0 is AVCaptureDepthDataOutput }),
-           let syncedDepth = collection.synchronizedData(for: depth) as? AVCaptureSynchronizedDepthData,
-           !syncedDepth.depthDataWasDropped {
-            depthData = syncedDepth.depthData
+           let syncedDepth = collection.synchronizedData(for: depth) as? AVCaptureSynchronizedDepthData {
+            if syncedDepth.depthDataWasDropped {
+                droppedDepthTimes.append(CACurrentMediaTime())
+            } else {
+                depthData = syncedDepth.depthData
+            }
         }
         processFrame(syncedVideo.sampleBuffer, depthData: depthData)
     }

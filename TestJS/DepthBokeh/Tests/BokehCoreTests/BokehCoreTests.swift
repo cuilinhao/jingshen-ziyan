@@ -302,4 +302,73 @@ final class BokehCoreTests: XCTestCase {
         XCTAssertEqual(a[40 * w + 70], 0, accuracy: 1e-4)
         XCTAssertNil(SubjectMatte.personRegion(mask, width: w, height: h, focusPoint: (0.5, 0.5)))
     }
+
+    /// 手（肤色方块，近处）在纹理背景前往右下移了 10 像素，深度还是上一帧的：
+    /// 重新对齐后手新移到的地方是近处，手离开、露出来的背景是远处
+    func testStaleDepthFollowsMovingObject() {
+        let w = 160, h = 120
+        func frame(_ ox: Int, _ oy: Int) -> (PlanarImage, FloatMap) {
+            var img = PlanarImage(width: w, height: h)
+            var d = [Float](repeating: 0.3, count: w * h)
+            for y in 0..<h {
+                for x in 0..<w {
+                    let i = y * w + x
+                    // 背景：灰色带竖条纹
+                    let v: Float = (x / 6) % 2 == 0 ? 0.35 : 0.2
+                    img.r[i] = v; img.g[i] = v; img.b[i] = v * 1.1
+                    if x >= ox && x < ox + 40 && y >= oy && y < oy + 40 {
+                        img.r[i] = 0.55; img.g[i] = 0.3; img.b[i] = 0.22
+                        d[i] = 3
+                    }
+                }
+            }
+            return (img, FloatMap(width: w, height: h, values: d))
+        }
+        let (prevImg, prevDepth) = frame(50, 40)
+        let (nowImg, nowTruth) = frame(60, 46)
+        let r = StaleDepth.realign(depth: prevDepth, now: nowImg, previous: prevImg,
+                                   guideLuma: nowImg.perceptualLuma(), gfRadius: 3)
+        var staleWrong = 0, fixedWrong = 0
+        for i in 0..<(w * h) {
+            if abs(prevDepth.values[i] - nowTruth.values[i]) > 1 { staleWrong += 1 }
+            if abs(r.depth.values[i] - nowTruth.values[i]) > 1 { fixedWrong += 1 }
+        }
+        var far: [(Int, Int)] = []
+        for i in 0..<(w * h) where abs(r.depth.values[i] - nowTruth.values[i]) > 1 {
+            let x = i % w, y = i / w
+            let edge = min(abs(x - 60), abs(x - 99), abs(y - 46), abs(y - 85))
+            if edge > 2 { far.append((x, y)) }
+        }
+        XCTAssertGreaterThan(staleWrong, 600)
+        // 剩下的只是手的轮廓上 1–2 像素的过渡（按这一帧亮度引导滤波，边缘是软的）
+        XCTAssertLessThan(fixedWrong, staleWrong / 5, "旧深度错 \(staleWrong) 个像素，对齐后还错 \(fixedWrong) 个")
+        XCTAssertTrue(far.isEmpty, "离手的轮廓超过 2 像素还有错的：\(far.prefix(20))")
+        // 手新移到的角（右下）是近处，手离开的角（左上）是远处
+        XCTAssertGreaterThan(r.depth[95, 82], 2.5)
+        XCTAssertLessThan(r.depth[52, 42], 0.8)
+        // 没动的背景完全不变
+        XCTAssertEqual(r.depth[150, 5], prevDepth[150, 5])
+    }
+
+    /// 人像遮罩是几帧前的：人挥手离开的地方不再相信遮罩，没动的地方照旧
+    func testStaleMaskDropped() {
+        let w = 80, h = 60
+        func image(_ ox: Int) -> PlanarImage {
+            var img = PlanarImage(width: w, height: h)
+            for i in 0..<(w * h) {
+                let x = i % w
+                let inHand = x >= ox && x < ox + 20
+                img.r[i] = inHand ? 0.55 : 0.2; img.g[i] = inHand ? 0.3 : 0.2; img.b[i] = inHand ? 0.22 : 0.25
+            }
+            return img
+        }
+        var mv = [Float](repeating: 0, count: w * h)
+        for i in 0..<(w * h) where (i % w) >= 10 && (i % w) < 30 { mv[i] = 1 }
+        let mask = FloatMap(width: w, height: h, values: mv)
+        // 手从 x = 10 移到了 x = 40
+        let out = LiveFrameAnalyzer.dropStaleMask(mask, maskColors: image(10), colors: image(40))
+        XCTAssertLessThan(out[15, 30], 0.05, "手离开的地方")
+        let same = LiveFrameAnalyzer.dropStaleMask(mask, maskColors: image(10), colors: image(10))
+        XCTAssertEqual(same[15, 30], 1, accuracy: 1e-4, "没动")
+    }
 }

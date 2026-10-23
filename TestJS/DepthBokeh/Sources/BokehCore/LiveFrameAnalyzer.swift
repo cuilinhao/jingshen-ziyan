@@ -34,6 +34,9 @@ public struct FramePlan {
     /// 和上一帧比，亮度明显变了（> 0.04）的像素占多少（画面里有东西在动；手机整体平移看 cameraShift）。
     /// 没有颜色输入或第一帧为 0
     public var changedFraction: Float = 0
+    /// 深度是几帧之前的（这一帧没有新深度、沿用了旧的）。≥ 1 时渲染不用旧深度，而是把上一帧对齐好的深度
+    /// 按这一帧的画面再对齐一次（StaleDepth）。0 = 深度是这一帧的，或者和上一帧裁得不一样、没法对齐
+    public var depthAge: Int = 0
 }
 
 /// 实时预览每一帧在 CPU 上的分析：对焦稳定、主体太近、相对深度保护、分层范围、主体种子、手机是否在动。
@@ -80,12 +83,18 @@ public final class LiveFrameAnalyzer {
         public var colors: PlanarImage?
         /// 人像分割遮罩（整个相机画面，任意分辨率，0…1）
         public var personMask: FloatMap?
+        /// 算遮罩用的那一帧画面（整个相机画面，任意小尺寸，线性光）。
+        /// 分割在别的线程上跑，遮罩总是晚几帧：画面从那以后变了的地方（人在动）不再相信遮罩；nil = 不检查
+        public var personMaskColors: PlanarImage?
         /// 输出画面的长边（像素），决定模糊部分的分辨率
         public var outputLongSide: Int
+        /// 深度是几帧之前的（这一帧没有新深度、沿用了旧的）。0 = 这一帧的
+        public var depthAge: Int
 
         public init(disparity: FloatMap, relativeDepth: Bool, crop: Float, fNumber: Float,
                     focusPoint: (x: Float, y: Float), focusTapped: Bool, time: Double,
-                    colors: PlanarImage?, personMask: FloatMap?, outputLongSide: Int) {
+                    colors: PlanarImage?, personMask: FloatMap?, outputLongSide: Int,
+                    personMaskColors: PlanarImage? = nil, depthAge: Int = 0) {
             self.disparity = disparity
             self.relativeDepth = relativeDepth
             self.crop = crop
@@ -95,7 +104,9 @@ public final class LiveFrameAnalyzer {
             self.time = time
             self.colors = colors
             self.personMask = personMask
+            self.personMaskColors = personMaskColors
             self.outputLongSide = outputLongSide
+            self.depthAge = depthAge
         }
     }
 
@@ -111,6 +122,8 @@ public final class LiveFrameAnalyzer {
     private var movingUntil: Double = -1
     private var previousLuma: [Float] = []
     private var previousLumaSize = (0, 0)
+    /// 上一帧的裁切比例：裁得不一样，上一帧的深度就没法直接和这一帧对齐
+    private var lastCrop: Float?
 
     public init() {}
 
@@ -123,10 +136,15 @@ public final class LiveFrameAnalyzer {
         movingUntil = -1
         previousLuma = []
         previousLumaSize = (0, 0)
+        lastCrop = nil
     }
 
     public func analyze(_ frame: Frame) -> FramePlan {
         let c = max(frame.crop, 1)
+        var depthAge = max(0, frame.depthAge)
+        if let lc = lastCrop, abs(lc - c) > 0.002 * c { depthAge = 0 }
+        if lastCrop == nil { depthAge = 0 }
+        lastCrop = c
         var p = frame.focusPoint
         var recentered = false
         // 对焦点被裁到画面外了：回到中心
@@ -212,16 +230,37 @@ public final class LiveFrameAnalyzer {
         if settings.keepSubjectSharp {
             let colors = frame.colors.map { $0.width == map.width && $0.height == map.height
                 ? $0 : $0.resized(width: map.width, height: map.height) }
+            var person = frame.personMask?.centerCropped(by: c)
+            if let pm = person, let then = frame.personMaskColors?.centerCropped(by: c), let colors {
+                person = Self.dropStaleMask(pm, maskColors: then, colors: colors)
+            }
             seeds = SubjectMatte.seeds(depth: map, colors: colors, focusDisparity: focusD, focusPoint: (fx, fy),
-                                       parameters: matte, scale: relativeScale,
-                                       personMask: frame.personMask?.centerCropped(by: c))
+                                       parameters: matte, scale: relativeScale, personMask: person)
         }
 
         return FramePlan(lens: lens, focusPoint: (fx, fy), streamFocusPoint: p, focusRecentered: recentered,
                          focusDisparity: focusD, focusDistance: distance, tooClose: tooClose, cameraMoving: moving,
                          cameraShift: shift, stillness: stillness, renderEffect: effectAmount >= 0.02,
                          layerCenters: centers, seeds: seeds, matte: matte, depth: map, lowLongSide: lowLongSide,
-                         changedFraction: changed)
+                         changedFraction: changed, depthAge: depthAge)
+    }
+
+    /// 人像遮罩是几帧之前的画面算的：从那以后画面变了的地方（人在动，手离开的地方）不再相信遮罩。
+    /// 不然手挥走以后，手原来的位置还被当成「人」保持清晰，背景在那里清清楚楚地露出来，像重影。
+    /// 返回和 colors 一样大的遮罩
+    static func dropStaleMask(_ mask: FloatMap, maskColors: PlanarImage, colors: PlanarImage) -> FloatMap {
+        let w = colors.width, h = colors.height
+        let m = mask.resized(width: w, height: h)
+        // 在很小的尺寸上比（长边约 80）：两张图的分辨率、取样位置不一样，边缘上的细微差别不算「变了」；
+        // 人挥手这种大变化照样看得出来
+        let s = min(1, 80 / Float(max(maskColors.width, maskColors.height, 1)))
+        let cw = max(8, Int((Float(maskColors.width) * s).rounded())), ch = max(8, Int((Float(maskColors.height) * s).rounded()))
+        let small = StaleDepth.changed(colors.resized(width: cw, height: ch),
+                                       since: maskColors.resized(width: cw, height: ch))
+        let u = FloatMap(width: cw, height: ch, values: small).resized(width: w, height: h).values
+        var v = m.values
+        for i in 0..<(w * h) { v[i] *= 1 - u[i] }
+        return FloatMap(width: w, height: h, values: v)
     }
 
     /// 拍下来的照片：没有时间历史，对焦点直接取中位数

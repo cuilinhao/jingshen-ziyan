@@ -23,8 +23,9 @@ final class MetalParityTests: XCTestCase {
 
     /// - Parameters:
     ///   - shift: 整幅画面平移的像素（模拟手机在动）
+    ///   - barShift: 前景横杆往上移的像素（画面里有东西在动，手机不动）
     static func makeScene(width W: Int = 960, height H: Int = 720, depthWidth dw: Int = 240, depthHeight dh: Int = 180,
-                          shift: Int = 0, withPerson: Bool = false) -> Scene {
+                          shift: Int = 0, withPerson: Bool = false, barShift: Int = 0) -> Scene {
         var img = PlanarImage(width: W, height: H)
         var truth = [Float](repeating: 0, count: W * H)
         for y in 0..<H {
@@ -46,7 +47,8 @@ final class MetalParityTests: XCTestCase {
                 let hx = Float(sx - W / 2), hy = Float(y - H / 5)
                 if hx * hx + hy * hy < Float(W * W) / 225 { r = 0.7; g = 0.45; b = 0.35; d = 1 }
                 // 前景横杆：0.4 米
-                if y > H * 3 / 4 && y < H * 3 / 4 + H / 12 && sx < W / 2 { r = 0.6; g = 0.55; b = 0.1; d = 2.5 }
+                let by0 = H * 3 / 4 - barShift
+                if y > by0 && y < by0 + H / 12 && sx < W / 2 { r = 0.6; g = 0.55; b = 0.1; d = 2.5 }
                 img.r[i] = r; img.g[i] = g; img.b[i] = b
                 truth[i] = d
             }
@@ -131,7 +133,8 @@ final class MetalParityTests: XCTestCase {
         let hint = plan.seeds.map { SubjectHint(point: plan.focusPoint, parameters: plan.matte, seeds: $0) }
         let ref = cpu.renderDetailPreserving(full: img, disparity: plan.depth, lens: plan.lens, lowLongSide: plan.lowLongSide,
                                              quality: quality, refinePasses: refinePasses, temporal: cpuTemporal,
-                                             subject: hint, layerCenters: plan.layerCenters, stillness: plan.stillness)
+                                             subject: hint, layerCenters: plan.layerCenters, stillness: plan.stillness,
+                                             depthAge: plan.depthAge)
         let src = try XCTUnwrap(r.makeTexture(from: img))
         let out = outputTexture(r, img.width, img.height)
         r.keepDebugTextures = true
@@ -262,6 +265,31 @@ final class MetalParityTests: XCTestCase {
             let d = try compareFrame(r, cpu: cpu, scene: scene, plan: plan, quality: .preview, refinePasses: 1,
                                      cpuTemporal: cpuTemporal, gpuTemporal: gpuTemporal, label: label)
             check(d, label, tolerance: 1.5)
+        }
+    }
+
+    /// 画面里的横杆在往上移，深度每 3 帧才有一张新的：其余帧把上一帧的深度按画面搬过来（StaleDepth），
+    /// 新深度来的那一帧不沿用被搬过的区域。CPU / GPU 每一帧都要一致
+    func testStaleDepthSequenceParity() throws {
+        let r = try makeRenderer()
+        let cpu = BokehRenderer()
+        let cpuTemporal = TemporalState()
+        let gpuTemporal = MetalTemporalState()
+        let analyzer = LiveFrameAnalyzer()
+        var lastFresh: FloatMap?
+        for k in 0..<7 {
+            let scene = Self.makeScene(barShift: 14 * k)
+            let age = k % 3
+            if age == 0 { lastFresh = scene.disparity }
+            let plan = analyzer.analyze(LiveFrameAnalyzer.Frame(
+                disparity: try XCTUnwrap(lastFresh), relativeDepth: false, crop: 1, fNumber: 1.4, focusPoint: (0.5, 0.45),
+                focusTapped: k == 0, time: Double(k) / 30, colors: scene.colors, personMask: nil,
+                outputLongSide: scene.image.longSide, depthAge: age))
+            XCTAssertEqual(plan.depthAge, k == 0 ? 0 : age)
+            let label = "沿用旧深度第 \(k + 1) 帧（深度是 \(age) 帧前的）"
+            let d = try compareFrame(r, cpu: cpu, scene: scene, plan: plan, quality: .preview, refinePasses: 1,
+                                     cpuTemporal: cpuTemporal, gpuTemporal: gpuTemporal, label: label)
+            check(d, label, tolerance: 2)
         }
     }
 

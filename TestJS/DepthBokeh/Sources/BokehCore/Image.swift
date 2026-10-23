@@ -51,6 +51,14 @@ public struct PlanarImage {
             g: FloatMap(width: width, height: height, values: g).resized(width: newW, height: newH).values,
             b: FloatMap(width: width, height: height, values: b).resized(width: newW, height: newH).values)
     }
+
+    /// 中心裁切（同 FloatMap.centerCropped，三个通道分别做）
+    public func centerCropped(by crop: Float, minSide: Int = 8) -> PlanarImage {
+        let cr = FloatMap(width: width, height: height, values: r).centerCropped(by: crop, minSide: minSide)
+        let cg = FloatMap(width: width, height: height, values: g).centerCropped(by: crop, minSide: minSide)
+        let cb = FloatMap(width: width, height: height, values: b).centerCropped(by: crop, minSide: minSide)
+        return PlanarImage(width: cr.width, height: cr.height, r: cr.values, g: cg.values, b: cb.values)
+    }
 }
 
 /// 单通道浮点图（视差图、亮度图、遮罩等）

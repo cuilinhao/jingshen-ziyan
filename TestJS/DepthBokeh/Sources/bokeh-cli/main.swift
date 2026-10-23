@@ -104,7 +104,7 @@ func readPPMBytes(_ path: String) throws -> (bytes: [UInt8], width: Int, height:
 // 实时预览模拟：bokeh-cli --live -
 // 每行一个 JSON：{"img": 相机整帧.ppm, "depth": 整帧视差.pfm 或 "", "out": 输出.ppm, "f": 1.4, "crop": 1.0,
 //               "rel": false, "fx": 0.5, "fy": 0.5, "tap": false, "t": 秒, "reset": false, "mask": 人像遮罩.pfm 或 "",
-//               "long": 1440}
+//               "maskimg": 算遮罩那一帧的画面.ppm 或 "", "age": 深度是几帧之前的, "mindist": 米, "long": 1440}
 // 和 App 的 DepthCameraController 走同一个 LivePreviewPipeline。每帧输出一行 JSON（对焦、耗时）
 if args.first == "--live" {
     args.removeFirst()
@@ -131,13 +131,32 @@ if args.first == "--live" {
         let disparity = depthPath.isEmpty ? nil : try readPFM(depthPath)
         let maskPath = job["mask"] as? String ?? ""
         let mask = maskPath.isEmpty ? nil : try readPFM(maskPath)
+        // 算遮罩那一帧的画面（整帧 ppm，任意尺寸，sRGB 8 位）
+        let maskImgPath = job["maskimg"] as? String ?? ""
+        var maskColors: PlanarImage?
+        if !maskImgPath.isEmpty {
+            let m = try readPPMBytes(maskImgPath)
+            maskColors = m.bytes.withUnsafeBytes { raw in
+                PlanarImage.cameraFrame(interleaved8: raw.baseAddress!, width: m.width, height: m.height,
+                                        bytesPerRow: m.width * 3, layout: .rgb, longSide: max(m.width, m.height), crop: 1)
+            }
+        }
+        if let v = job["mindist"] as? Double { pipeline.settings.minSubjectDistance = Float(v) }
         let input = LivePreviewPipeline.Frame(
             image: image, disparity: disparity, relativeDepth: job["rel"] as? Bool ?? false, crop: crop,
             fNumber: Float(job["f"] as? Double ?? 2.8),
             focusPoint: (Float(job["fx"] as? Double ?? 0.5), Float(job["fy"] as? Double ?? 0.5)),
-            focusTapped: job["tap"] as? Bool ?? false, time: job["t"] as? Double ?? 0, personMask: mask)
+            focusTapped: job["tap"] as? Bool ?? false, time: job["t"] as? Double ?? 0, personMask: mask,
+            personMaskColors: maskColors, depthAge: job["age"] as? Int ?? 0)
+        let dbg = job["dbg"] as? String ?? ""
+        pipeline.renderer.captureDebugMaps = !dbg.isEmpty
         let r = pipeline.process(input)
         let t2 = Double(DispatchTime.now().uptimeNanoseconds) / 1e9
+        if !dbg.isEmpty {
+            if let m = pipeline.renderer.debugRefinedDisparity { try writePFM(m, dbg + "_refined.pfm") }
+            if let m = pipeline.renderer.debugLowDisparity { try writePFM(m, dbg + "_final.pfm") }
+            if let m = pipeline.temporal.debugUnreliable { try writePFM(m, dbg + "_u.pfm") }
+        }
         if let out = job["out"] as? String, !out.isEmpty { try writePPM(r.image, out) }
         var info: [String: Any] = ["out": job["out"] as? String ?? "", "w": r.image.width, "h": r.image.height,
                                    "fx": r.focusPoint.x, "fy": r.focusPoint.y, "recentered": r.focusRecentered,

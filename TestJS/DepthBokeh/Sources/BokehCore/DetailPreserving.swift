@@ -36,11 +36,12 @@ extension BokehRenderer {
     ///   - temporal: 实时预览传同一个对象进来，跨帧稳定深度边缘和光斑；拍照编辑传 nil
     ///   - layerCenters: 分层位置（LiveFrameAnalyzer 按深度范围算好，GPU 版用同一组）；nil = 按这张视差图现算
     ///   - stillness: 画面整体静止的程度（LiveFrameAnalyzer 估计）；nil = TemporalState 自己估计
+    ///   - depthAge: 深度是几帧之前的（FramePlan）。≥ 1 时按这一帧的画面把上一帧的深度重新对齐
     public func renderDetailPreserving(full: PlanarImage, disparity: FloatMap, lens: LensParameters,
                                        lowLongSide: Int, quality: RenderQuality = .preview,
                                        refinePasses: Int = 1, temporal: TemporalState? = nil,
                                        subject: SubjectHint? = nil, layerCenters: [Float]? = nil,
-                                       stillness: Float? = nil) -> PlanarImage {
+                                       stillness: Float? = nil, depthAge: Int = 0) -> PlanarImage {
         let scale = Float(lowLongSide) / Float(full.longSide)
         // 主体种子：在深度图分辨率上算（和 GPU 版共用同一套规则）
         var seeds = subject?.seeds
@@ -50,7 +51,11 @@ extension BokehRenderer {
         if scale >= 0.95 {
             let luma = full.perceptualLuma()
             var d = DepthRefiner.refine(disparity: disparity, guide: full, passes: refinePasses, guideLuma: luma)
-            if let t = temporal { d = t.prepare(luma: luma.values, disparity: d, stillness: stillness) }
+            if let t = temporal {
+                d = t.realignStaleDepth(d, colors: full, guideLuma: luma,
+                                        gfRadius: DepthRefiner.radius(disparity: disparity, image: full), depthAge: depthAge)
+                d = t.prepare(luma: luma.values, disparity: d, stillness: stillness, freshDepth: depthAge == 0)
+            }
             if let sh = subject, let seeds {
                 d = SubjectMatte.apply(disparity: d, image: full, focusDisparity: lens.focusDisparity,
                                        parameters: sh.parameters, scale: lens.relativeScale, seeds: seeds).0
@@ -72,7 +77,11 @@ extension BokehRenderer {
         lap("缩小")
         var dLow = DepthRefiner.refine(disparity: disparity, guide: low, passes: refinePasses, guideLuma: lowLuma)
         lap("深度对齐")
-        if let t = temporal { dLow = t.prepare(luma: lowLuma.values, disparity: dLow, stillness: stillness) }
+        if let t = temporal {
+            dLow = t.realignStaleDepth(dLow, colors: low, guideLuma: lowLuma,
+                                       gfRadius: DepthRefiner.radius(disparity: disparity, image: low), depthAge: depthAge)
+            dLow = t.prepare(luma: lowLuma.values, disparity: dLow, stillness: stillness, freshDepth: depthAge == 0)
+        }
         lap("时间稳定")
         let refined = captureDebugMaps ? dLow : nil
         var matte: FloatMap?

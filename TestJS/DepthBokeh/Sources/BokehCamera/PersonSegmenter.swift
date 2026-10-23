@@ -17,6 +17,8 @@ final class PersonSegmenter: @unchecked Sendable {   // 可变状态都由 lock 
     private let lock = NSLock()
     private var busy = false
     private var mask: FloatMap?
+    /// 算遮罩那一帧的小图（整个相机画面，线性光）
+    private var maskColors: PlanarImage?
     private var generation = 0
     private let handler = VNSequenceRequestHandler()
     private let request: VNGeneratePersonSegmentationRequest = {
@@ -33,10 +35,18 @@ final class PersonSegmenter: @unchecked Sendable {   // 可变状态都由 lock 
         return mask
     }
 
+    /// 最近一次的遮罩，和算它用的那一帧的小图（遮罩总是晚几帧：拿小图和当前画面比，变了的地方不再相信遮罩）
+    var latest: (mask: FloatMap, colors: PlanarImage?)? {
+        lock.lock()
+        defer { lock.unlock() }
+        return mask.map { ($0, maskColors) }
+    }
+
     /// 换了相机：旧画面的遮罩不能再用
     func reset() {
         lock.lock()
         mask = nil
+        maskColors = nil
         generation &+= 1
         lastStart = -1
         lock.unlock()
@@ -61,8 +71,13 @@ final class PersonSegmenter: @unchecked Sendable {   // 可变状态都由 lock 
         queue.async {
             let result = self.segment(pixelBuffer)
             let hasPerson = result.map { m in m.values.contains { $0 > 0.5 } } ?? false
+            // 同一帧的小图（160 长边够判断哪里变了）
+            let thumb = hasPerson ? Self.thumbnail(pixelBuffer) : nil
             self.lock.lock()
-            if gen == self.generation { self.mask = hasPerson ? result : nil }
+            if gen == self.generation {
+                self.mask = hasPerson ? result : nil
+                self.maskColors = thumb
+            }
             if hasPerson { self.lastPersonSeen = now }
             self.busy = false
             self.lock.unlock()
@@ -79,6 +94,14 @@ final class PersonSegmenter: @unchecked Sendable {   // 可变状态都由 lock 
         } catch {
             return nil
         }
+    }
+
+    /// 整个相机画面的小图（传感器方向，线性光，长边 160）
+    static func thumbnail(_ pixelBuffer: CVPixelBuffer) -> PlanarImage {
+        let w = CVPixelBufferGetWidth(pixelBuffer), h = CVPixelBufferGetHeight(pixelBuffer)
+        let s = 160 / Double(max(w, h, 1))
+        return ImageBridge.planarImage(from: pixelBuffer, width: max(1, Int((Double(w) * s).rounded())),
+                                       height: max(1, Int((Double(h) * s).rounded())), crop: 1)
     }
 
     /// 拍下来的照片（传感器方向）用高质量的分割

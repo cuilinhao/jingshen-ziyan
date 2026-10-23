@@ -80,6 +80,8 @@ public final class MetalBokehRenderer {
         "dilateTilesKernel", "layerPrefixKernel", "layerDiskKernel", "layerUpsampleKernel",
         "layerDirectKernel", "clearKernel", "clearUIntKernel", "pullKernel", "pushTopKernel", "pushKernel",
         "finishBokehKernel", "defocusWeightKernel", "stabilizeBokehKernel", "compositeKernel",
+        "staleDiffKernel", "staleMaskKernel", "staleQuarterKernel", "staleFlowKernel", "staleWarpKernel",
+        "staleSnapKernel",
     ]
 
     /// 编译着色器（约 0.1–0.3 秒，建议在后台队列上建）
@@ -186,52 +188,88 @@ public final class MetalBokehRenderer {
         enc.label = "景深"
 
         // ---- 1. 缩小 + 亮度 ----
+        // 低分辨率原图：实时预览时留两份轮流写（沿用旧深度的帧要和上一帧比，见 StaleDepth）
+        let low = temporal.map { $0.color[$0.cur] } ?? ws.low
         let lumaTex = temporal?.luma[temporal!.cur] ?? ws.luma
         var down = GPUDown(cropOrigin: composite.cropOrigin, cropSize: composite.cropSize,
                            samples: Int32(min(4, max(1, Int((reg.width / Float(lw) / 2).rounded(.up))))),
                            boxFactor: Int32(boxFactor), boxOrigin: composite.readOrigin)
         run(enc, "downsampleKernel", lw, lh) { e in
-            e.setTexture(source, index: 0); e.setTexture(ws.low, index: 1); e.setTexture(lumaTex, index: 2)
+            e.setTexture(source, index: 0); e.setTexture(low, index: 1); e.setTexture(lumaTex, index: 2)
             self.setValue(e, &down, 0)
         }
 
-        // ---- 2. 深度对齐：上采样 + 灰度引导滤波 ----
-        run(enc, "upsampleDepthKernel", lw, lh) { e in
-            e.setTexture(depthTex, index: 0); e.setTexture(ws.depthA, index: 1)
-        }
+        // ---- 2. 深度对齐 ----
         var depthCur = ws.depthA, depthNext = ws.depthB
-        for pass in 0..<max(0, refinePasses) {
-            let r = pass == 0 ? gfRadius : max(1, gfRadius / 2)
-            run(enc, "gfPrepareGrayKernel", lw, lh) { e in
-                e.setTexture(lumaTex, index: 0); e.setTexture(depthCur, index: 1); e.setTexture(ws.f4a, index: 2)
+        // 这一帧没有新深度：不用旧的那张，把上一帧对齐好的深度搬到这一帧（TemporalState.realignStaleDepth）
+        let stale = plan.depthAge > 0 && (temporal.map { $0.strength > 0 && $0.hasDepthHistory } ?? false)
+        if let t = temporal, stale {
+            let prev = 1 - t.cur
+            run(enc, "staleDiffKernel", lw, lh) { e in
+                e.setTexture(low, index: 0); e.setTexture(t.color[prev], index: 1); e.setTexture(ws.r1a, index: 2)
             }
-            box(enc, ws.f4a, temp: ws.f4b, radius: r)
-            var eps: Float = 2e-4
-            run(enc, "gfCoeffGrayKernel", lw, lh) { e in
-                e.setTexture(ws.f4a, index: 0); e.setTexture(ws.f4c, index: 1)
-                self.setValue(e, &eps, 0)
+            var mp = GPUStaleMask(suspectValid: t.suspectValid ? 1 : 0, pad0: 0, pad1: 0, pad2: 0)
+            run(enc, "staleMaskKernel", lw, lh) { e in
+                e.setTexture(ws.r1a, index: 0)
+                e.setTexture(t.suspectValid ? t.suspect[t.suspectCur] : self.dummy, index: 1)
+                e.setTexture(ws.staleU, index: 2); e.setTexture(ws.staleUs, index: 3)
+                e.setTexture(t.suspect[1 - t.suspectCur], index: 4)
+                self.setValue(e, &mp, 0)
             }
-            box(enc, ws.f4c, temp: ws.f4b, radius: r)
-            run(enc, "gfApplyGrayKernel", lw, lh) { e in
-                e.setTexture(lumaTex, index: 0); e.setTexture(ws.f4c, index: 1); e.setTexture(depthNext, index: 2)
+            let bw = ws.qNow.width, bh = ws.qNow.height
+            run(enc, "staleQuarterKernel", bw, bh) { e in
+                e.setTexture(low, index: 0); e.setTexture(t.color[prev], index: 1); e.setTexture(ws.staleU, index: 2)
+                e.setTexture(ws.qNow, index: 3); e.setTexture(ws.qPrev, index: 4); e.setTexture(ws.qU, index: 5)
             }
-            swap(&depthCur, &depthNext)
+            run(enc, "staleFlowKernel", bw, bh) { e in
+                e.setTexture(ws.qNow, index: 0); e.setTexture(ws.qPrev, index: 1); e.setTexture(ws.qU, index: 2)
+                e.setTexture(ws.qFlow, index: 3)
+            }
+            run(enc, "staleWarpKernel", lw, lh) { e in
+                e.setTexture(t.depth[prev], index: 0); e.setTexture(low, index: 1); e.setTexture(t.color[prev], index: 2)
+                e.setTexture(ws.staleU, index: 3); e.setTexture(ws.qFlow, index: 4); e.setTexture(ws.depthA, index: 5)
+            }
+            guidedGray(enc, ws, guide: lumaTex, input: ws.depthA, output: ws.r1a, radius: gfRadius)
+            run(enc, "staleSnapKernel", lw, lh) { e in
+                e.setTexture(ws.depthA, index: 0); e.setTexture(ws.r1a, index: 1); e.setTexture(ws.staleUs, index: 2)
+                e.setTexture(ws.depthB, index: 3)
+            }
+            depthCur = ws.depthB; depthNext = ws.depthA
+        } else {
+            // 上采样 + 灰度引导滤波
+            run(enc, "upsampleDepthKernel", lw, lh) { e in
+                e.setTexture(depthTex, index: 0); e.setTexture(ws.depthA, index: 1)
+            }
+            for pass in 0..<max(0, refinePasses) {
+                let r = pass == 0 ? gfRadius : max(1, gfRadius / 2)
+                guidedGray(enc, ws, guide: lumaTex, input: depthCur, output: depthNext, radius: r)
+                swap(&depthCur, &depthNext)
+            }
         }
 
         // ---- 3. 跨帧稳定（深度）----
         if let t = temporal {
             let prev = 1 - t.cur
             if t.hasDepthHistory { t.stillness = plan.stillness ?? 1 }
+            // 新深度来的这一帧：之前被重新对齐过的区域不沿用上一帧
+            let gate = !stale && t.suspectValid
             var tp = GPUTemporal(strength: t.strength * t.stillness, invSigma: 1 / t.sigma,
-                                 hasHistory: t.hasDepthHistory && t.strength > 0 ? 1 : 0, pad: 0)
+                                 hasHistory: t.hasDepthHistory && t.strength > 0 ? 1 : 0, gate: gate ? 1 : 0)
             let out = t.depth[t.cur]
             run(enc, "temporalDepthKernel", lw, lh) { e in
                 e.setTexture(t.luma[t.cur], index: 0); e.setTexture(t.luma[prev], index: 1)
                 e.setTexture(depthCur, index: 2); e.setTexture(t.depth[prev], index: 3)
                 e.setTexture(out, index: 4); e.setTexture(ws.blend, index: 5)
+                e.setTexture(gate ? t.suspect[t.suspectCur] : self.dummy, index: 6)
                 self.setValue(e, &tp, 0)
             }
             depthCur = out
+            if stale {
+                t.suspectCur = 1 - t.suspectCur
+                t.suspectValid = true
+            } else {
+                t.suspectValid = false
+            }
         }
         let refinedDepth = depthCur
 
@@ -250,7 +288,7 @@ public final class MetalBokehRenderer {
                 self.setValue(e, &sp, 0)
             }
             run(enc, "gfPrepareColorKernel", lw, lh) { e in
-                e.setTexture(ws.low, index: 0); e.setTexture(ws.core, index: 1)
+                e.setTexture(low, index: 0); e.setTexture(ws.core, index: 1)
                 e.setTexture(ws.m1, index: 2); e.setTexture(ws.m2, index: 3); e.setTexture(ws.m3, index: 4)
             }
             box(enc, ws.m1, temp: ws.f4a, radius: r)
@@ -265,7 +303,7 @@ public final class MetalBokehRenderer {
             box(enc, ws.f4b, temp: ws.f4a, radius: r)
             box(enc, ws.f4c, temp: ws.f4a, radius: r)
             run(enc, "gfApplyColorKernel", lw, lh) { e in
-                e.setTexture(ws.low, index: 0); e.setTexture(ws.f4b, index: 1); e.setTexture(ws.f4c, index: 2)
+                e.setTexture(low, index: 0); e.setTexture(ws.f4b, index: 1); e.setTexture(ws.f4c, index: 2)
                 e.setTexture(personTex ?? self.dummy, index: 3); e.setTexture(ws.alpha, index: 4)
                 self.setValue(e, &sp, 0)
             }
@@ -294,7 +332,7 @@ public final class MetalBokehRenderer {
                                 highlightGain: gain, hasBoostHistory: hasBoostHistory ? 1 : 0, pad: 0)
         var centerValues = centers
         run(enc, "cocKernel", lw, lh) { e in
-            e.setTexture(depthCur, index: 0); e.setTexture(ws.low, index: 1)
+            e.setTexture(depthCur, index: 0); e.setTexture(low, index: 1)
             e.setTexture(ws.s, index: 2); e.setTexture(ws.maxC, index: 3)
             e.setBuffer(ws.layerPos, offset: 0, index: 0)
             self.setValue(e, &gpuLens, 1)
@@ -307,7 +345,7 @@ public final class MetalBokehRenderer {
         let boostOut = temporal.map { $0.boost[$0.cur] } ?? ws.boost
         let prevBoost = temporal.map { $0.boost[1 - $0.cur] } ?? dummy
         run(enc, "boostKernel", lw, lh) { e in
-            e.setTexture(ws.low, index: 0); e.setTexture(ws.s, index: 1); e.setTexture(ws.maxC, index: 2)
+            e.setTexture(low, index: 0); e.setTexture(ws.s, index: 1); e.setTexture(ws.maxC, index: 2)
             e.setTexture(gain > 0 ? ws.localMean : self.dummy, index: 3)
             e.setTexture(hasBoostHistory ? prevBoost : self.dummy, index: 4)
             e.setTexture(temporal != nil ? ws.blend : self.dummy, index: 5)
@@ -363,14 +401,14 @@ public final class MetalBokehRenderer {
 
         // ---- 7. 虚化程度 w、焦外跨帧稳定 ----
         run(enc, "defocusWeightKernel", lw, lh) { e in
-            e.setTexture(depthCur, index: 0); e.setTexture(ws.low, index: 1); e.setTexture(ws.bokeh, index: 2)
+            e.setTexture(depthCur, index: 0); e.setTexture(low, index: 1); e.setTexture(ws.bokeh, index: 2)
             e.setTexture(ws.w, index: 3)
             self.setValue(e, &gpuLens, 0)
         }
         var bokehFinal = ws.bokeh
         if let t = temporal, !fullRes {
             var tp = GPUTemporal(strength: t.backgroundStrength * t.stillness, invSigma: 1 / t.backgroundSigma,
-                                 hasHistory: t.hasBokehHistory && t.backgroundStrength > 0 ? 1 : 0, pad: 0)
+                                 hasHistory: t.hasBokehHistory && t.backgroundStrength > 0 ? 1 : 0, gate: 0)
             let out = t.bokeh[t.cur]
             run(enc, "stabilizeBokehKernel", lw, lh) { e in
                 e.setTexture(ws.bokeh, index: 0); e.setTexture(t.bokeh[1 - t.cur], index: 1)
@@ -383,7 +421,7 @@ public final class MetalBokehRenderer {
         // ---- 8. 合成到全分辨率 ----
         composite.effect = fullRes ? 2 : 1
         run(enc, "compositeKernel", W, H) { e in
-            e.setTexture(source, index: 0); e.setTexture(ws.low, index: 1); e.setTexture(bokehFinal, index: 2)
+            e.setTexture(source, index: 0); e.setTexture(low, index: 1); e.setTexture(bokehFinal, index: 2)
             e.setTexture(ws.w, index: 3); e.setTexture(output, index: 4)
             self.setValue(e, &composite, 0)
         }
@@ -396,7 +434,7 @@ public final class MetalBokehRenderer {
             t.cur = 1 - t.cur
         }
         debug = keepDebugTextures
-            ? DebugTextures(low: ws.low, refinedDepth: refinedDepth, depth: depthCur, matte: matte,
+            ? DebugTextures(low: low, refinedDepth: refinedDepth, depth: depthCur, matte: matte,
                             bokeh: bokehFinal, weights: ws.w)
             : nil
     }
@@ -479,6 +517,24 @@ public final class MetalBokehRenderer {
     // MARK: - 小工具
 
     /// 可分离盒式均值：tex → (水平) → temp → (垂直) → output（默认写回 tex）
+    /// 灰度引导滤波（DepthRefiner.guidedFilter，eps 2e-4）。f4a / f4b / f4c 当临时纹理
+    private func guidedGray(_ enc: MTLComputeCommandEncoder, _ ws: Workspace, guide: MTLTexture, input: MTLTexture,
+                            output: MTLTexture, radius r: Int) {
+        run(enc, "gfPrepareGrayKernel", ws.width, ws.height) { e in
+            e.setTexture(guide, index: 0); e.setTexture(input, index: 1); e.setTexture(ws.f4a, index: 2)
+        }
+        box(enc, ws.f4a, temp: ws.f4b, radius: r)
+        var eps: Float = 2e-4
+        run(enc, "gfCoeffGrayKernel", ws.width, ws.height) { e in
+            e.setTexture(ws.f4a, index: 0); e.setTexture(ws.f4c, index: 1)
+            self.setValue(e, &eps, 0)
+        }
+        box(enc, ws.f4c, temp: ws.f4b, radius: r)
+        run(enc, "gfApplyGrayKernel", ws.width, ws.height) { e in
+            e.setTexture(guide, index: 0); e.setTexture(ws.f4c, index: 1); e.setTexture(output, index: 2)
+        }
+    }
+
     private func box(_ enc: MTLComputeCommandEncoder, _ tex: MTLTexture, temp: MTLTexture, radius: Int,
                      output: MTLTexture? = nil) {
         let w = tex.width, h = tex.height, seg = 16
@@ -610,9 +666,15 @@ public final class MetalTemporalState {
 
     var width = 0, height = 0
     var luma: [MTLTexture] = [], depth: [MTLTexture] = [], boost: [MTLTexture] = [], bokeh: [MTLTexture] = []
+    /// 低分辨率原图（线性光）
+    var color: [MTLTexture] = []
     var cur = 0
     var hasDepthHistory = false, hasBoostHistory = false, hasBokehHistory = false
     var stillness: Float = 1
+    /// 上一张新深度以来被重新对齐过的区域（TemporalState.suspect）。只在写的时候换一份
+    var suspect: [MTLTexture] = []
+    var suspectCur = 0
+    var suspectValid = false
 
     public init() {}
 
@@ -620,6 +682,7 @@ public final class MetalTemporalState {
     public func reset() {
         hasDepthHistory = false; hasBoostHistory = false; hasBokehHistory = false
         stillness = 1
+        suspectValid = false
     }
 
     func ensure(device: MTLDevice, width w: Int, height h: Int) {
@@ -627,7 +690,9 @@ public final class MetalTemporalState {
         width = w; height = h
         func make(_ f: MTLPixelFormat) -> [MTLTexture] { (0..<2).map { _ in Workspace.texture(device, w, h, f) } }
         luma = make(.r32Float); depth = make(.r32Float); boost = make(.r32Float); bokeh = make(.rgba32Float)
+        color = make(.rgba32Float); suspect = make(.r32Float)
         hasDepthHistory = false; hasBoostHistory = false; hasBokehHistory = false
+        suspectValid = false
         cur = 0
     }
 }
@@ -640,6 +705,8 @@ final class Workspace {
     let f4a, f4b, f4c, m1, m2, m3: MTLTexture
     let core, depthCore, alpha, r1a, r1b: MTLTexture
     let s, maxC, localMean, boost, bokeh, w: MTLTexture
+    /// 沿用旧深度时（StaleDepth）：变了的程度 U、贴边范围 Us；1/4 分辨率的颜色、U、运动
+    let staleU, staleUs, qNow, qPrev, qU, qFlow: MTLTexture
     let src, layerPos, prefix, lowOut, acc, fg: MTLBuffer
     let tiles, dilated, rowMask: MTLBuffer
     let levelDims: [(Int, Int)]
@@ -662,6 +729,10 @@ final class Workspace {
         f4a = t4(); f4b = t4(); f4c = t4(); m1 = t4(); m2 = t4(); m3 = t4()
         core = t1(); depthCore = t1(); alpha = t1(); r1a = t1(); r1b = t1()
         s = t1(); maxC = t1(); localMean = t1(); boost = t1(); bokeh = t4(); w = t1()
+        staleU = t1(); staleUs = t1()
+        let bw = (width + StaleDepth.block - 1) / StaleDepth.block, bh = (height + StaleDepth.block - 1) / StaleDepth.block
+        qNow = Self.texture(device, bw, bh, .rgba32Float); qPrev = Self.texture(device, bw, bh, .rgba32Float)
+        qU = Self.texture(device, bw, bh, .r32Float); qFlow = Self.texture(device, bw, bh, .rgba32Float)
         let n = width * height
         src = buf(n * 16); layerPos = buf(n * 8)
         prefix = buf((width + 1) * height * 16)
@@ -757,7 +828,14 @@ struct GPUTemporal {
     var strength: Float
     var invSigma: Float
     var hasHistory: Int32
-    var pad: Int32
+    var gate: Int32
+}
+
+struct GPUStaleMask {
+    var suspectValid: Int32
+    var pad0: Int32
+    var pad1: Int32
+    var pad2: Int32
 }
 
 struct GPUSubject {

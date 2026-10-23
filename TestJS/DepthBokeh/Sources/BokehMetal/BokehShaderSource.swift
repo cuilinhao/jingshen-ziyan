@@ -273,7 +273,7 @@ struct TemporalParams {
     float strength;           // 已乘上 stillness
     float invSigma;
     int hasHistory;
-    int pad;
+    int gate;                 // 1 = 新深度来的这一帧：之前被重新对齐过的区域（suspect）不沿用上一帧
 };
 
 kernel void temporalDepthKernel(texture2d<float, access::read> luma [[texture(0)]],
@@ -282,6 +282,7 @@ kernel void temporalDepthKernel(texture2d<float, access::read> luma [[texture(0)
                                 texture2d<float, access::read> prevDepth [[texture(3)]],
                                 texture2d<float, access::write> outDepth [[texture(4)]],
                                 texture2d<float, access::write> blendOut [[texture(5)]],
+                                texture2d<float, access::read> suspect [[texture(6)]],
                                 constant TemporalParams& p [[buffer(0)]],
                                 uint2 gid [[thread_position_in_grid]]) {
     int w = int(outDepth.get_width()), h = int(outDepth.get_height());
@@ -307,9 +308,195 @@ kernel void temporalDepthKernel(texture2d<float, access::read> luma [[texture(0)
     float dm = colSum * (1.0f / float(y1 - y0 + 1));
     float xv = dm * p.invSigma;
     float b = p.strength * exp(-xv * xv);
+    if (p.gate != 0) { b *= 1.0f - suspect.read(gid).x; }
     float out = d + b * (prevDepth.read(gid).x - d);
     outDepth.write(float4(out, 0.0f, 0.0f, 0.0f), gid);
     blendOut.write(float4(b, 0.0f, 0.0f, 0.0f), gid);
+}
+
+// ================================================================ 4b. 沿用旧深度：把上一帧的深度搬到这一帧（StaleDepth）
+
+constant float STALE_LO = 0.04f;
+constant float STALE_HI = 0.10f;
+constant int STALE_BLOCK = 4;
+constant int STALE_SEARCH = 12;
+constant float STALE_OUTSIDE = 3.0f;
+
+inline float3 sqrtColor(float3 c) { return sqrt(max(c, float3(0.0f))); }
+
+// 每个像素两帧颜色差（√线性光，三个通道里最大的）
+kernel void staleDiffKernel(texture2d<float, access::read> now [[texture(0)]],
+                            texture2d<float, access::read> prev [[texture(1)]],
+                            texture2d<float, access::write> outTex [[texture(2)]],
+                            uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= outTex.get_width() || gid.y >= outTex.get_height()) { return; }
+    float3 d = fabs(sqrtColor(now.read(gid).rgb) - sqrtColor(prev.read(gid).rgb));
+    outTex.write(float4(max(d.r, max(d.g, d.b)), 0.0f, 0.0f, 0.0f), gid);
+}
+
+struct StaleMaskParams {
+    int suspectValid;         // suspectIn 有效（上一张新深度以来已经重新对齐过）
+    int pad0;
+    int pad1;
+    int pad2;
+};
+
+// U = smoothstep(lo, hi, 5×5 最大差)、Us = smoothstep(lo, hi, 11×11 最大差)；suspect 累积 U
+kernel void staleMaskKernel(texture2d<float, access::read> diff [[texture(0)]],
+                            texture2d<float, access::read> suspectIn [[texture(1)]],
+                            texture2d<float, access::write> uOut [[texture(2)]],
+                            texture2d<float, access::write> usOut [[texture(3)]],
+                            texture2d<float, access::write> suspectOut [[texture(4)]],
+                            constant StaleMaskParams& p [[buffer(0)]],
+                            uint2 gid [[thread_position_in_grid]]) {
+    int w = int(uOut.get_width()), h = int(uOut.get_height());
+    int x = int(gid.x), y = int(gid.y);
+    if (x >= w || y >= h) { return; }
+    float m2 = 0.0f, m5 = 0.0f;
+    for (int yy = max(0, y - 5); yy <= min(h - 1, y + 5); yy++) {
+        for (int xx = max(0, x - 5); xx <= min(w - 1, x + 5); xx++) {
+            float v = diff.read(uint2(xx, yy)).x;
+            m5 = max(m5, v);
+            if (xx >= x - 2 && xx <= x + 2 && yy >= y - 2 && yy <= y + 2) { m2 = max(m2, v); }
+        }
+    }
+    float u = smoothstepf(STALE_LO, STALE_HI, m2);
+    uOut.write(float4(u, 0.0f, 0.0f, 0.0f), gid);
+    usOut.write(float4(smoothstepf(STALE_LO, STALE_HI, m5), 0.0f, 0.0f, 0.0f), gid);
+    float s = p.suspectValid != 0 ? max(suspectIn.read(gid).x, u) : u;
+    suspectOut.write(float4(s, 0.0f, 0.0f, 0.0f), gid);
+}
+
+// 1/4 分辨率的 √颜色（每块线性光取平均再开方，边上的块只算图内的像素）、每块最大的 U
+kernel void staleQuarterKernel(texture2d<float, access::read> now [[texture(0)]],
+                               texture2d<float, access::read> prev [[texture(1)]],
+                               texture2d<float, access::read> u [[texture(2)]],
+                               texture2d<float, access::write> qNow [[texture(3)]],
+                               texture2d<float, access::write> qPrev [[texture(4)]],
+                               texture2d<float, access::write> qU [[texture(5)]],
+                               uint2 gid [[thread_position_in_grid]]) {
+    int bw = int(qNow.get_width()), bh = int(qNow.get_height());
+    if (int(gid.x) >= bw || int(gid.y) >= bh) { return; }
+    int w = int(now.get_width()), h = int(now.get_height());
+    int x0 = int(gid.x) * STALE_BLOCK, x1 = min(w, x0 + STALE_BLOCK);
+    int y0 = int(gid.y) * STALE_BLOCK, y1 = min(h, y0 + STALE_BLOCK);
+    float3 sn = float3(0.0f), sp = float3(0.0f);
+    float mu = 0.0f;
+    for (int y = y0; y < y1; y++) {
+        for (int x = x0; x < x1; x++) {
+            uint2 q = uint2(x, y);
+            sn += now.read(q).rgb;
+            sp += prev.read(q).rgb;
+            mu = max(mu, u.read(q).x);
+        }
+    }
+    float inv = 1.0f / float((x1 - x0) * (y1 - y0));
+    qNow.write(float4(sqrtColor(sn * inv), 1.0f), gid);
+    qPrev.write(float4(sqrtColor(sp * inv), 1.0f), gid);
+    qU.write(float4(mu, 0.0f, 0.0f, 0.0f), gid);
+}
+
+// 块 (bx, by) 移动 (dx, dy) 块后的 3×3 色块差
+inline float staleBlockCost(texture2d<float, access::read> qNow, texture2d<float, access::read> qPrev,
+                            int bx, int by, int dx, int dy, int bw, int bh) {
+    float s = 0.0f;
+    for (int oy = -1; oy <= 1; oy++) {
+        for (int ox = -1; ox <= 1; ox++) {
+            int ax = clamp(bx + ox, 0, bw - 1), ay = clamp(by + oy, 0, bh - 1);
+            int sx = ax + dx, sy = ay + dy;
+            if (sx < 0 || sy < 0 || sx >= bw || sy >= bh) { s += STALE_OUTSIDE; continue; }
+            float3 a = qNow.read(uint2(ax, ay)).rgb, b = qPrev.read(uint2(sx, sy)).rgb;
+            s += fabs(a.r - b.r) + fabs(a.g - b.g) + fabs(a.b - b.b);
+        }
+    }
+    return s;
+}
+
+// 每块的运动（块为单位，±STALE_SEARCH）。周围 3×3 块都没变的块不算
+kernel void staleFlowKernel(texture2d<float, access::read> qNow [[texture(0)]],
+                            texture2d<float, access::read> qPrev [[texture(1)]],
+                            texture2d<float, access::read> qU [[texture(2)]],
+                            texture2d<float, access::write> flowOut [[texture(3)]],
+                            uint2 gid [[thread_position_in_grid]]) {
+    int bw = int(qNow.get_width()), bh = int(qNow.get_height());
+    int bx = int(gid.x), by = int(gid.y);
+    if (bx >= bw || by >= bh) { return; }
+    bool active = false;
+    for (int oy = -1; oy <= 1; oy++) {
+        for (int ox = -1; ox <= 1; ox++) {
+            int nx = bx + ox, ny = by + oy;
+            if (nx >= 0 && ny >= 0 && nx < bw && ny < bh && qU.read(uint2(nx, ny)).x > 0.001f) { active = true; }
+        }
+    }
+    if (!active) {
+        flowOut.write(float4(0.0f), gid);
+        return;
+    }
+    float best = staleBlockCost(qNow, qPrev, bx, by, 0, 0, bw, bh);
+    int bdx = 0, bdy = 0;
+    for (int dy = -STALE_SEARCH; dy <= STALE_SEARCH; dy++) {
+        for (int dx = -STALE_SEARCH; dx <= STALE_SEARCH; dx++) {
+            if (dx == 0 && dy == 0) { continue; }
+            float c = staleBlockCost(qNow, qPrev, bx, by, dx, dy, bw, bh);
+            if (c < best) { best = c; bdx = dx; bdy = dy; }
+        }
+    }
+    flowOut.write(float4(float(bdx), float(bdy), 0.0f, 0.0f), gid);
+}
+
+// 变了的像素：在相邻 3×3 块的运动里挑全分辨率 3×3 色块差最小的，取上一帧那里的深度
+kernel void staleWarpKernel(texture2d<float, access::read> depth [[texture(0)]],
+                            texture2d<float, access::read> now [[texture(1)]],
+                            texture2d<float, access::read> prev [[texture(2)]],
+                            texture2d<float, access::read> u [[texture(3)]],
+                            texture2d<float, access::read> flow [[texture(4)]],
+                            texture2d<float, access::write> outTex [[texture(5)]],
+                            uint2 gid [[thread_position_in_grid]]) {
+    int w = int(outTex.get_width()), h = int(outTex.get_height());
+    int x = int(gid.x), y = int(gid.y);
+    if (x >= w || y >= h) { return; }
+    float d = depth.read(gid).x;
+    float ui = u.read(gid).x;
+    if (ui <= 0.001f) {
+        outTex.write(float4(d, 0.0f, 0.0f, 0.0f), gid);
+        return;
+    }
+    int bw = int(flow.get_width()), bh = int(flow.get_height());
+    int bx = x / STALE_BLOCK, by = y / STALE_BLOCK;
+    float best = INFINITY;
+    int vx = 0, vy = 0;
+    for (int oy = -1; oy <= 1; oy++) {
+        for (int ox = -1; ox <= 1; ox++) {
+            int nx = clamp(bx + ox, 0, bw - 1), ny = clamp(by + oy, 0, bh - 1);
+            float2 f = flow.read(uint2(nx, ny)).xy;
+            int cx = int(f.x) * STALE_BLOCK, cy = int(f.y) * STALE_BLOCK;
+            float s = 0.0f;
+            for (int py = -1; py <= 1; py++) {
+                for (int px = -1; px <= 1; px++) {
+                    int ax = clamp(x + px, 0, w - 1), ay = clamp(y + py, 0, h - 1);
+                    int sx = clamp(ax + cx, 0, w - 1), sy = clamp(ay + cy, 0, h - 1);
+                    float3 a = sqrtColor(now.read(uint2(ax, ay)).rgb), b = sqrtColor(prev.read(uint2(sx, sy)).rgb);
+                    s += fabs(a.r - b.r) + fabs(a.g - b.g) + fabs(a.b - b.b);
+                }
+            }
+            if (s < best) { best = s; vx = cx; vy = cy; }
+        }
+    }
+    int sx = clamp(x + vx, 0, w - 1), sy = clamp(y + vy, 0, h - 1);
+    outTex.write(float4(d + ui * (depth.read(uint2(sx, sy)).x - d), 0.0f, 0.0f, 0.0f), gid);
+}
+
+// 变了的区域附近（Us > 0）换成按这一帧亮度引导滤波后的深度
+kernel void staleSnapKernel(texture2d<float, access::read> warped [[texture(0)]],
+                            texture2d<float, access::read> filtered [[texture(1)]],
+                            texture2d<float, access::read> us [[texture(2)]],
+                            texture2d<float, access::write> outTex [[texture(3)]],
+                            uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= outTex.get_width() || gid.y >= outTex.get_height()) { return; }
+    float v = warped.read(gid).x;
+    float s = us.read(gid).x;
+    if (s > 0.0f) { v += s * (filtered.read(gid).x - v); }
+    outTex.write(float4(v, 0.0f, 0.0f, 0.0f), gid);
 }
 
 // ================================================================ 5. 主体遮罩（SubjectMatte.apply）

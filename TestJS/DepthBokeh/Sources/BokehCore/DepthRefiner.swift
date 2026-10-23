@@ -22,14 +22,19 @@ public enum DepthRefiner {
         let filled = fillInvalid(disparity)
         var up = filled.resized(width: image.width, height: image.height)
         let guide = guideLuma ?? image.perceptualLuma()
-        let upscale = Float(image.longSide) / Float(max(disparity.width, disparity.height))
-        let r = min(max(2, Int((radiusScale * upscale).rounded())), max(2, image.longSide / 40))
+        let r = radius(disparity: disparity, image: image, radiusScale: radiusScale)
         for i in 0..<passes {
             // 第二遍用更小的半径收紧边缘
             let radius = i == 0 ? r : max(1, r / 2)
             up = guidedFilter(guide: guide, input: up, radius: radius, epsilon: epsilon)
         }
         return up
+    }
+
+    /// 引导滤波窗口半径：radiusScale × 上采样倍数，限制在 [2, 长边 / 40]
+    public static func radius(disparity: FloatMap, image: PlanarImage, radiusScale: Float = 2.5) -> Int {
+        let upscale = Float(image.longSide) / Float(max(disparity.width, disparity.height))
+        return min(max(2, Int((radiusScale * upscale).rounded())), max(2, image.longSide / 40))
     }
 
     /// 用拉推法（pull-push）填补视差图里的无效像素
