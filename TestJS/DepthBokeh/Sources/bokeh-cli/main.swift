@@ -105,7 +105,7 @@ func readPPMBytes(_ path: String) throws -> (bytes: [UInt8], width: Int, height:
 // 每行一个 JSON：{"img": 相机整帧.ppm, "depth": 整帧视差.pfm 或 "", "out": 输出.ppm, "f": 1.4, "crop": 1.0,
 //               "rel": false, "fx": 0.5, "fy": 0.5, "tap": false, "t": 秒, "reset": false, "mask": 人像遮罩.pfm 或 "",
 //               "maskimg": 算遮罩那一帧的画面.ppm 或 "", "age": 深度是几帧之前的, "mindist": 米,
-//               "objects": 物体分割标签图.pfm 或 "", "long": 1440}
+//               "objects": 物体分割标签图.pfm 或 "", "objimg": 算物体分割那一帧的画面.ppm 或 "", "long": 1440}
 // 和 App 的 DepthCameraController 走同一个 LivePreviewPipeline。每帧输出一行 JSON（对焦、耗时）
 if args.first == "--live" {
     args.removeFirst()
@@ -146,13 +146,23 @@ if args.first == "--live" {
         if let v = job["mindist"] as? Double { pipeline.settings.minSubjectDistance = Float(v) }
         let objectsPath = job["objects"] as? String ?? ""
         let objects = objectsPath.isEmpty ? nil : try readPFM(objectsPath)
+        // 算物体分割那一帧的画面（整帧 ppm，任意尺寸）
+        let objImgPath = job["objimg"] as? String ?? ""
+        var objectColors: PlanarImage?
+        if !objImgPath.isEmpty {
+            let m = try readPPMBytes(objImgPath)
+            objectColors = m.bytes.withUnsafeBytes { raw in
+                PlanarImage.cameraFrame(interleaved8: raw.baseAddress!, width: m.width, height: m.height,
+                                        bytesPerRow: m.width * 3, layout: .rgb, longSide: max(m.width, m.height), crop: 1)
+            }
+        }
         let input = LivePreviewPipeline.Frame(
             image: image, disparity: disparity, relativeDepth: job["rel"] as? Bool ?? false, crop: crop,
             fNumber: Float(job["f"] as? Double ?? 2.8),
             focusPoint: (Float(job["fx"] as? Double ?? 0.5), Float(job["fy"] as? Double ?? 0.5)),
             focusTapped: job["tap"] as? Bool ?? false, time: job["t"] as? Double ?? 0, personMask: mask,
             personMaskColors: maskColors, depthAge: job["age"] as? Int ?? 0,
-            objectLabels: objects, objectColors: nil)
+            objectLabels: objects, objectColors: objectColors)
         let dbg = job["dbg"] as? String ?? ""
         pipeline.renderer.captureDebugMaps = !dbg.isEmpty
         let r = pipeline.process(input)

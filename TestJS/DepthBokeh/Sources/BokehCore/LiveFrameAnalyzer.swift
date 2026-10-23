@@ -282,11 +282,11 @@ public final class LiveFrameAnalyzer {
         let w = colors.width, h = colors.height
         let m = mask.resized(width: w, height: h)
         // 在很小的尺寸上比（长边约 80）：两张图的分辨率、取样位置不一样，边缘上的细微差别不算「变了」；
-        // 人挥手这种大变化照样看得出来
+        // 手抖造成的整体平移、一两个像素的错位也不算（长焦手持时一直在抖）。人挥手这种大变化照样看得出来
         let s = min(1, 80 / Float(max(maskColors.width, maskColors.height, 1)))
         let cw = max(8, Int((Float(maskColors.width) * s).rounded())), ch = max(8, Int((Float(maskColors.height) * s).rounded()))
-        let small = StaleDepth.changed(colors.resized(width: cw, height: ch),
-                                       since: maskColors.resized(width: cw, height: ch))
+        let small = StaleDepth.changedAllowingShift(colors.resized(width: cw, height: ch),
+                                                    since: maskColors.resized(width: cw, height: ch))
         let u = FloatMap(width: cw, height: ch, values: small).resized(width: w, height: h).values
         var v = m.values
         for i in 0..<(w * h) { v[i] *= 1 - u[i] }

@@ -73,6 +73,59 @@ public enum StaleDepth {
                              radius: maskRadius)
     }
 
+    /// 同上，但允许两张图之间有一点错位：先估计整体平移（±shiftRadius 像素），再允许每个像素 ±1 像素的出入。
+    /// 用在几帧之前算的人像 / 物体遮罩上：长焦手持时整幅画面会抖几个像素，强边缘（盒子顶边和后面的暗背景）
+    /// 一抖就会被当成「变了」，遮罩在那一圈被扔掉，盒子顶上就忽清忽糊、像一层波纹。手挥走这种大变化照样看得出来
+    public static func changedAllowingShift(_ now: PlanarImage, since old: PlanarImage, shiftRadius R: Int = 3) -> [Float] {
+        let w = now.width, h = now.height, n = w * h
+        guard old.width == w, old.height == h, w > 2 * R + 2, h > 2 * R + 2 else {
+            return [Float](repeating: 1, count: n)
+        }
+        // 先各自做 3×3 平均：纹理在亚像素错位下的差别抹掉，整块东西挪走的大变化留着
+        func smoothed(_ img: PlanarImage) -> [Float] {
+            let c = sqrtColors(img)
+            var out = [Float](repeating: 0, count: n * 3)
+            for ch in 0..<3 {
+                let m = BoxFilter.mean((0..<n).map { c[3 * $0 + ch] }, width: w, height: h, radius: 1)
+                for i in 0..<n { out[3 * i + ch] = m[i] }
+            }
+            return out
+        }
+        let a = smoothed(now), b = smoothed(old)
+        @inline(__always) func d(_ i: Int, _ j: Int) -> Float {
+            max(abs(a[3 * i] - b[3 * j]), max(abs(a[3 * i + 1] - b[3 * j + 1]), abs(a[3 * i + 2] - b[3 * j + 2])))
+        }
+        // 整体平移：中间区域的平均差最小的（先算不平移，平局时不动）
+        func cost(_ sx: Int, _ sy: Int) -> Float {
+            var s: Float = 0
+            for y in R..<(h - R) { for x in R..<(w - R) { s += d(y * w + x, (y + sy) * w + x + sx) } }
+            return s
+        }
+        var best = cost(0, 0), bx = 0, by = 0
+        for sy in -R...R {
+            for sx in -R...R where sx != 0 || sy != 0 {
+                let c = cost(sx, sy)
+                if c < best { best = c; bx = sx; by = sy }
+            }
+        }
+        // 每个像素：平移后再在 3×3 里找最像的
+        var diff = [Float](repeating: 0, count: n)
+        for y in 0..<h {
+            for x in 0..<w {
+                var m = Float.infinity
+                for oy in -1...1 {
+                    for ox in -1...1 {
+                        let qx = min(max(x + bx + ox, 0), w - 1), qy = min(max(y + by + oy, 0), h - 1)
+                        m = min(m, d(y * w + x, qy * w + qx))
+                    }
+                }
+                diff[y * w + x] = m
+            }
+        }
+        // 变了的地方往外扩 2 像素（长边 80 时约 1/40 画面）：手挥走后边上残留的一条旧遮罩也去掉
+        return maxSmoothstep(diff, width: w, height: h, radius: 2)
+    }
+
     /// √线性光（三个通道交错存放：r, g, b, r, g, b…）
     static func sqrtColors(_ img: PlanarImage) -> [Float] {
         let n = img.pixelCount

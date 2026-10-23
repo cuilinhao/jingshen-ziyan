@@ -421,4 +421,34 @@ final class BokehCoreTests: XCTestCase {
         let table = plan(0.5, 0.97)
         XCTAssertNil(table.seeds?.person)
     }
+
+    /// 长焦手持：算遮罩那一帧和现在整体错开两三个像素（盒子顶边是强边缘），遮罩不能因此被扔掉；
+    /// 盒子真的被拿走了才扔
+    func testStaleMaskToleratesShake() {
+        let w = 80, h = 60
+        func image(dx: Int, dy: Int, boxX: Int) -> PlanarImage {
+            var img = PlanarImage(width: w, height: h)
+            for y in 0..<h {
+                for x in 0..<w {
+                    let i = y * w + x
+                    let sx = x - dx, sy = y - dy
+                    // 暗背景 + 一点纹理，盒子是亮的、带条纹
+                    var v: Float = 0.02 + 0.03 * Float((sx / 3 + sy / 4) % 2)
+                    if sx >= boxX && sx < boxX + 24 && sy >= 20 && sy < 50 { v = (sx / 2) % 2 == 0 ? 0.7 : 0.4 }
+                    img.r[i] = v; img.g[i] = v; img.b[i] = v
+                }
+            }
+            return img
+        }
+        var mv = [Float](repeating: 0, count: w * h)
+        for y in 20..<50 { for x in 30..<54 { mv[y * w + x] = 1 } }
+        let mask = FloatMap(width: w, height: h, values: mv)
+        let then = image(dx: 0, dy: 0, boxX: 30)
+        let shaken = LiveFrameAnalyzer.dropStaleMask(mask, maskColors: then, colors: image(dx: 2, dy: 1, boxX: 30))
+        var kept: Float = 0
+        for y in 20..<50 { for x in 30..<54 { kept += shaken[x, y] } }
+        XCTAssertGreaterThan(kept / Float(30 * 24), 0.9, "手抖不算「变了」")
+        let moved = LiveFrameAnalyzer.dropStaleMask(mask, maskColors: then, colors: image(dx: 0, dy: 0, boxX: 2))
+        XCTAssertLessThan(moved[45, 35], 0.1, "盒子被拿走了")
+    }
 }
