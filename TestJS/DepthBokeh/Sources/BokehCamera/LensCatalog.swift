@@ -1,5 +1,5 @@
 // 从 DepthBokehCamera 2（最新工作区）迁移：每个变焦倍率该开哪颗摄像头、从哪里拿深度。
-// 去掉了前置摄像头，其余逻辑不变。
+// 前置优先使用 TrueDepth，无法使用时回退到普通前置摄像头和 AI 深度。
 //
 //   倍率            实际用的相机                     画面裁切        深度来源
 //   0.5×–0.99×     超广角 0.5×                      1–1.98×        AI 单目深度（Depth Anything V2）
@@ -29,13 +29,14 @@ struct LensOption: Identifiable, Equatable {
 }
 
 enum DepthSource {
-    case starting, lidar, dualCamera, monocular, unavailable
+    case starting, lidar, dualCamera, trueDepth, monocular, unavailable
 
     var label: String {
         switch self {
         case .starting: return "启动中…"
         case .lidar: return "LiDAR 深度"
         case .dualCamera: return "双摄视差"
+        case .trueDepth: return "TrueDepth 深度"
         case .monocular: return "AI 深度"
         case .unavailable: return "无深度"
         }
@@ -43,7 +44,7 @@ enum DepthSource {
 
     var isHardwareDepth: Bool {
         switch self {
-        case .lidar, .dualCamera: return true
+        case .lidar, .dualCamera, .trueDepth: return true
         default: return false
         }
     }
@@ -71,8 +72,9 @@ enum LensCatalog {
     // Discovery and format scoring happen once. Dial updates only perform small lookup queries.
     private static let devices = AVCaptureDevice.DiscoverySession(
         deviceTypes: [.builtInUltraWideCamera, .builtInWideAngleCamera, .builtInTelephotoCamera,
-                      .builtInDualWideCamera, .builtInDualCamera, .builtInLiDARDepthCamera],
-        mediaType: .video, position: .back).devices
+                      .builtInDualWideCamera, .builtInDualCamera, .builtInLiDARDepthCamera,
+                      .builtInTrueDepthCamera],
+        mediaType: .video, position: .unspecified).devices
 
     private static func device(_ type: AVCaptureDevice.DeviceType,
                                position: AVCaptureDevice.Position) -> AVCaptureDevice? {
@@ -138,6 +140,12 @@ enum LensCatalog {
     }
 
     // MARK: Session plan per lens
+
+    static func frontPlans() -> [CameraPlan] {
+        [depthPlan(.builtInTrueDepthCamera, .front, .trueDepth) { _ in 1 },
+         plainPlan(.builtInWideAngleCamera, .front, .monocular, zoom: 1),
+         plainPlan(.builtInTrueDepthCamera, .front, .monocular, zoom: 1)].compactMap { $0 }
+    }
 
     /// The route the session tries first for a dial zoom (back cameras).
     static func plan(forDisplayZoom zoom: CGFloat) -> CameraPlan? {

@@ -2,6 +2,7 @@
 import CoreGraphics
 import CoreVideo
 import Foundation
+import ImageIO
 import Vision
 import BokehCore
 
@@ -121,8 +122,9 @@ final class PersonSegmenter: @unchecked Sendable {   // 可变状态都由 lock 
     ///   - personChanged: 上一帧分析时，人像遮罩那块变了不少（FramePlan.personMaskStale）；nil = 不知道
     ///   - objectChanged: 同上，对焦的物体（FramePlan.objectMaskStale）；nil = 对焦点上没有物体
     ///   - focusPoint: 对焦点（相机画面坐标）：落在人身上时不分物体
+    ///   - orientation: 原始像素转到正立画面所需的方向（不含预览镜像）
     func update(with pixelBuffer: CVPixelBuffer, now: TimeInterval, moving: Bool, personChanged: Bool?,
-                objectChanged: Bool?, focusPoint: (Float, Float)) {
+                objectChanged: Bool?, focusPoint: (Float, Float), orientation: CGImagePropertyOrientation = .right) {
         lock.lock()
         if busy {
             if moving { movedSinceObjects = true }
@@ -178,9 +180,9 @@ final class PersonSegmenter: @unchecked Sendable {   // 可变状态都由 lock 
         lock.unlock()
         queue.async {
             let t0 = Date().timeIntervalSinceReferenceDate
-            let result = doPerson ? self.segment(pixelBuffer) : nil
+            let result = doPerson ? self.segment(pixelBuffer, orientation: orientation) : nil
             let hasPerson = result.map { m in m.values.contains { $0 > 0.5 } } ?? false
-            let labels = runObjects ? Self.objectLabels(pixelBuffer, request: self.objectRequest) : nil
+            let labels = runObjects ? Self.objectLabels(pixelBuffer, request: self.objectRequest, orientation: orientation) : nil
             let hasObjects = labels.map { m in m.values.contains { $0 > 0.5 } } ?? false
             // 同一帧的小图（160 长边够判断哪里变了）
             let thumb = hasPerson || hasObjects ? Self.thumbnail(pixelBuffer) : nil
@@ -206,26 +208,27 @@ final class PersonSegmenter: @unchecked Sendable {   // 可变状态都由 lock 
 
     /// 前景物体分割（传感器方向的标签图）。不支持的设备（没有神经网络引擎）返回 nil
     static func objectLabels(_ pixelBuffer: CVPixelBuffer,
-                             request: VNGenerateForegroundInstanceMaskRequest = VNGenerateForegroundInstanceMaskRequest()) -> FloatMap? {
-        let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .right, options: [:])
+                             request: VNGenerateForegroundInstanceMaskRequest = VNGenerateForegroundInstanceMaskRequest(),
+                             orientation: CGImagePropertyOrientation = .right) -> FloatMap? {
+        let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: orientation, options: [:])
         guard (try? handler.perform([request])) != nil, let obs = request.results?.first else { return nil }
-        return sensorMask(obs.instanceMask, labels: true)
+        return sensorMask(obs.instanceMask, labels: true, orientation: orientation)
     }
 
     /// 拍下来的照片（传感器方向）的物体标签图
-    static func photoObjects(_ image: CGImage) -> FloatMap? {
+    static func photoObjects(_ image: CGImage, orientation: CGImagePropertyOrientation = .right) -> FloatMap? {
         let request = VNGenerateForegroundInstanceMaskRequest()
-        let handler = VNImageRequestHandler(cgImage: image, orientation: .right, options: [:])
+        let handler = VNImageRequestHandler(cgImage: image, orientation: orientation, options: [:])
         guard (try? handler.perform([request])) != nil, let obs = request.results?.first else { return nil }
-        return sensorMask(obs.instanceMask, labels: true)
+        return sensorMask(obs.instanceMask, labels: true, orientation: orientation)
     }
 
-    private func segment(_ pixelBuffer: CVPixelBuffer) -> FloatMap? {
+    private func segment(_ pixelBuffer: CVPixelBuffer, orientation: CGImagePropertyOrientation = .right) -> FloatMap? {
         do {
-            // 按竖拍方向交给 Vision（.right），它才认得出人
-            try handler.perform([request], on: pixelBuffer, orientation: .right)
+            // 按正立方向交给 Vision；前置传感器的安装方向可能和后置不同
+            try handler.perform([request], on: pixelBuffer, orientation: orientation)
             guard let out = request.results?.first?.pixelBuffer else { return nil }
-            return Self.sensorMask(out)
+            return Self.sensorMask(out, orientation: orientation)
         } catch {
             return nil
         }
@@ -240,18 +243,19 @@ final class PersonSegmenter: @unchecked Sendable {   // 可变状态都由 lock 
     }
 
     /// 拍下来的照片（传感器方向）用高质量的分割
-    static func photoMask(_ image: CGImage) -> FloatMap? {
+    static func photoMask(_ image: CGImage, orientation: CGImagePropertyOrientation = .right) -> FloatMap? {
         let request = VNGeneratePersonSegmentationRequest()
         request.qualityLevel = .accurate
         request.outputPixelFormat = kCVPixelFormatType_OneComponent8
-        let handler = VNImageRequestHandler(cgImage: image, orientation: .right, options: [:])
+        let handler = VNImageRequestHandler(cgImage: image, orientation: orientation, options: [:])
         guard (try? handler.perform([request])) != nil, let out = request.results?.first?.pixelBuffer else { return nil }
-        return sensorMask(out)
+        return sensorMask(out, orientation: orientation)
     }
 
-    /// Vision 输出的遮罩（在交给它的竖拍方向 .right 里）转回传感器方向（横），见 VisionOrientation。
+    /// Vision 输出的遮罩转回原始像素方向；正方形标签图也必须按传入方向旋转。
     /// labels = true：标签图，保留原始整数值（不除以 255）
-    static func sensorMask(_ buffer: CVPixelBuffer, labels: Bool = false) -> FloatMap? {
+    static func sensorMask(_ buffer: CVPixelBuffer, labels: Bool = false,
+                           orientation: CGImagePropertyOrientation = .right) -> FloatMap? {
         let format = CVPixelBufferGetPixelFormatType(buffer)
         // 人像遮罩是 8 位；物体标签图一般也是 8 位（每个像素是物体编号），以防万一也认 32 位浮点
         let isFloat = labels && format == kCVPixelFormatType_OneComponent32Float
@@ -274,7 +278,40 @@ final class PersonSegmenter: @unchecked Sendable {   // 可变状态都由 lock 
                 for col in 0..<mw { portrait[row * mw + col] = Float(p[col]) * scale }
             }
         }
-        return VisionOrientation.sensorFromRight(portrait, width: mw, height: mh)
+        return CameraImageOrientation.sensorMap(portrait, width: mw, height: mh, orientation: orientation)
+    }
+}
+
+/// 把按指定方向送入 Vision / Core ML 的结果转回原始像素坐标；镜像只在显示层处理。
+enum CameraImageOrientation {
+    static func quarterTurns(for orientation: CGImagePropertyOrientation) -> Int {
+        switch orientation {
+        case .right, .rightMirrored: return 1
+        case .down, .downMirrored: return 2
+        case .left, .leftMirrored: return 3
+        default: return 0
+        }
+    }
+
+    static func sensorMap(_ values: [Float], width: Int, height: Int,
+                          orientation: CGImagePropertyOrientation = .right) -> FloatMap {
+        let turns = quarterTurns(for: orientation)
+        if turns == 0 { return FloatMap(width: width, height: height, values: values) }
+        let rawWidth = turns % 2 == 0 ? width : height
+        let rawHeight = turns % 2 == 0 ? height : width
+        var raw = [Float](repeating: 0, count: values.count)
+        for y in 0..<rawHeight {
+            for x in 0..<rawWidth {
+                let index: Int
+                switch turns {
+                case 1: index = x * width + width - 1 - y
+                case 2: index = (height - 1 - y) * width + width - 1 - x
+                default: index = (height - 1 - x) * width + y
+                }
+                raw[y * rawWidth + x] = values[index]
+            }
+        }
+        return FloatMap(width: rawWidth, height: rawHeight, values: raw)
     }
 }
 #endif

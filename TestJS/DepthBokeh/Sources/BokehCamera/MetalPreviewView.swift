@@ -15,6 +15,8 @@ public final class PreviewDisplay: @unchecked Sendable {   // 可变状态都由
         let texture: MTLTexture
         /// 这一帧的视场倍率（1× = 主摄）
         let zoom: CGFloat
+        let rotation: Int
+        let mirrored: Bool
     }
 
     let device: MTLDevice
@@ -45,14 +47,14 @@ public final class PreviewDisplay: @unchecked Sendable {   // 可变状态都由
     }
 
     /// 任意线程：显示一帧。holdPrevious = 换相机后的第一帧，屏幕上原来那一帧淡出
-    func show(_ texture: MTLTexture, zoom: CGFloat, holdPrevious: Bool) {
+    func show(_ texture: MTLTexture, zoom: CGFloat, holdPrevious: Bool, rotation: Int = 90, mirrored: Bool = false) {
         lock.lock()
         let now = CACurrentMediaTime()
         if holdPrevious, let old = current {
             held = (old, now)
             animateUntil = max(animateUntil, now + Self.fadeDuration + 0.05)
         }
-        current = Shown(texture: texture, zoom: zoom)
+        current = Shown(texture: texture, zoom: zoom, rotation: rotation, mirrored: mirrored)
         lock.unlock()
         if holdPrevious { animate(until: now + Self.fadeDuration + 0.05) } else { requestRedraw() }
     }
@@ -98,7 +100,7 @@ public final class PreviewDisplay: @unchecked Sendable {   // 可变状态都由
         let residual = frame.zoom > 0 && zoom.isFinite ? max(1, zoom / frame.zoom) : 1
         return DisplayTransform.portrait(frameWidth: frame.texture.width, frameHeight: frame.texture.height,
                                          viewWidth: Double(viewSize.width), viewHeight: Double(viewSize.height),
-                                         zoom: Double(residual))
+                                         zoom: Double(residual), rotation: frame.rotation, mirrored: frame.mirrored)
     }
 
     /// 主线程（MTKView 回调）

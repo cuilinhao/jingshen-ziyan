@@ -15,16 +15,25 @@ public struct DisplayTransform: Equatable {
     ///   - viewWidth/viewHeight: 视图尺寸（像素或点，只看比例）
     ///   - zoom: 以中心放大的倍数（≥ 1）
     public static func portrait(frameWidth: Int, frameHeight: Int, viewWidth: Double, viewHeight: Double,
-                                zoom: Double, fill: Bool = false) -> DisplayTransform {
-        // 竖着显示的图：宽 = 帧高，高 = 帧宽
-        let wu = Double(max(frameHeight, 1)), hu = Double(max(frameWidth, 1))
+                                zoom: Double, fill: Bool = false, rotation: Int = 90,
+                                mirrored: Bool = false) -> DisplayTransform {
+        let angle = ((rotation % 360) + 360) % 360
+        let swapsAxes = angle == 90 || angle == 270
+        let wu = Double(max(swapsAxes ? frameHeight : frameWidth, 1))
+        let hu = Double(max(swapsAxes ? frameWidth : frameHeight, 1))
         let vw = max(viewWidth, 1), vh = max(viewHeight, 1)
         let k = fill ? max(vw / wu, vh / hu) : min(vw / wu, vh / hu)
         let z = zoom.isFinite ? max(zoom, 1) : 1
-        let su = vw / (wu * k) / z, sv = vh / (hu * k) / z
-        // 竖图坐标 U = 0.5 + (u − 0.5)·su，V = 0.5 + (v − 0.5)·sv；帧坐标 = (V, 1 − U)
-        return DisplayTransform(a: 0, b: Float(sv), c: Float(-su), d: 0,
-                                tx: Float(0.5 - 0.5 * sv), ty: Float(0.5 + 0.5 * su))
+        let su = vw / (wu * k) / z * (mirrored ? -1 : 1), sv = vh / (hu * k) / z
+        let a: Double, b: Double, c: Double, d: Double
+        switch angle {
+        case 0: (a, b, c, d) = (su, 0, 0, sv)
+        case 180: (a, b, c, d) = (-su, 0, 0, -sv)
+        case 270: (a, b, c, d) = (0, -sv, su, 0)
+        default: (a, b, c, d) = (0, sv, -su, 0)
+        }
+        return DisplayTransform(a: Float(a), b: Float(b), c: Float(c), d: Float(d),
+                                tx: Float(0.5 - 0.5 * (a + b)), ty: Float(0.5 - 0.5 * (c + d)))
     }
 
     /// 视图归一化坐标 → 帧归一化坐标

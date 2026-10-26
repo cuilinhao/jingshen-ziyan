@@ -53,6 +53,9 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
     @Published public private(set) var statusText = "正在启动相机…"
     @Published public private(set) var lastPhoto: CapturedDepthPhoto?
     @Published public private(set) var isCapturing = false
+    @Published public private(set) var isFrontCamera = false
+    @Published public private(set) var canSwitchCameras = false
+    @Published public private(set) var isSwitchingCamera = false
     /// 主体太近，景深已自动关闭
     @Published public private(set) var isTooClose = false
     /// 当前深度来源（LiDAR / 双摄视差 / AI 深度）
@@ -119,12 +122,13 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
         return glideFrom * pow(glideTo / glideFrom, eased)
     }
 
-    /// 预览帧的显示方向：后置摄像头竖屏时原始帧需要顺时针转 90°
-    public let previewOrientation: UIImage.Orientation = .right
+    /// 当前传感器画面的显示方向（镜像由显示层单独处理）。
+    @Published public private(set) var previewOrientation: UIImage.Orientation = .right
 
     // MARK: - 变焦调度（主线程）：同一时间只做一次相机操作，只保留最新的目标
     private var lenses: [LensOption] = []
     private var backZoomRange: ClosedRange<CGFloat> = 1...1
+    private var lastBackZoom: CGFloat = 1
     private var pendingZoom: CGFloat?
     /// 待处理的倍率要换到它最合适的相机（手指已松开），而不只是继续裁切
     private var pendingSettle = false
@@ -153,6 +157,7 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
     private var device: AVCaptureDevice?
     private var activePlan: CameraPlan?
     private var isConfigured = false
+    private var captureRotationAngle: CGFloat = 90
 
     // MARK: - 每帧状态（只在 dataQueue 上访问）
     /// 每帧在 CPU 上的分析（对焦、主体太近、分层、主体种子、手机是否在动），云主机上的模拟测试跑的是同一份代码
@@ -185,6 +190,9 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
     private let segmenter = PersonSegmenter()
     /// 当前相机的视场倍率（每帧都按它和 previewZoom 算裁切）
     private var streamZoom: CGFloat = 1
+    private var frameRotation = 90
+    private var frameOrientation: CGImagePropertyOrientation = .right
+    private var frameMirrored = false
     private var depthEnabled = false
     /// 这条线路本来就有硬件深度：深度晚到时沿用上一张，不切到 AI 深度
     private var depthExpected = false
@@ -296,6 +304,7 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
 
     /// 点按对焦。point 是屏幕上那一帧（传感器方向）里的归一化坐标（用 ImageBridge.rawPoint 从屏幕坐标换算）
     public func focus(atRawPoint point: CGPoint) {
+        guard !isSwitchingCamera else { return }
         // 屏幕上的帧是从相机画面中间裁出来的：换算回整个相机画面
         let c = max(displayedCrop, 1)
         let p = CGPoint(x: min(max(0.5 + (point.x - 0.5) / c, 0), 1),
@@ -346,12 +355,59 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
 
     // MARK: - 变焦（主线程）
 
+    /// 前后切换复用变焦的会话重建和首帧等待，避免拍照或连续点击与重建竞争。
+    public func switchCamera() {
+        dispatchPrecondition(condition: .onQueue(.main))
+        guard canSwitchCameras, !isCapturing, !isSwitchingCamera,
+              !isZoomSettling, !zoomOperationInFlight else { return }
+        let previousFront = isFrontCamera
+        let previousZoom = zoomFactor
+        if !previousFront { lastBackZoom = previousZoom }
+        let targetFront = !previousFront
+        let targetZoom = targetFront ? 1 : ZoomScale(range: backZoomRange).clamped(lastBackZoom)
+        settleWork?.cancel()
+        pendingZoom = nil
+        pendingSettle = false
+        zoomRevision &+= 1
+        let revision = zoomRevision
+        zoomOperationInFlight = true
+        isSwitchingCamera = true
+        isZoomSettling = true
+        isTooClose = false
+        depthSourceLabel = ""
+        glideToken &+= 1
+        isZoomGliding = false
+        showZoom(targetZoom, glide: false)
+        sessionQueue.async {
+            let applied = self.configureSession(displayZoom: targetZoom, front: targetFront, revision: revision)
+            let restored = applied == nil
+                ? self.configureSession(displayZoom: previousZoom, front: previousFront, revision: revision) : nil
+            DispatchQueue.main.async {
+                self.zoomOperationInFlight = false
+                if let plan = applied ?? restored {
+                    self.isFrontCamera = plan.device.position == .front
+                    self.activeStreamZoom = plan.streamZoom
+                    self.activeDisplayZoom = applied != nil ? targetZoom : previousZoom
+                    self.zoomRange = self.isFrontCamera ? 1...1 : self.backZoomRange
+                    self.showZoom(self.activeDisplayZoom, glide: false)
+                    self.updateZoomStops()
+                    self.finishZoomIfReady()
+                } else {
+                    self.activeStreamZoom = nil
+                    self.isSwitchingCamera = false
+                    self.showZoom(previousZoom, glide: false)
+                }
+                if applied == nil { self.showStatusMessage("暂时无法切换摄像头") }
+            }
+        }
+    }
+
     /// 手指拖动刻度时连续调用。只要当前相机的画面裁得出来（往大拖），相机就不动、深度一直有；
     /// 只有要比当前相机更广（往小拖超过 5%）才马上换相机。松手后由 `commitZoom` 换到最合适的相机
     public func setZoomFactor(_ factor: CGFloat) {
         dispatchPrecondition(condition: .onQueue(.main))
-        guard !isCapturing, factor.isFinite else { return }
-        let target = ZoomScale(range: backZoomRange).clamped(factor)
+        guard !isCapturing, !isSwitchingCamera, factor.isFinite else { return }
+        let target = ZoomScale(range: zoomRange).clamped(factor)
         guard abs(target - zoomFactor) > 0.00001 else { return }
         // 跳变（点数字）平滑过去；拖动的步子小，直接跟手
         showZoom(target, glide: abs(log(target / previewZoom)) > 0.15)
@@ -368,10 +424,11 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
     /// 它下面最近的深度倍率点，剩下的靠裁切。点数字（正在平滑变焦）时马上换，让相机在变焦动画期间启动
     public func commitZoom(after delay: TimeInterval? = nil) {
         dispatchPrecondition(condition: .onQueue(.main))
+        guard !isCapturing, !isSwitchingCamera else { return }
         let delay = delay ?? (isGliding ? 0 : 0.3)
         settleWork?.cancel()
         let work = DispatchWorkItem { [weak self] in
-            guard let self, !self.isCapturing else { return }
+            guard let self, !self.isCapturing, !self.isSwitchingCamera else { return }
             self.requestRoute(for: self.zoomFactor, settle: true)
         }
         settleWork = work
@@ -429,9 +486,10 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
         pendingSettle = false
         zoomOperationInFlight = true
         let previousZoom = activeDisplayZoom
+        let front = isFrontCamera
         sessionQueue.async {
-            let applied = self.configureSession(displayZoom: target, revision: revision)
-            let restored = applied == nil ? self.configureSession(displayZoom: previousZoom, revision: revision) : nil
+            let applied = self.configureSession(displayZoom: target, front: front, revision: revision)
+            let restored = applied == nil ? self.configureSession(displayZoom: previousZoom, front: front, revision: revision) : nil
             DispatchQueue.main.async {
                 self.zoomOperationInFlight = false
                 if let plan = applied ?? restored { self.activeStreamZoom = plan.streamZoom }
@@ -457,10 +515,15 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
     private func finishZoomIfReady() {
         if !zoomOperationInFlight, pendingZoom == nil, latestFrameRevision == zoomRevision {
             isZoomSettling = false
+            isSwitchingCamera = false
         }
     }
 
     private func updateZoomStops() {
+        if isFrontCamera {
+            zoomStops = [ZoomStop(factor: 1, focalLength: 24)]
+            return
+        }
         var factors = lenses.filter { zoomRange.contains($0.nativeZoom) }.map(\.nativeZoom)
         if zoomRange.contains(2), !factors.contains(where: { abs($0 - 2) < 0.0001 }) {
             factors.append(2)   // 48mm：主摄原生 2× 裁切
@@ -491,8 +554,15 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
                 settings.isDepthDataDeliveryEnabled = true
                 settings.isDepthDataFiltered = true   // 让系统先补洞、平滑
             }
-            if let conn = self.photoOutput.connection(with: .video), conn.isVideoRotationAngleSupported(90) {
-                conn.videoRotationAngle = 90          // 竖屏拍摄：只写进 EXIF 方向，像素本身不旋转
+            if let conn = self.photoOutput.connection(with: .video) {
+                if conn.isVideoRotationAngleSupported(self.captureRotationAngle) {
+                    conn.videoRotationAngle = self.captureRotationAngle
+                }
+                // 自拍预览镜像，照片保留真实方向；深度和照片始终保持一致。
+                if conn.isVideoMirroringSupported {
+                    conn.automaticallyAdjustsVideoMirroring = false
+                    conn.isVideoMirrored = false
+                }
             }
             self.photoOutput.capturePhoto(with: settings, delegate: self)
         }
@@ -506,10 +576,12 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
             let lenses = LensCatalog.availableLenses()
             let range = LensCatalog.zoomRange(for: lenses)
             let initialZoom = ZoomScale(range: range).clamped(1)
+            let canSwitch = !lenses.isEmpty && !LensCatalog.frontPlans().isEmpty
             DispatchQueue.main.async {
                 self.lenses = lenses
                 self.backZoomRange = range
                 self.zoomRange = range
+                self.canSwitchCameras = canSwitch
                 self.showZoom(initialZoom, glide: false)
                 self.activeDisplayZoom = initialZoom
                 self.updateZoomStops()
@@ -523,8 +595,9 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
 
     /// 按 LensCatalog 给的顺序逐个尝试，打开这个倍率最合适的相机。返回打开的那条线路，都失败返回 nil
     @discardableResult
-    private func configureSession(displayZoom: CGFloat, revision: Int = 0) -> CameraPlan? {
-        for plan in LensCatalog.settledPlans(displayZoom: displayZoom) where apply(plan, revision: revision) {
+    private func configureSession(displayZoom: CGFloat, front: Bool = false, revision: Int = 0) -> CameraPlan? {
+        let plans = front ? LensCatalog.frontPlans() : LensCatalog.settledPlans(displayZoom: displayZoom)
+        for plan in plans where apply(plan, revision: revision) {
             return plan
         }
         return nil
@@ -663,6 +736,20 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
             session.addOutput(photoOutput)
             photoReady = true
         }
+        // 取景界面固定按竖屏排布，查询传感器相对竖屏的角度，不能冻结某一刻的重力方向。
+        let portraitAngle: CGFloat
+        if #available(iOS 27.0, *) {
+            let coordinator = AVCaptureDevice.RotationCoordinator(device: device, previewLayer: nil)
+            portraitAngle = coordinator.videoRotationAngleRelative(toDeviceOrientation: .portrait)
+        } else if let connection = videoOutput.connection(with: .video), connection.isVideoOrientationSupported {
+            // 旧系统通过系统的方向映射查询，随后恢复 0°，保留画面和深度的原始像素。
+            connection.videoOrientation = .portrait
+            portraitAngle = connection.videoRotationAngle
+        } else {
+            session.commitConfiguration()
+            return false
+        }
+        let rotation = (Int((portraitAngle / 90).rounded()) * 90 + 360) % 360
         // 所有输出都保持传感器方向、不镜像、不防抖：画面和深度图逐像素对得上（防抖会挪画面，深度不跟着挪）
         for output in [videoOutput, depthOutput] as [AVCaptureOutput] {
             for connection in output.connections {
@@ -694,7 +781,30 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
         let depthOn = useDepth
         let newVideoOutput = videoOutput
         let newSynchronizer = synchronizer
+        let orientation: CGImagePropertyOrientation
+        switch rotation {
+        case 0: orientation = .up
+        case 180: orientation = .down
+        case 270: orientation = .left
+        default: orientation = .right
+        }
+        captureRotationAngle = CGFloat(rotation)
         let focus = dataQueue.sync { () -> CGPoint? in
+            let front = device.position == .front
+            if self.frameMirrored != front {
+                self.paramLock.lock()
+                self._focusPoint = CGPoint(x: 0.5, y: 0.5)
+                self.paramLock.unlock()
+                self.lastPublishedZoom = self.previewZoom
+                self.tooCloseState = false
+                self.lastRenderInputs = nil
+                self.sceneMoving = true
+                self.personMaskStale = nil
+                self.objectMaskStale = nil
+            }
+            self.frameMirrored = front
+            self.frameRotation = rotation
+            self.frameOrientation = orientation
             self.acceptedVideoOutput = newVideoOutput
             self.acceptedSynchronizer = newSynchronizer
             self.depthEnabled = depthOn
@@ -724,6 +834,7 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
             dataQueue.sync { self.minimumFrameTimestamp = timestamp }
         }
         activePlan = plan
+        DispatchQueue.main.async { self.previewOrientation = ImageBridge.uiOrientation(orientation) }
         if useDepth { capDepthFrameRate(device) }
         if let focus { focusDevice(at: focus) }
         // 没有深度硬件的镜头用 AI 深度：现在加载（或下载）模型
@@ -922,7 +1033,7 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
             monoCounter &+= 1
             var estimated = false
             if lastMonoMap == nil || monoCounter % 2 == 0,
-               let result = estimator.estimate(pixelBuffer, previous: monoRange) {
+               let result = estimator.estimate(pixelBuffer, previous: monoRange, orientation: frameOrientation) {
                 lastMonoMap = result.map
                 monoRange = result.range
                 estimated = true
@@ -990,7 +1101,8 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
             if keepSubjectSharp {
                 if tapped || firstRouteFrame { segmenter.focusChanged() }
                 segmenter.update(with: pixelBuffer, now: t0, moving: sceneMoving, personChanged: personMaskStale,
-                                 objectChanged: objectMaskStale, focusPoint: (Float(p.x), Float(p.y)))
+                                 objectChanged: objectMaskStale, focusPoint: (Float(p.x), Float(p.y)),
+                                 orientation: frameOrientation)
             }
 
             var settings = analyzer.settings
@@ -1056,10 +1168,12 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
 
         framesInFlight += 1
         let holdPrevious = firstRouteFrame
+        let rotation = frameRotation
+        let mirrored = frameMirrored
         cb.addCompletedHandler { [weak self] buffer in
             withExtendedLifetime(camera) {}   // 相机帧要等 GPU 读完才能还给相机
             let ms = (buffer.gpuEndTime - buffer.gpuStartTime) * 1000
-            display.show(output, zoom: frameZoom, holdPrevious: holdPrevious)
+            display.show(output, zoom: frameZoom, holdPrevious: holdPrevious, rotation: rotation, mirrored: mirrored)
             guard let self else { return }
             self.dataQueue.async {
                 self.framesInFlight -= 1
@@ -1185,13 +1299,25 @@ extension DepthCameraController: AVCapturePhotoCaptureDelegate {
             return
         }
         // 和预览一样的裁切（两个深度倍率点之间相机停在低的那个点）
-        let (crop, monoRoute) = dataQueue.sync { (self.lastFrameCrop, !self.depthExpected) }
+        let (crop, monoRoute, streamOrientation) = dataQueue.sync {
+            (self.lastFrameCrop, !self.depthExpected, self.frameOrientation)
+        }
         let depth = photo.depthData
         let orientationRaw = (photo.metadata[kCGImagePropertyOrientation as String] as? NSNumber)?.uint32Value ?? 1
-        let orientation = ImageBridge.uiOrientation(CGImagePropertyOrientation(rawValue: orientationRaw) ?? .up)
+        let photoOrientation = CGImagePropertyOrientation(rawValue: orientationRaw) ?? .up
+        let orientation = ImageBridge.uiOrientation(photoOrientation)
+        // 照片输出可能为竖装传感器补偿像素方向；先转到正向图，再转入照片的原始坐标。
+        let uprightFocus: CGPoint
+        switch streamOrientation {
+        case .right: uprightFocus = CGPoint(x: 1 - streamFocus.y, y: streamFocus.x)
+        case .left: uprightFocus = CGPoint(x: streamFocus.y, y: 1 - streamFocus.x)
+        case .down: uprightFocus = CGPoint(x: 1 - streamFocus.x, y: 1 - streamFocus.y)
+        default: uprightFocus = streamFocus
+        }
+        let photoFocus = ImageBridge.rawPoint(fromDisplayed: uprightFocus, orientation: orientation)
         let c = max(crop, 1)
-        let focus = CGPoint(x: min(max(0.5 + (streamFocus.x - 0.5) * c, 0), 1),
-                            y: min(max(0.5 + (streamFocus.y - 0.5) * c, 0), 1))
+        let focus = CGPoint(x: min(max(0.5 + (photoFocus.x - 0.5) * c, 0), 1),
+                            y: min(max(0.5 + (photoFocus.y - 0.5) * c, 0), 1))
 
         photoQueue.async {
             let cg = ImageBridge.centerCrop(cgFull, by: c)
@@ -1202,7 +1328,8 @@ extension DepthCameraController: AVCapturePhotoCaptureDelegate {
                 // 只补洞；和图像的对齐在编辑器里按渲染分辨率做
                 disparity = DepthRefiner.fillInvalid(ImageBridge.disparityMap(from: depth).centerCropped(by: Float(c)))
                 relative = depth.depthDataAccuracy == .relative
-            } else if monoRoute, let estimator = DepthModelStore.shared.estimator, let mono = estimator.estimate(cgImage: cg) {
+            } else if monoRoute, let estimator = DepthModelStore.shared.estimator,
+                      let mono = estimator.estimate(cgImage: cg, orientation: photoOrientation) {
                 // 超广角：在裁好的照片上重新估计一次 AI 深度
                 disparity = mono
                 relative = true
@@ -1210,8 +1337,8 @@ extension DepthCameraController: AVCapturePhotoCaptureDelegate {
             // 没有深度（光线太暗、AI 模型没准备好）：整张图当作在对焦面上
             let hasDepth = disparity != nil
             // 人像分割（高质量）：对焦在人身上时整个人保持清晰；物体分割：对焦的物体整个保持清晰。和预览一致
-            let person = hasDepth ? PersonSegmenter.photoMask(cg) : nil
-            let objects = hasDepth ? PersonSegmenter.photoObjects(cg) : nil
+            let person = hasDepth ? PersonSegmenter.photoMask(cg, orientation: photoOrientation) : nil
+            let objects = hasDepth ? PersonSegmenter.photoObjects(cg, orientation: photoOrientation) : nil
             let captured = CapturedDepthPhoto(image: image,
                                               disparity: disparity ?? FloatMap(width: 64, height: 48, repeating: 1),
                                               orientation: orientation, focusPoint: focus, fNumber: fNumber,

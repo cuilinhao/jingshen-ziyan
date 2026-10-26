@@ -10,6 +10,7 @@ import CoreML
 import CoreImage
 import CoreVideo
 import CoreGraphics
+import ImageIO
 import BokehCore
 
 /// Normalisation range of the model output (2nd / 98th percentile), smoothed over video frames.
@@ -87,20 +88,23 @@ final class MonocularDepthEstimator: @unchecked Sendable {   // all mutable stat
     /// Disparity-like depth for a camera buffer in sensor orientation.
     /// Returns a map in the same (sensor) orientation plus the range used.
     /// Pass the previous frame's range to smooth the normalisation over video (nil for photos).
-    func estimate(_ pixelBuffer: CVPixelBuffer, previous: DepthRange?) -> (map: FloatMap, range: DepthRange)? {
-        estimate(image: CIImage(cvPixelBuffer: pixelBuffer), previous: previous)
+    func estimate(_ pixelBuffer: CVPixelBuffer, previous: DepthRange?,
+                  orientation: CGImagePropertyOrientation = .right) -> (map: FloatMap, range: DepthRange)? {
+        estimate(image: CIImage(cvPixelBuffer: pixelBuffer), previous: previous, orientation: orientation)
     }
 
     /// Same for a still photo (sensor orientation, EXIF orientation not applied).
-    func estimate(cgImage: CGImage) -> FloatMap? {
-        estimate(image: CIImage(cgImage: cgImage), previous: nil)?.map
+    func estimate(cgImage: CGImage, orientation: CGImagePropertyOrientation = .right) -> FloatMap? {
+        estimate(image: CIImage(cgImage: cgImage), previous: nil, orientation: orientation)?.map
     }
 
-    private func estimate(image source: CIImage, previous: DepthRange?) -> (map: FloatMap, range: DepthRange)? {
+    private func estimate(image source: CIImage, previous: DepthRange?,
+                          orientation: CGImagePropertyOrientation = .right) -> (map: FloatMap, range: DepthRange)? {
         lock.lock()
         defer { lock.unlock() }
 
-        guard var output = predict(source) else { return nil }
+        guard let prediction = predict(source, orientation: orientation) else { return nil }
+        var output = prediction.output
         if !Self.outputIsInverseDepth {
             output.values = output.values.map { $0 > 1e-6 ? 1 / $0 : 0 }
         }
@@ -124,57 +128,66 @@ final class MonocularDepthEstimator: @unchecked Sendable {   // all mutable stat
         }
         let span = max(high - low, 1e-6)
 
-        // Back to sensor orientation (the model saw the upright image when output is portrait).
-        let sensorLandscape = source.extent.width >= source.extent.height
-        let outputLandscape = output.width >= output.height
-        let upright = sensorLandscape != outputLandscape
-        let outWidth = upright ? output.height : output.width
-        let outHeight = upright ? output.width : output.height
-
-        var values = [Float](repeating: 0.02, count: outWidth * outHeight)
-        for y in 0..<outHeight {
-            for x in 0..<outWidth {
-                // sensor (x, y) → upright (col = W_up − 1 − y, row = x)   [EXIF .right]
-                let src = upright ? (x * output.width + (output.width - 1 - y)) : (y * output.width + x)
-                let v = output.values[src]
-                values[y * outWidth + x] = v.isFinite ? min(max((v - low) / span, 0), 1.5) + 0.02 : 0.02
-            }
+        let values = output.values.map { v in
+            v.isFinite ? min(max((v - low) / span, 0), 1.5) + 0.02 : 0.02
         }
-        return (FloatMap(width: outWidth, height: outHeight, values: values), DepthRange(low: low, high: high))
+        // Invert the actual input rotation, including a fallback to a landscape model size.
+        let map = CameraImageOrientation.sensorMap(values, width: output.width, height: output.height,
+                                                   orientation: prediction.orientation)
+        return (map, DepthRange(low: low, high: high))
     }
 
     // MARK: Inference
 
-    private func predict(_ pixelBuffer: CIImage) -> Output? {
-        if let result = runModel(pixelBuffer, size: inputSize) { return result }
+    private func predict(_ pixelBuffer: CIImage, orientation: CGImagePropertyOrientation) -> Prediction? {
+        if let result = runModel(pixelBuffer, size: inputSize, orientation: orientation) { return result }
         // The preferred (portrait) size was rejected at runtime: fall back to the model's default.
         if inputSize != defaultSize {
             print("[Depth] \(inputSize) rejected, falling back to \(defaultSize)")
             inputSize = defaultSize
             inputBuffer = nil
-            return runModel(pixelBuffer, size: inputSize)
+            return runModel(pixelBuffer, size: inputSize, orientation: orientation)
         }
         return nil
     }
 
-    private func runModel(_ pixelBuffer: CIImage, size: (width: Int, height: Int)) -> Output? {
-        guard let input = makeInput(from: pixelBuffer, size: size) else { return nil }
+    private func runModel(_ pixelBuffer: CIImage, size: (width: Int, height: Int),
+                          orientation: CGImagePropertyOrientation) -> Prediction? {
+        let inputOrientation = Self.inputOrientation(for: orientation,
+                                                     sourceLandscape: pixelBuffer.extent.width >= pixelBuffer.extent.height,
+                                                     inputLandscape: size.width >= size.height)
+        guard let input = makeInput(from: pixelBuffer, size: size, orientation: inputOrientation) else { return nil }
         do {
             let features = try MLDictionaryFeatureProvider(dictionary: [inputName: MLFeatureValue(pixelBuffer: input)])
             let result = try model.prediction(from: features)
             guard let value = result.featureValue(for: outputName) else { return nil }
-            if let image = value.imageBufferValue { return Self.read(pixelBuffer: image) }
-            if let array = value.multiArrayValue { return Self.read(multiArray: array) }
-            return nil
+            let output: Output?
+            if let image = value.imageBufferValue {
+                output = Self.read(pixelBuffer: image)
+            } else if let array = value.multiArrayValue {
+                output = Self.read(multiArray: array)
+            } else {
+                output = nil
+            }
+            return output.map { Prediction(output: $0, orientation: inputOrientation) }
         } catch {
             print("[Depth] prediction failed: \(error)")
             return nil
         }
     }
 
-    /// Camera buffer (sensor orientation) → model input: rotated upright if the input is portrait,
-    /// stretched to the exact input size (aspect ratios already match: 3:4 vs 392:518).
-    private func makeInput(from source: CIImage, size: (width: Int, height: Int)) -> CVPixelBuffer? {
+    /// Preserve the original landscape-model fallback: upright portrait turned left is its basis.
+    static func inputOrientation(for orientation: CGImagePropertyOrientation,
+                                 sourceLandscape: Bool, inputLandscape: Bool) -> CGImagePropertyOrientation {
+        var turns = CameraImageOrientation.quarterTurns(for: orientation)
+        let uprightLandscape = turns % 2 == 0 ? sourceLandscape : !sourceLandscape
+        if uprightLandscape != inputLandscape { turns = (turns + 3) % 4 }
+        return [CGImagePropertyOrientation.up, .right, .down, .left][turns]
+    }
+
+    /// Camera buffer → model input, using the exact rotation also recorded for the output map.
+    private func makeInput(from source: CIImage, size: (width: Int, height: Int),
+                           orientation: CGImagePropertyOrientation) -> CVPixelBuffer? {
         if inputBuffer == nil || CVPixelBufferGetWidth(inputBuffer!) != size.width || CVPixelBufferGetHeight(inputBuffer!) != size.height {
             var buffer: CVPixelBuffer?
             let attributes: [String: Any] = [kCVPixelBufferIOSurfacePropertiesKey as String: [String: Any]()]
@@ -183,12 +196,7 @@ final class MonocularDepthEstimator: @unchecked Sendable {   // all mutable stat
         }
         guard let inputBuffer else { return nil }
 
-        var image = source
-        let sensorLandscape = image.extent.width >= image.extent.height
-        let inputLandscape = size.width >= size.height
-        if sensorLandscape != inputLandscape {
-            image = image.oriented(.right)
-        }
+        var image = source.oriented(orientation)
         image = image.transformed(by: CGAffineTransform(translationX: -image.extent.minX, y: -image.extent.minY))
         image = image.transformed(by: CGAffineTransform(scaleX: CGFloat(size.width) / image.extent.width,
                                                         y: CGFloat(size.height) / image.extent.height))
@@ -197,6 +205,11 @@ final class MonocularDepthEstimator: @unchecked Sendable {   // all mutable stat
     }
 
     // MARK: Reading model output
+
+    private struct Prediction {
+        let output: Output
+        let orientation: CGImagePropertyOrientation
+    }
 
     private struct Output {
         var values: [Float]

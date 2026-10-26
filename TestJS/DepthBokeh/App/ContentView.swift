@@ -36,7 +36,7 @@ struct ContentView: View {
                 .animation(.easeInOut(duration: 0.2), value: camera.isTooClose)
 
             ContinuousZoomControl(zoomFactor: camera.zoomFactor, range: camera.zoomRange, stops: camera.zoomStops,
-                                  isEnabled: !camera.isCapturing,
+                                  isEnabled: !camera.isCapturing && !camera.isSwitchingCamera && !camera.isFrontCamera,
                                   onZoomChange: { camera.setZoomFactor($0) },
                                   onZoomCommit: { camera.commitZoom() })
             .padding(.horizontal, 16)
@@ -52,16 +52,37 @@ struct ContentView: View {
                     .padding(.horizontal, 32)
             }
 
-            Button {
-                camera.capturePhoto()
-            } label: {
-                Circle()
-                    .strokeBorder(.white, lineWidth: 4)
-                    .background(Circle().fill(.white).padding(7))
-                    .frame(width: 72, height: 72)
-                    .opacity(camera.isCapturing || camera.isZoomSettling ? 0.4 : 1)
+            HStack(spacing: 28) {
+                // 与右侧按钮等宽，让快门保持居中。
+                Color.clear.frame(width: 48, height: 48)
+                    .accessibilityHidden(true)
+
+                Button {
+                    camera.capturePhoto()
+                } label: {
+                    Circle()
+                        .strokeBorder(.white, lineWidth: 4)
+                        .background(Circle().fill(.white).padding(7))
+                        .frame(width: 72, height: 72)
+                        .opacity(camera.isCapturing || camera.isZoomSettling ? 0.4 : 1)
+                }
+                .disabled(camera.isCapturing || camera.isZoomSettling)
+                .accessibilityLabel("拍摄")
+
+                Button {
+                    focusMarker = nil
+                    camera.switchCamera()
+                } label: {
+                    Image(systemName: "arrow.triangle.2.circlepath.camera")
+                        .font(.system(size: 22, weight: .medium))
+                        .foregroundStyle(.white)
+                        .frame(width: 48, height: 48)
+                        .background(.white.opacity(0.15), in: Circle())
+                        .opacity(canSwitchCamera ? 1 : 0.4)
+                }
+                .disabled(!canSwitchCamera)
+                .accessibilityLabel(camera.isFrontCamera ? "切换到后置摄像头" : "切换到前置摄像头")
             }
-            .disabled(camera.isCapturing || camera.isZoomSettling)
             .padding(.bottom, 8)
         }
         .padding(.top, 8)
@@ -82,6 +103,10 @@ struct ContentView: View {
         .fullScreenCover(item: $editingPhoto, onDismiss: { camera.setPreviewPaused(false) }) { photo in
             PhotoEditorView(photo: photo)
         }
+    }
+
+    private var canSwitchCamera: Bool {
+        camera.canSwitchCameras && !camera.isCapturing && !camera.isZoomSettling && !camera.isSwitchingCamera
     }
 
     /// 预览：GPU 渲染好的帧直接画在 Metal 视图上（MetalPreviewView）。每一帧按它渲染时的倍率出图，

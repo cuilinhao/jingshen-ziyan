@@ -351,6 +351,33 @@ final class MetalParityTests: XCTestCase {
         check(box, 0.5, 0, 0, 0.5)
     }
 
+    /// 前置预览和点按对焦必须使用同一套旋转、镜像与裁切；覆盖横装和竖装传感器。
+    func testFrontCameraDisplayTransform() {
+        let cases: [(rotation: Int, width: Int, height: Int, x: Double, y: Double)] = [
+            (0, 1080, 1440, 1, 0),
+            (90, 1440, 1080, 0, 0),
+            (180, 1080, 1440, 0, 1),
+            (270, 1440, 1080, 1, 1)
+        ]
+        for c in cases {
+            let t = DisplayTransform.portrait(frameWidth: c.width, frameHeight: c.height,
+                                              viewWidth: 300, viewHeight: 400, zoom: 1,
+                                              rotation: c.rotation, mirrored: true)
+            let corner = t.framePoint(u: 0, v: 0)
+            XCTAssertEqual(corner.x, c.x, accuracy: 1e-5, "rotation = \(c.rotation)")
+            XCTAssertEqual(corner.y, c.y, accuracy: 1e-5, "rotation = \(c.rotation)")
+            let center = t.framePoint(u: 0.5, v: 0.5)
+            XCTAssertEqual(center.x, 0.5, accuracy: 1e-5)
+            XCTAssertEqual(center.y, 0.5, accuracy: 1e-5)
+        }
+        let zoomed = DisplayTransform.portrait(frameWidth: 1440, frameHeight: 1080,
+                                               viewWidth: 300, viewHeight: 400, zoom: 2,
+                                               rotation: 270, mirrored: true)
+        let point = zoomed.framePoint(u: 0, v: 0)
+        XCTAssertEqual(point.x, 0.75, accuracy: 1e-5)
+        XCTAssertEqual(point.y, 0.75, accuracy: 1e-5)
+    }
+
     /// 性能（只在真 GPU 上有意义）：相机大小的帧 1920×1440 → 输出 1440×1080，连续 30 帧
     func testPerformance() throws {
         let r = try makeRenderer()
