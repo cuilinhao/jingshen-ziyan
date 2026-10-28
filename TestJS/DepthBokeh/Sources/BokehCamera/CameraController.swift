@@ -30,10 +30,10 @@ public struct CapturedDepthPhoto: Identifiable {
 
 /// 实时景深相机。
 ///
-/// 变焦和 DepthBokehCamera 2 一样（0.5×–4×，点数字或拖刻度）：
+/// 变焦和 DepthBokehCamera 2 一样（13–100mm，点数字或拖刻度）：
 ///  - 拖动时只裁切当前相机的画面（往大拖不换相机，往小拖超过当前相机 5% 才马上换）
 ///  - 松手或点数字约 0.3 秒后，换到这个倍率最合适的相机（LensCatalog）：
-///      0.5×–0.99× 超广角 + AI 深度，1×–1.99× LiDAR，2×–3.99× 双摄 2×，4× 双摄长焦
+///      0.5×–0.99× 超广角 + AI 深度，1×–1.99× LiDAR，2×–4.16× 双摄 2×，100mm 双摄长焦
 ///  - 两个深度倍率点之间，画面和深度图都从中间裁（相机本身的倍率一旦打开就不再改）
 ///  - 换相机期间保留最后一帧（继续跟着倍率放大），新相机出了 3 帧并且有深度（最多 0.8 秒）后，
 ///    0.2 秒淡入
@@ -66,9 +66,9 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
     // MARK: - 变焦（界面和交互复用 DepthBokehCamera 2 的 ContinuousZoomControl / ZoomScale）
     /// 刻度盘上的倍率（1× = 主摄 24mm）
     @Published public private(set) var zoomFactor: CGFloat = 1
-    /// 可调范围（iPhone 17 Pro Max：0.5×–4×）
+    /// 可调范围（iPhone 17 Pro Max：0.5×–4.17×，即 13–100mm）
     @Published public private(set) var zoomRange: ClosedRange<CGFloat> = 1...1
-    /// 快捷焦段（0.5×、1×、2×、4×）
+    /// 快捷焦段（13、24、48、100mm）
     @Published public private(set) var zoomStops: [ZoomStop] = []
     /// 换相机还没出第一帧：快门暂时不可用（刻度盘照常可以拖）
     @Published public private(set) var isZoomSettling = true
@@ -462,8 +462,8 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
         }
     }
 
-    /// 拖动时最多把当前相机的画面裁到几倍。刻度最大 4×，所以从 1×（LiDAR）往大拖，松手前不会换相机
-    private static let maxDragCrop: CGFloat = 4
+    /// 拖动时最多把当前相机的画面裁到几倍。刻度最大 100mm（约 4.17×），所以从 1×（LiDAR）往大拖，松手前不会换相机
+    private static let maxDragCrop: CGFloat = LensCatalog.maxDialZoom
 
     /// 拖动时也可以比当前相机广 5%（画面停在相机的视场）：在 2× 这种数字下面一点徘徊时，
     /// 不会先换到 1× 的相机、松手吸附到 2× 又换回来

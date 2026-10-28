@@ -4,7 +4,7 @@ import QuartzCore
 import BokehCamera
 
 /// 取景界面：实时虚化预览 + 焦段调节 + 景深（ƒ）滑块 + 点按对焦 + 快门
-/// 焦段调节的界面和交互直接复用 DepthBokehCamera 2 的 ContinuousZoomControl（0.5×–4×）：
+/// 焦段调节的界面和交互直接复用 DepthBokehCamera 2 的 ContinuousZoomControl（13–100mm）：
 /// 点数字跳到对应焦段，左右拖动或长按展开刻度，松手 ±5% 内吸附到数字，约 1 秒收起
 struct ContentView: View {
     @StateObject private var camera = DepthCameraController()

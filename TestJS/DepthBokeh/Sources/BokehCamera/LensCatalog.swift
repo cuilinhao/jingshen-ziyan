@@ -4,10 +4,10 @@
 //   倍率            实际用的相机                     画面裁切        深度来源
 //   0.5×–0.99×     超广角 0.5×                      1–1.98×        AI 单目深度（Depth Anything V2）
 //   1×–1.99×       LiDAR 1×                         1–1.99×        LiDAR
-//   2×–3.99×       双摄广角 2×（主摄原生 2× 裁切）    1–1.99×        双摄视差
-//   4×             双摄长焦                          无             双摄视差
+//   2×–4.16×       双摄广角 2×（主摄原生 2× 裁切）    1–2.08×        双摄视差
+//   4.17×（100mm） 双摄长焦                          无             双摄视差
 //
-// 实时深度只在几个倍率点上有（iPhone 17 Pro Max：1×、2×、4×）。两个点之间相机停在低的那个点，
+// 实时深度只在几个倍率点上有（iPhone 17 Pro Max：1×、2×、100mm 长焦）。两个点之间相机停在低的那个点，
 // App 自己从中间裁切画面和深度图补足剩下的倍率 —— 开着深度时相机的非原生倍率本来就是数码放大，
 // 画质一样，但深度一直有。
 //
@@ -117,6 +117,10 @@ enum LensCatalog {
                let s = dual.virtualDeviceSwitchOverVideoZoomFactors.last, s.doubleValue > 0 {
                 magnification = s.doubleValue
             }
+            // 切换倍率是取整的（17 Pro Max 报 4，长焦实际是 100mm）：有标称焦距时按真实焦距定位
+            if let nominal = nominalMagnification(of: tele, relativeTo: wide) {
+                magnification = nominal
+            }
             lenses.append(LensOption(kind: .telephoto, label: formatZoom(magnification, fallback: "长焦"),
                                      nativeZoom: CGFloat(magnification ?? 2)))
         }
@@ -130,6 +134,16 @@ enum LensCatalog {
         let fov = Double(device.activeFormat.videoFieldOfView) * .pi / 180
         guard fovWide > 0.01, fov > 0.01 else { return nil }
         return tan(fovWide / 2) / tan(fov / 2)
+    }
+
+    /// Ratio of the nominal 35mm-equivalent focal lengths (physical cameras, iOS 26+).
+    private static func nominalMagnification(of device: AVCaptureDevice, relativeTo wide: AVCaptureDevice?) -> Double? {
+        guard #available(iOS 26.0, *) else { return nil }
+        guard let wide else { return nil }
+        let focal = Double(device.nominalFocalLengthIn35mmFilm)
+        let wideFocal = Double(wide.nominalFocalLengthIn35mmFilm)
+        guard focal > 0, wideFocal > 0 else { return nil }
+        return focal / wideFocal
     }
 
     /// 0.5 → "0.5×", 2.5 → "2.5×", 4.9… → "5×".
@@ -155,7 +169,7 @@ enum LensCatalog {
     /// Back-camera routes for a dial zoom, best first; the session tries them in order until one opens.
     ///   1. a depth route that delivers depth at exactly this zoom (camera zoom = dial, no crop);
     ///   2. the nearest depth anchor below: the camera stays there, the preview crops the rest
-    ///      (17 Pro Max: 1×–1.99× on LiDAR 1×, 2×–3.99× on dual-wide 2×, 4× on the dual telephoto);
+    ///      (17 Pro Max: 1×–1.99× on LiDAR 1×, 2×–4.16× on dual-wide 2×, 100mm on the dual telephoto);
     ///   3. the plain camera of this zoom's segment at its native view, cropped (AI depth). Below the
     ///      first anchor (0.5×–0.99×) only this one exists.
     static func settledPlans(displayZoom zoom: CGFloat) -> [CameraPlan] {
@@ -175,15 +189,13 @@ enum LensCatalog {
     }
 
     /// Dial zoom factors where some back camera streams hardware depth, from the depth formats'
-    /// reported zoom points (17 Pro Max: 1, 2, 4).
+    /// reported zoom points (17 Pro Max: 1, 2, 4.17).
     private static let depthAnchors: [CGFloat] = {
         let dial = zoomRange(for: availableLenses())
         var points = Set<CGFloat>()
         for type in [AVCaptureDevice.DeviceType.builtInLiDARDepthCamera, .builtInDualWideCamera, .builtInDualCamera] {
             guard let device = device(type, position: .back), let profile = formatProfiles[device.uniqueID] else { continue }
-            let wideZoom = device.constituentDevices.contains { $0.deviceType == .builtInUltraWideCamera }
-                ? (firstSwitchOver(device) ?? 1) : 1
-            for point in profile.depth.boundaries { points.insert(point / wideZoom) }
+            for point in profile.depth.boundaries { points.insert(dialZoom(forDeviceZoom: point, of: device)) }
         }
         return points.filter { dial.contains($0) }.sorted().filter { zoom in
             guard let lens = segment(for: zoom) else { return false }
@@ -192,7 +204,19 @@ enum LensCatalog {
         }
     }()
 
-    /// The back lens whose segment of the dial contains `zoom` (0.5×–0.99× ultra-wide, 1×–3.99× wide …).
+    /// A virtual camera's zoom factor on the dial. From the telephoto switch-over on, the stream is the
+    /// telephoto's own view (17 Pro Max: camera zoom 4 = 100mm = dial 4.17×), not the rounded factor.
+    private static func dialZoom(forDeviceZoom zoom: CGFloat, of device: AVCaptureDevice) -> CGFloat {
+        let constituents = device.constituentDevices.map(\.deviceType)
+        let wideZoom = constituents.contains(.builtInUltraWideCamera) ? (firstSwitchOver(device) ?? 1) : 1
+        let dial = zoom / wideZoom
+        guard constituents.contains(.builtInTelephotoCamera), let switchOver = lastSwitchOver(device),
+              let tele = lensOptions.first(where: { $0.kind == .telephoto }) else { return dial }
+        let teleStart = switchOver / wideZoom
+        return dial >= teleStart - 0.0001 ? dial / teleStart * tele.nativeZoom : dial
+    }
+
+    /// The back lens whose segment of the dial contains `zoom` (0.5×–0.99× ultra-wide, 1×–4.16× wide …).
     private static func segment(for zoom: CGFloat) -> LensOption? {
         let back = availableLenses().sorted { $0.nativeZoom < $1.nativeZoom }
         return ZoomScale.nativeIndex(for: zoom, nativeFactors: back.map(\.nativeZoom)).map { back[$0] }
@@ -212,7 +236,10 @@ enum LensCatalog {
                      depthPlan(.builtInDualWideCamera, .back, .dualCamera) { device in
                          firstSwitchOver(device).map { $0 * relativeZoom }
                      },
-                     depthPlan(.builtInDualCamera, .back, .dualCamera) { _ in relativeZoom },
+                     // From the switch-over on this camera streams the telephoto, whose view is not `relativeZoom`.
+                     depthPlan(.builtInDualCamera, .back, .dualCamera) { device in
+                         relativeZoom < (lastSwitchOver(device) ?? .infinity) - 0.0001 ? relativeZoom : nil
+                     },
                      plainPlan(.builtInWideAngleCamera, .back, .monocular, zoom: relativeZoom)]
         case .ultraWide:
             plans = [depthPlan(.builtInDualWideCamera, .back, .dualCamera) { _ in relativeZoom },
@@ -227,7 +254,11 @@ enum LensCatalog {
         return plans.compactMap { $0.map { var plan = $0; plan.streamZoom = streamZoom; return plan } }
     }
 
-    /// Limit the dial to 4× (96mm equivalent), intersected with real format limits.
+    /// Longest focal length on the dial (35mm equivalent; 1× = 24mm). 17 Pro Max: its 100mm telephoto.
+    static let maxFocalLength: CGFloat = 100
+    static let maxDialZoom: CGFloat = maxFocalLength / 24
+
+    /// Limit the dial to `maxFocalLength`, intersected with real format limits.
     static func zoomRange(for lenses: [LensOption]) -> ClosedRange<CGFloat> {
         let back = lenses.sorted { $0.nativeZoom < $1.nativeZoom }
         guard let first = back.first else { return 1...1 }
@@ -244,7 +275,9 @@ enum LensCatalog {
                 maximum = lens.nativeZoom * choice.format.videoMaxZoomFactor
             }
         }
-        return first.nativeZoom...max(first.nativeZoom, min(4, maximum))
+        // A lens sitting at the limit is the limit, so rounding in its magnification cannot drop its stop.
+        let cap = back.map(\.nativeZoom).first { abs($0 / maxDialZoom - 1) < 0.01 } ?? maxDialZoom
+        return first.nativeZoom...max(first.nativeZoom, min(cap, maximum))
     }
 
     private static func firstSwitchOver(_ device: AVCaptureDevice) -> CGFloat? {

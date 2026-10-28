@@ -1,4 +1,4 @@
-// 从 DepthBokehCamera 2 迁移（最新版：松手 ±5% 吸附到 0.5× / 1× / 2× / 4×，松手或点按后通知相机换到最合适的镜头）。
+// 从 DepthBokehCamera 2 迁移（最新版：松手 ±5% 吸附到各焦段数字，松手或点按后通知相机换到最合适的镜头）。
 // 只加了 public 和 init，指针图片改从本包的资源里取
 #if os(iOS)
 import SwiftUI
@@ -226,14 +226,17 @@ public struct ContinuousZoomControl: View {
         let count = max(0, min(400, Int(floor((range.upperBound - first) / step + 0.0001))))
         var ticks = (0...count).map { first + CGFloat($0) * step }
             .filter { range.contains($0) }
-        if range.contains(0.5), !ticks.contains(where: { abs($0 - 0.5) < 0.0001 }) {
-            ticks.append(0.5)
+        // Stops off the grid (0.5×, the 100mm telephoto at 4.17×) still get their own tick.
+        for factor in [0.5] + stops.map(\.factor)
+        where range.contains(factor) && !ticks.contains(where: { abs($0 - factor) < 0.0001 }) {
+            ticks.append(factor)
         }
         return ticks
     }
 
     private func isMajorTick(_ factor: CGFloat) -> Bool {
-        abs(factor - 0.5) < 0.0001 || (factor >= 1 && abs(factor.rounded() - factor) < 0.0001)
+        abs(factor - 0.5) < 0.0001 || stops.contains { abs($0.factor - factor) < 0.0001 }
+            || (factor >= 1 && abs(factor.rounded() - factor) < 0.0001)
     }
 
     private func applyProgress(_ value: CGFloat) {
@@ -252,7 +255,7 @@ public struct ContinuousZoomControl: View {
         onZoomChange(displayedFactor)
     }
 
-    /// Releasing the dial within ±5% of a stop lands exactly on it. The stops (1×, 2×, 4×) are where
+    /// Releasing the dial within ±5% of a stop lands exactly on it. The stops (1×, 2×, 100mm) are where
     /// the camera itself delivers depth, uncropped — 1× is the LiDAR route.
     private func snapToStop() -> Bool {
         let factor = displayedFactor
@@ -300,12 +303,12 @@ public struct ContinuousZoomControl: View {
 #Preview {
     ContinuousZoomControl(
         zoomFactor: 3,
-        range: 0.5...4,
+        range: 0.5...(100.0 / 24),
         stops: [
             ZoomStop(factor: 0.5, focalLength: 13),
             ZoomStop(factor: 1, focalLength: 24),
             ZoomStop(factor: 2, focalLength: 48),
-            ZoomStop(factor: 4, focalLength: 96)
+            ZoomStop(factor: 100.0 / 24, focalLength: 100)
         ],
         onZoomChange: { _ in }
     )
