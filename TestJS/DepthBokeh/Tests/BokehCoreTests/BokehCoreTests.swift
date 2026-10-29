@@ -560,4 +560,83 @@ final class BokehCoreTests: XCTestCase {
         XCTAssertLessThan(still.seeds?.person?[62, 30] ?? 1, 0.05)
         XCTAssertGreaterThan(still.seeds?.person?[15, 50] ?? 0, 0.5)
     }
+
+    /// 按焦距换算 = 视差差乘 s 再进模型（全清晰区除以 s、斜率乘 s）；1× 和更广不变
+    func testFocalLengthScaling() {
+        let base = LensParameters(fNumber: 1.4, focusDisparity: 0.5)
+        var tele = base
+        tele.scaleForFocalLength(100)
+        let s = powf(100 / LensParameters.referenceFocalLength, LensParameters.focalScalingExponent)
+        let L = 1440
+        for dd: Float in [-0.3, -0.1, -0.02, 0.05, 0.1, 0.3] {
+            let a = tele.signedBlurRadius(disparity: 0.5 + dd, imageLongSide: L)
+            let b = base.signedBlurRadius(disparity: 0.5 + dd * s, imageLongSide: L)
+            XCTAssertEqual(a, b, accuracy: 1e-3, "Δd = \(dd)")
+        }
+        var wide = base
+        wide.scaleForFocalLength(24)
+        XCTAssertEqual(wide, base)
+        wide.scaleForFocalLength(13)
+        XCTAssertEqual(wide, base)
+    }
+
+    /// 用户录屏的场景（4× / 100mm，双摄相对视差 = 真实视差 + 0.3）：对焦远处 3.75 m 的 A，
+    /// 近处 2.3 m 背对镜头坐着的 B 和他 2.1 m 的椅背要明显虚化（系统相机是这样）；以前视差差 0.17～0.21
+    /// 落在前面 0.25 的全清晰区里，虚化半径是 0。人像遮罩里 A、B 连成一片时，B 也不能跟着 A 保持清晰
+    func testTelephotoBlursPersonInFront() {
+        let w = 160, h = 120, off: Float = 0.3
+        var d = [Float](repeating: 1 / 8 + off, count: w * h)          // 背景 8 m
+        var m = [Float](repeating: 0, count: w * h)
+        var labels = [Float](repeating: 0, count: w * h)
+        func fill(_ x0: Float, _ x1: Float, _ y0: Float, _ y1: Float, _ body: (Int) -> Void) {
+            for y in Int(y0 * Float(h))..<Int(y1 * Float(h)) {
+                for x in Int(x0 * Float(w))..<Int(x1 * Float(w)) { body(y * w + x) }
+            }
+        }
+        fill(0, 0.45, 0.55, 1) { d[$0] = 1 / 3.3 + off }                                       // A 前面的隔板
+        fill(0.15, 0.40, 0.25, 0.60) { d[$0] = 1 / 3.75 + off; m[$0] = 1; labels[$0] = 1 }    // A（对焦）
+        fill(0.40, 0.80, 0.30, 1) { d[$0] = 1 / 2.3 + off; m[$0] = 1; labels[$0] = 2 }        // B，和 A 挨着
+        fill(0.45, 0.75, 0.55, 1) { d[$0] = 1 / 2.1 + off; m[$0] = 0; labels[$0] = 0 }        // 椅背
+        let disparity = FloatMap(width: w, height: h, values: d)
+        let mask = FloatMap(width: w, height: h, values: m)
+        let people = FloatMap(width: w, height: h, values: labels)
+        let analyzer = LiveFrameAnalyzer()
+        func plan(focus: (Float, Float), fl: Float?) -> FramePlan {
+            analyzer.resetHistory()
+            var p: FramePlan!
+            for t in 0..<10 {
+                p = analyzer.analyze(LiveFrameAnalyzer.Frame(
+                    disparity: disparity, relativeDepth: true, crop: 1, fNumber: 1.4, focusPoint: focus,
+                    focusTapped: t == 0, time: Double(t) / 30, colors: nil, personMask: mask, outputLongSide: 1440,
+                    personInstances: people, focalLength35mm: fl))
+            }
+            return p
+        }
+        let L = 1440
+        func pct(_ p: FramePlan, _ meters: Float) -> Float {
+            p.lens.signedBlurRadius(disparity: 1 / meters + off, imageLongSide: L) / Float(L) * 100
+        }
+        // 1×：维持原来的标定（近处的人在全清晰区里）
+        XCTAssertEqual(pct(plan(focus: (0.25, 0.4), fl: 24), 2.3), 0)
+        // 4×：对焦 A，前面的 B、椅背、后面的背景都明显虚化
+        let tele = plan(focus: (0.25, 0.4), fl: 100)
+        XCTAssertGreaterThan(pct(tele, 2.3), 0.5, "B")
+        XCTAssertGreaterThan(pct(tele, 2.1), 0.6, "椅背")
+        XCTAssertLessThan(pct(tele, 8), -0.5, "背景")
+        XCTAssertEqual(pct(tele, 3.75), 0, "对焦面")
+        XCTAssertGreaterThan(tele.seeds?.person?[40, 48] ?? 0, 0.5, "对焦的 A")
+        XCTAssertLessThan(tele.seeds?.person?[96, 48] ?? 1, 0.05, "B 不跟着 A 保持清晰")
+        // 4×：对焦 B，后面的 A 也明显虚化
+        let back = plan(focus: (0.6, 0.4), fl: 100)
+        XCTAssertLessThan(pct(back, 3.75), -0.5, "A")
+        // B 的深度只差一点、band 判断留下了它时，按镜头算会糊也要去掉
+        var parts = LiveFrameAnalyzer.instanceMasks(people, crop: 1, width: w, height: h)
+        parts.removeAll { $0.label == 1 }
+        var wideBand = SubjectMatteParameters()
+        wideBand.band = 0.6
+        XCTAssertNil(LiveFrameAnalyzer.otherPeople(parts, focusLabel: 1, depth: disparity, focusDisparity: 1 / 3.75 + off,
+                                                   norm: 1 / 3.75 + off, matte: wideBand))
+        XCTAssertNotNil(LiveFrameAnalyzer.otherPeople(parts, focusLabel: 1, depth: disparity, focusDisparity: 1 / 3.75 + off,
+                                                      norm: 1 / 3.75 + off, matte: wideBand, lens: tele.lens))
+    }
 }

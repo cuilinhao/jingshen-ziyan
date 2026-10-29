@@ -40,6 +40,9 @@ public struct SubjectMatteParameters: Equatable {
     /// 深度在 ±band 以内的像素至少占这么多，才和对焦的人一起保持清晰（站在旁边、和对焦的人差不多远的人）；
     /// 不到的（对焦的人后面站着的同事）照常按深度虚化。人像遮罩本身分不出是谁，画面上挨着的人会连成一片
     public var personDepthAgreement: Float = 0.5
+    /// 同上，不是对焦的那个人：按镜头算，虚化半径超过长边的这个比例（0.3%，1440 时约 4 像素）的像素占多数时，
+    /// 不管深度在不在 ±band 里都照常虚化。相对视差（双摄 / AI）对焦在远处时 band 很宽，近处的人只靠 band 去不掉
+    public var personMaxBlur: Float = 0.003
 
     public init() {}
 }

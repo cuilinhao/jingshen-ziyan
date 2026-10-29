@@ -111,6 +111,9 @@ public final class LiveFrameAnalyzer {
         public var personInstanceColors: PlanarImage?
         /// 人像实例标签图的版本号（每次重新分割加 1）：版本、裁切都没变时直接用上次拆好的遮罩。0 = 每帧重新拆
         public var personInstanceRevision: Int
+        /// 渲染出来的画面的 35mm 等效焦距（毫米，已含数码裁切；1× = 24mm）。`.system` 模型按它放大虚化
+        /// （LensParameters.scaleForFocalLength）；nil = 按 1× 的标定
+        public var focalLength35mm: Float?
 
         public init(disparity: FloatMap, relativeDepth: Bool, crop: Float, fNumber: Float,
                     focusPoint: (x: Float, y: Float), focusTapped: Bool, time: Double,
@@ -118,7 +121,8 @@ public final class LiveFrameAnalyzer {
                     personMaskColors: PlanarImage? = nil, depthAge: Int = 0,
                     objectLabels: FloatMap? = nil, objectColors: PlanarImage? = nil, objectRevision: Int = 0,
                     personInstances: FloatMap? = nil, personInstanceColors: PlanarImage? = nil,
-                    personInstanceRevision: Int = 0) {
+                    personInstanceRevision: Int = 0, focalLength35mm: Float? = nil) {
+            self.focalLength35mm = focalLength35mm
             self.personInstances = personInstances
             self.personInstanceColors = personInstanceColors
             self.personInstanceRevision = personInstanceRevision
@@ -228,6 +232,8 @@ public final class LiveFrameAnalyzer {
         var lens = LensParameters(fNumber: frame.fNumber, focusDisparity: focusD, model: settings.lensModel,
                                   focalLength35mm: settings.virtualFocalLength, focusTolerance: settings.focusTolerance,
                                   relativeScale: relativeScale)
+        // 长焦：同样的视差差虚化更大、全清晰区更窄（标定是 1× 的）
+        if let f = frame.focalLength35mm { lens.scaleForFocalLength(f) }
         lens.blurK *= effectAmount
         lens.maxBlurFraction *= effectAmount
 
@@ -299,7 +305,7 @@ public final class LiveFrameAnalyzer {
                 }
                 if var others = Self.otherPeople(parts, focusLabel: SubjectMatte.instanceLabel(labels, point: p),
                                                  depth: map, focusDisparity: focusD,
-                                                 norm: max(relativeScale ?? focusD, 1e-3), matte: matte) {
+                                                 norm: max(relativeScale ?? focusD, 1e-3), matte: matte, lens: lens) {
                     // 实例也是几帧之前算的：和遮罩一样按整体平移挪到这一帧
                     if let then, let colors {
                         others = Self.alignMask(others, maskColors: then, colors: colors,
@@ -358,22 +364,40 @@ public final class LiveFrameAnalyzer {
         }
     }
 
-    /// 不该和对焦的人一起保持清晰的人：不是对焦点所在的那个人，深度在对焦面 ±band 以内的又不到 personDepthAgreement
-    /// （对焦的人后面站着的同事）。站在旁边、和对焦的人差不多远的人照样保持清晰（系统相机也是这样）。
+    /// 不该和对焦的人一起保持清晰的人：不是对焦点所在的那个人，并且
+    ///  - 深度在对焦面 ±band 以内的不到 personDepthAgreement（对焦的人后面站着的同事），或者
+    ///  - 按镜头算会明显虚化（lensBlurred）：双摄 / AI 的相对视差带着未知的偏移（+0.2…0.4），对焦在远处时 band 被放得很宽
+    ///    （4× 对焦 3.75 m 的人，2.4–8 m 都算「差不多远」），近处的人光看 band 留不住
+    /// 站在旁边、和对焦的人差不多远的人照样保持清晰（系统相机也是这样）。
     /// 返回这些人合起来的遮罩（和深度图一样大，0…1）；没有返回 nil
     static func otherPeople(_ parts: [(label: Int, mask: FloatMap)], focusLabel: Int?, depth: FloatMap,
-                            focusDisparity df: Float, norm: Float, matte: SubjectMatteParameters) -> FloatMap? {
+                            focusDisparity df: Float, norm: Float, matte: SubjectMatteParameters,
+                            lens: LensParameters? = nil) -> FloatMap? {
         let w = depth.width, h = depth.height, n = w * h
         var out: [Float]?
         for part in parts where part.label != focusLabel && part.mask.width == w && part.mask.height == h {
             let agree = SubjectMatte.depthAgreement(part.mask.values, depth: depth.values, focusDisparity: df,
                                                     norm: norm, band: matte.band)
-            guard agree < matte.personDepthAgreement else { continue }
+            guard agree < matte.personDepthAgreement
+                    || lensBlurred(part.mask.values, depth: depth.values, lens: lens, limit: matte.personMaxBlur,
+                                   share: matte.personDepthAgreement) else { continue }
             var v = out ?? [Float](repeating: 0, count: n)
             for i in 0..<n { v[i] = max(v[i], part.mask.values[i]) }
             out = v
         }
         return out.map { FloatMap(width: w, height: h, values: $0) }
+    }
+
+    /// 遮罩里的像素按镜头算会不会明显虚化：虚化半径不超过长边 limit 的像素不到 share（大部分都会糊）。lens 为 nil 时 false
+    static func lensBlurred(_ mask: [Float], depth: [Float], lens: LensParameters?, limit: Float, share: Float) -> Bool {
+        guard let lens, limit > 0 else { return false }
+        let L = 1000, maxR = limit * Float(L)
+        var n = 0, sharp = 0
+        for i in 0..<min(mask.count, depth.count) where mask[i] > 0.5 {
+            n += 1
+            if depth[i].isFinite && abs(lens.signedBlurRadius(disparity: depth[i], imageLongSide: L)) <= maxR { sharp += 1 }
+        }
+        return n >= 12 && Float(sharp) < share * Float(n)
     }
 
     /// 人像遮罩里去掉 others（任意分辨率，0…1），返回和人像遮罩一样大的
@@ -556,7 +580,7 @@ public final class LiveFrameAnalyzer {
     public static func stillPlan(disparity: FloatMap, relativeDepth: Bool, colors: PlanarImage?, fNumber: Float,
                                  focusPoint: (x: Float, y: Float), personMask: FloatMap?, outputLongSide: Int,
                                  settings: Settings, objectLabels: FloatMap? = nil,
-                                 personInstances: FloatMap? = nil) -> FramePlan {
+                                 personInstances: FloatMap? = nil, focalLength35mm: Float? = nil) -> FramePlan {
         let map = DepthRefiner.fillInvalid(disparity)
         let lowLongSide = max(320, outputLongSide / max(1, settings.blurDownscale))
         let focusD = DepthRefiner.focusDisparity(in: map, nx: focusPoint.x, ny: focusPoint.y)
@@ -564,9 +588,11 @@ public final class LiveFrameAnalyzer {
         if relativeDepth, let range = map.percentiles(0.05, 0.95) {
             relativeScale = max(focusD, 0.25 * (range.high - range.low))
         }
-        let lens = LensParameters(fNumber: fNumber, focusDisparity: focusD, model: settings.lensModel,
+        var lens = LensParameters(fNumber: fNumber, focusDisparity: focusD, model: settings.lensModel,
                                   focalLength35mm: settings.virtualFocalLength, focusTolerance: settings.focusTolerance,
                                   relativeScale: relativeScale)
+        // 拍照时的焦距（同 analyze）
+        if let f = focalLength35mm { lens.scaleForFocalLength(f) }
         var dMin = Float.infinity, dMax = -Float.infinity
         for v in map.values where v.isFinite { dMin = min(dMin, v); dMax = max(dMax, v) }
         if !dMin.isFinite { dMin = focusD; dMax = focusD }
@@ -585,7 +611,7 @@ public final class LiveFrameAnalyzer {
                let others = otherPeople(instanceMasks(labels, crop: 1, width: map.width, height: map.height),
                                         focusLabel: SubjectMatte.instanceLabel(labels, point: focusPoint), depth: map,
                                         focusDisparity: focusD, norm: max(relativeScale ?? focusD, 1e-3),
-                                        matte: matte) {
+                                        matte: matte, lens: lens) {
                 person = removing(others, from: pm)
             }
             if let labels = objectLabels, let inst = SubjectMatte.instanceAt(labels, point: focusPoint) {

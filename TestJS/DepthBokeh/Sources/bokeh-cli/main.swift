@@ -105,7 +105,8 @@ func readPPMBytes(_ path: String) throws -> (bytes: [UInt8], width: Int, height:
 // 每行一个 JSON：{"img": 相机整帧.ppm, "depth": 整帧视差.pfm 或 "", "out": 输出.ppm, "f": 1.4, "crop": 1.0,
 //               "rel": false, "fx": 0.5, "fy": 0.5, "tap": false, "t": 秒, "reset": false, "mask": 人像遮罩.pfm 或 "",
 //               "maskimg": 算遮罩那一帧的画面.ppm 或 "", "age": 深度是几帧之前的, "mindist": 米,
-//               "objects": 物体分割标签图.pfm 或 "", "objimg": 算物体分割那一帧的画面.ppm 或 "", "long": 1440}
+//               "objects": 物体分割标签图.pfm 或 "", "objimg": 算物体分割那一帧的画面.ppm 或 "", "long": 1440,
+//               "fl": 画面的 35mm 等效焦距（毫米，含裁切；4× 长焦是 100），不填 = 按 1× 的标定}
 // 和 App 的 DepthCameraController 走同一个 LivePreviewPipeline。每帧输出一行 JSON（对焦、耗时）
 if args.first == "--live" {
     args.removeFirst()
@@ -162,7 +163,8 @@ if args.first == "--live" {
             focusPoint: (Float(job["fx"] as? Double ?? 0.5), Float(job["fy"] as? Double ?? 0.5)),
             focusTapped: job["tap"] as? Bool ?? false, time: job["t"] as? Double ?? 0, personMask: mask,
             personMaskColors: maskColors, depthAge: job["age"] as? Int ?? 0,
-            objectLabels: objects, objectColors: objectColors, objectRevision: job["objrev"] as? Int ?? 0)
+            objectLabels: objects, objectColors: objectColors, objectRevision: job["objrev"] as? Int ?? 0,
+            focalLength35mm: (job["fl"] as? Double).map { Float($0) })
         let dbg = job["dbg"] as? String ?? ""
         pipeline.renderer.captureDebugMaps = !dbg.isEmpty
         let r = pipeline.process(input)

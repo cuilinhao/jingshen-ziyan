@@ -28,6 +28,8 @@ public struct CapturedDepthPhoto: Identifiable {
     public var objectLabels: FloatMap? = nil
     /// 人像实例的标签图（传感器方向，0 = 不是人，1…N = 各个人）：对焦的人后面挨着的别人不跟着保持清晰
     public var personInstances: FloatMap? = nil
+    /// 拍照时画面的 35mm 等效焦距（毫米，含裁切）：长焦的虚化按它放大，和预览一致
+    public var focalLength35mm: Float? = nil
 }
 
 /// 实时景深相机。
@@ -1131,7 +1133,9 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
                 objectLabels: masks?.objects, objectColors: masks?.objectColors,
                 objectRevision: masks?.objectRevision ?? 0, personInstances: masks?.personInstances,
                 personInstanceColors: masks?.personInstanceColors,
-                personInstanceRevision: masks?.personInstanceRevision ?? 0))
+                personInstanceRevision: masks?.personInstanceRevision ?? 0,
+                // 画面的等效焦距（1× = 24mm，同 ZoomScale.focalLength）：长焦虚化更强、全清晰区更窄
+                focalLength35mm: Float(frameZoom) * 24))
             // 下一帧决定分割跑多勤用：手机在动或画面里有东西在动
             sceneMoving = plan.cameraShift >= 0.5 || plan.cameraMoving || plan.changedFraction >= 0.005
             personMaskStale = plan.personMaskStale
@@ -1303,8 +1307,8 @@ extension DepthCameraController: AVCapturePhotoCaptureDelegate {
             return
         }
         // 和预览一样的裁切（两个深度倍率点之间相机停在低的那个点）
-        let (crop, monoRoute, streamOrientation) = dataQueue.sync {
-            (self.lastFrameCrop, !self.depthExpected, self.frameOrientation)
+        let (crop, monoRoute, streamOrientation, frameZoom) = dataQueue.sync {
+            (self.lastFrameCrop, !self.depthExpected, self.frameOrientation, self.lastPublishedZoom)
         }
         let depth = photo.depthData
         let orientationRaw = (photo.metadata[kCGImagePropertyOrientation as String] as? NSNumber)?.uint32Value ?? 1
@@ -1349,7 +1353,7 @@ extension DepthCameraController: AVCapturePhotoCaptureDelegate {
                                               disparity: disparity ?? FloatMap(width: 64, height: 48, repeating: 1),
                                               orientation: orientation, focusPoint: focus, fNumber: fNumber,
                                               isRelativeDepth: relative, personMask: person, objectLabels: objects,
-                                              personInstances: people)
+                                              personInstances: people, focalLength35mm: Float(frameZoom) * 24)
             DispatchQueue.main.async {
                 self.lastPhoto = captured
                 self.isCapturing = false

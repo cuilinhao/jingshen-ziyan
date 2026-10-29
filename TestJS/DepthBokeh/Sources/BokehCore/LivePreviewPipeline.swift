@@ -58,12 +58,15 @@ public final class LivePreviewPipeline {
         /// 人像实例分割的标签图（整个相机画面，0 = 不是人，1…N = 各个人）：不是对焦的那个人、深度也对不上的，
         /// 从人像遮罩里去掉（对焦的人后面挨着的人照常虚化）
         public var personInstances: FloatMap?
+        /// 画面的 35mm 等效焦距（毫米，已含裁切；1× = 24mm）。nil = 按 1× 的标定（LiveFrameAnalyzer.Frame.focalLength35mm）
+        public var focalLength35mm: Float?
 
         public init(image: PlanarImage, disparity: FloatMap?, relativeDepth: Bool, crop: Float, fNumber: Float,
                     focusPoint: (x: Float, y: Float), focusTapped: Bool, time: Double, personMask: FloatMap? = nil,
                     personMaskColors: PlanarImage? = nil, depthAge: Int = 0,
                     objectLabels: FloatMap? = nil, objectColors: PlanarImage? = nil, objectRevision: Int = 0,
-                    personInstances: FloatMap? = nil) {
+                    personInstances: FloatMap? = nil, focalLength35mm: Float? = nil) {
+            self.focalLength35mm = focalLength35mm
             self.personInstances = personInstances
             self.objectRevision = objectRevision
             self.objectLabels = objectLabels
@@ -154,7 +157,8 @@ public final class LivePreviewPipeline {
             colors: colors, personMask: frame.personMask, outputLongSide: frame.image.longSide,
             personMaskColors: frame.personMaskColors, depthAge: frame.depthAge,
             objectLabels: frame.objectLabels, objectColors: frame.objectColors,
-            objectRevision: frame.objectRevision, personInstances: frame.personInstances))
+            objectRevision: frame.objectRevision, personInstances: frame.personInstances,
+            focalLength35mm: frame.focalLength35mm))
         lastPlan = plan
         lap("分析")
 

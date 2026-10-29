@@ -108,7 +108,8 @@ public final class PhotoBokehEditor: ObservableObject, @unchecked Sendable {
                                                fNumber: fNumber, focusPoint: (Float(focus.x), Float(focus.y)),
                                                personMask: photo.personMask, outputLongSide: img.longSide,
                                                settings: settings, objectLabels: photo.objectLabels,
-                                               personInstances: photo.personInstances)
+                                               personInstances: photo.personInstances,
+                                               focalLength35mm: photo.focalLength35mm)
         if let ui = renderOnGPU(plan) { return (ui, plan.focusDisparity) }
         return (renderOnCPU(plan), plan.focusDisparity)
     }

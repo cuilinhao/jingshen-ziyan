@@ -19,12 +19,24 @@ import Foundation
 ///    原始 blurK = 0.015 时，ƒ1.4、拳头 0.46 m、背景 3 m 的半径约为长边的 1%；
 ///    主体 1.5 m、背景 6 m 时约为 0.66%。当前默认强度统一由 defaultBlurK 配置，半径仍受 maxBlurFraction 限制。
 ///
+///    上面这组数是在 1×（主摄 24mm）下标定的。变焦到长焦时要按焦距换算（`scaleForFocalLength`）：
+///    同样的 ƒ 值，焦距越长虚化越大、全清晰区越窄，不换算的话 4× 时近处的人整个在 0.25 的全清晰区里，一点都不虚化。
+///
 /// 2. `.thinLens` —— 薄透镜物理公式：c ≈ (f² / N) · |1/z − 1/z_f|。
 ///    对焦越近、模糊越大；与原始 blurK = 0.015 的系统模型相比，实测拳头 0.46 m 时约为其 4 倍。
 public struct LensParameters: Equatable {
     /// 默认景深虚化强度：调整预览和照片的虚化时，只需修改这里。
     //public static let defaultBlurK: Float = 0.015
     public static let defaultBlurK: Float = 0.015 + 0.001
+
+    /// `.system` 模型标定时的焦距（35mm 等效，毫米）：全清晰区、斜率都是在 1×（主摄 24mm）下对着系统相机标的
+    public static let referenceFocalLength: Float = 24
+    /// 焦距变长时，同样的视差差虚化放大多少（指数）：s = (焦距 / 24)^指数。
+    /// 真实镜头是 2（弥散圆 ∝ f² / N · Δd）；对比系统相机 4×（100mm）的录屏，1 更接近
+    /// （2 的话对焦面前后一点点就糊到上限，双摄视差的噪声也被放大 17 倍）。觉得长焦虚化还不够可以往 1.5 调
+    // linhao todo 修改长焦虚化
+    // 如果觉得 4× 虚化还不够强，可以把 Lens.swift 里的 focalScalingExponent 从 1 调到 1.5。真实镜头物理上是 2
+    public static let focalScalingExponent: Float = 1 + 0.35
 
     public enum Model: Equatable { case system, thinLens }
 
@@ -91,6 +103,24 @@ public struct LensParameters: Equatable {
         self.backMax = backMax
         self.softLimitFraction = softLimitFraction
         self.relativeScale = relativeScale
+    }
+
+    /// `.system`：按画面的 35mm 等效焦距（毫米，已含数码裁切；1× = 24mm）换算，每个 LensParameters 只调用一次。
+    ///
+    /// 模型本身不看焦距，以前 4×（100mm）和 1× 用同一组参数：对焦远处 3.75 m 的人时，前面 0.25（1/米）的全清晰区
+    /// 一直延伸到 1.9 m，近处 2.3 m 的人和他的椅背视差差只有 0.17～0.21，虚化半径正好是 0；后面 8 m 的背景也只有长边的 0.2%。
+    /// 系统相机 4× 时前后都糊得很明显。
+    ///
+    /// 做法：视差差先乘 s = (f / 24)^focalScalingExponent 再进模型，等价于全清晰区除以 s、斜率乘以 s（上限不变）。
+    /// 只放大不缩小（s ≥ 1）：1× 和超广角保持原来的标定。GPU 直接读换算后的这几个字段，着色器不用改
+    public mutating func scaleForFocalLength(_ focalLength35mm: Float) {
+        guard model == .system, focalLength35mm.isFinite, focalLength35mm > 0 else { return }
+        let s = powf(focalLength35mm / Self.referenceFocalLength, Self.focalScalingExponent)
+        guard s > 1 else { return }
+        frontTolerance /= s
+        backTolerance /= s
+        frontSlope *= s
+        backSlope *= s
     }
 
     /// 相对对焦面的距离：(d − d_f) / 分母。正数 = 前景，−1 = 无穷远（绝对视差时）
