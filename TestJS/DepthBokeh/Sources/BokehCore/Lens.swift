@@ -34,7 +34,7 @@ public struct LensParameters: Equatable {
     /// 焦距变长时，同样的视差差虚化放大多少（指数）：s = (焦距 / 24)^指数。
     /// 真实镜头是 2（弥散圆 ∝ f² / N · Δd）；对比系统相机 4×（100mm）的录屏，1 更接近
     /// （2 的话对焦面前后一点点就糊到上限，双摄视差的噪声也被放大 17 倍）。觉得长焦虚化还不够可以往 1.5 调
-    // linhao todo 修改长焦虚化
+    // linhao todo 修改长焦虚化的值
     // 如果觉得 4× 虚化还不够强，可以把 Lens.swift 里的 focalScalingExponent 从 1 调到 1.5。真实镜头物理上是 2
     public static let focalScalingExponent: Float = 1 + 0.35
 
