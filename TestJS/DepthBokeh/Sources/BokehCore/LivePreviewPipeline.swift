@@ -55,11 +55,16 @@ public final class LivePreviewPipeline {
         public var objectColors: PlanarImage?
         /// 物体标签图的版本号（没变时分析直接用上次选好的物体）；0 = 每帧重新选
         public var objectRevision: Int
+        /// 人像实例分割的标签图（整个相机画面，0 = 不是人，1…N = 各个人）：不是对焦的那个人、深度也对不上的，
+        /// 从人像遮罩里去掉（对焦的人后面挨着的人照常虚化）
+        public var personInstances: FloatMap?
 
         public init(image: PlanarImage, disparity: FloatMap?, relativeDepth: Bool, crop: Float, fNumber: Float,
                     focusPoint: (x: Float, y: Float), focusTapped: Bool, time: Double, personMask: FloatMap? = nil,
                     personMaskColors: PlanarImage? = nil, depthAge: Int = 0,
-                    objectLabels: FloatMap? = nil, objectColors: PlanarImage? = nil, objectRevision: Int = 0) {
+                    objectLabels: FloatMap? = nil, objectColors: PlanarImage? = nil, objectRevision: Int = 0,
+                    personInstances: FloatMap? = nil) {
+            self.personInstances = personInstances
             self.objectRevision = objectRevision
             self.objectLabels = objectLabels
             self.objectColors = objectColors
@@ -149,7 +154,7 @@ public final class LivePreviewPipeline {
             colors: colors, personMask: frame.personMask, outputLongSide: frame.image.longSide,
             personMaskColors: frame.personMaskColors, depthAge: frame.depthAge,
             objectLabels: frame.objectLabels, objectColors: frame.objectColors,
-            objectRevision: frame.objectRevision))
+            objectRevision: frame.objectRevision, personInstances: frame.personInstances))
         lastPlan = plan
         lap("分析")
 

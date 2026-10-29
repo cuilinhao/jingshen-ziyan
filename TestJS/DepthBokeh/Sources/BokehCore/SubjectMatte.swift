@@ -36,6 +36,10 @@ public struct SubjectMatteParameters: Equatable {
     /// 物体分割（Vision 前景实例）里对焦的那个物体：深度在 ±band 以内的像素至少占这么多，才把整个物体当主体。
     /// 物体分割有时会把一大片（比如一路延伸到远处的桌面）当成一个物体，深度对不上就不用它
     public var objectDepthAgreement: Float = 0.6
+    /// 人像实例（Vision 的 VNGeneratePersonInstanceMaskRequest，每个人一个编号）里不是对焦的那个人：
+    /// 深度在 ±band 以内的像素至少占这么多，才和对焦的人一起保持清晰（站在旁边、和对焦的人差不多远的人）；
+    /// 不到的（对焦的人后面站着的同事）照常按深度虚化。人像遮罩本身分不出是谁，画面上挨着的人会连成一片
+    public var personDepthAgreement: Float = 0.5
 
     public init() {}
 }
@@ -330,6 +334,13 @@ public enum SubjectMatte {
     /// 物体分割的标签图（0 = 背景，1…N = 各个物体，任意分辨率）里对焦点所在的那个物体：同样大小的 0/1 遮罩。
     /// 对焦点落在背景上时，在附近（长边的 2%）找最近的物体；找不到返回 nil
     public static func instanceAt(_ labels: FloatMap, point: (Float, Float)) -> FloatMap? {
+        guard let label = instanceLabel(labels, point: point) else { return nil }
+        return FloatMap(width: labels.width, height: labels.height,
+                        values: labels.values.map { Int($0.rounded()) == label ? 1 : 0 })
+    }
+
+    /// 标签图里对焦点所在的那个编号（规则同 instanceAt：点在背景上时在附近找最近的）；找不到返回 nil
+    public static func instanceLabel(_ labels: FloatMap, point: (Float, Float)) -> Int? {
         let w = labels.width, h = labels.height
         guard w > 0, h > 0 else { return nil }
         let cx = min(w - 1, max(0, Int(point.0 * Float(w)))), cy = min(h - 1, max(0, Int(point.1 * Float(h))))
@@ -345,8 +356,7 @@ public enum SubjectMatte {
                 }
             }
         }
-        guard label > 0 else { return nil }
-        return FloatMap(width: w, height: h, values: labels.values.map { Int($0.rounded()) == label ? 1 : 0 })
+        return label > 0 ? label : nil
     }
 
     /// 物体遮罩（和深度图一样大）的深度是不是和对焦面对得上：遮罩里 |相对距离| < band 的像素占多少

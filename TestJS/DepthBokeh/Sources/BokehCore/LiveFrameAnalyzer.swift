@@ -103,12 +103,25 @@ public final class LiveFrameAnalyzer {
         public var objectColors: PlanarImage?
         /// 物体标签图的版本号（每次重新分割加 1）：版本、对焦点、裁切都没变时直接用上一帧选好的物体。0 = 每帧重新选
         public var objectRevision: Int
+        /// 人像实例分割的标签图（Vision 的 VNGeneratePersonInstanceMaskRequest，整个相机画面，任意分辨率；
+        /// 0 = 不是人，1…N = 各个人）。人像遮罩把画面里所有人当成一片：对焦的人和后面的人在画面上挨着时，
+        /// 后面的人也会被当成主体保持清晰。有了它，不是对焦的那个人、深度也和对焦面对不上的，从人像遮罩里去掉
+        public var personInstances: FloatMap?
+        /// 算人像实例那一帧的画面（同 personMaskColors）
+        public var personInstanceColors: PlanarImage?
+        /// 人像实例标签图的版本号（每次重新分割加 1）：版本、裁切都没变时直接用上次拆好的遮罩。0 = 每帧重新拆
+        public var personInstanceRevision: Int
 
         public init(disparity: FloatMap, relativeDepth: Bool, crop: Float, fNumber: Float,
                     focusPoint: (x: Float, y: Float), focusTapped: Bool, time: Double,
                     colors: PlanarImage?, personMask: FloatMap?, outputLongSide: Int,
                     personMaskColors: PlanarImage? = nil, depthAge: Int = 0,
-                    objectLabels: FloatMap? = nil, objectColors: PlanarImage? = nil, objectRevision: Int = 0) {
+                    objectLabels: FloatMap? = nil, objectColors: PlanarImage? = nil, objectRevision: Int = 0,
+                    personInstances: FloatMap? = nil, personInstanceColors: PlanarImage? = nil,
+                    personInstanceRevision: Int = 0) {
+            self.personInstances = personInstances
+            self.personInstanceColors = personInstanceColors
+            self.personInstanceRevision = personInstanceRevision
             self.objectLabels = objectLabels
             self.objectColors = objectColors
             self.objectRevision = objectRevision
@@ -144,6 +157,9 @@ public final class LiveFrameAnalyzer {
     /// 上一次选出来的物体（已裁切、缩放到深度图大小）和那一帧的小图（已裁切）。标签图没更新、对焦点和裁切没变时直接用
     private var objectCache: (revision: Int, point: (Float, Float), crop: Float, w: Int, h: Int,
                               mask: FloatMap?, colors: PlanarImage?)?
+    /// 上一次按编号拆开的人像实例（已裁切、缩放到深度图大小）和那一帧的小图（已裁切）。标签图没更新、裁切没变时直接用
+    private var personInstanceCache: (revision: Int, crop: Float, w: Int, h: Int,
+                                      parts: [(label: Int, mask: FloatMap)], colors: PlanarImage?)?
 
     public init() {}
 
@@ -158,6 +174,7 @@ public final class LiveFrameAnalyzer {
         previousLumaSize = (0, 0)
         lastCrop = nil
         objectCache = nil
+        personInstanceCache = nil
     }
 
     public func analyze(_ frame: Frame) -> FramePlan {
@@ -266,6 +283,31 @@ public final class LiveFrameAnalyzer {
                 person = aligned.mask
                 personStale = aligned.changed >= Self.maskStaleFraction
             }
+            // 人像遮罩分不出是谁：对焦的人和后面的同事在画面上挨着时连成一片，后面的人也被一起保持清晰。
+            // 用人像实例把不是对焦的那个人、深度也和对焦面对不上的去掉（照常按深度虚化）
+            if let pm = person, let labels = frame.personInstances {
+                let parts: [(label: Int, mask: FloatMap)]
+                let then: PlanarImage?
+                if let k = personInstanceCache, frame.personInstanceRevision != 0,
+                   k.revision == frame.personInstanceRevision, k.crop == c, k.w == map.width, k.h == map.height {
+                    parts = k.parts
+                    then = k.colors
+                } else {
+                    parts = Self.instanceMasks(labels, crop: c, width: map.width, height: map.height)
+                    then = frame.personInstanceColors?.centerCropped(by: c)
+                    personInstanceCache = (frame.personInstanceRevision, c, map.width, map.height, parts, then)
+                }
+                if var others = Self.otherPeople(parts, focusLabel: SubjectMatte.instanceLabel(labels, point: p),
+                                                 depth: map, focusDisparity: focusD,
+                                                 norm: max(relativeScale ?? focusD, 1e-3), matte: matte) {
+                    // 实例也是几帧之前算的：和遮罩一样按整体平移挪到这一帧
+                    if let then, let colors {
+                        others = Self.alignMask(others, maskColors: then, colors: colors,
+                                                colorsSmall: small(for: then, colors)).mask
+                    }
+                    person = Self.removing(others, from: pm)
+                }
+            }
             // 对焦的那个物体（在整个相机画面上按对焦点选，再裁）。标签图几秒才更新一次：没变就用上次选好的
             var selected: (mask: FloatMap?, colors: PlanarImage?) = (nil, nil)
             if let labels = frame.objectLabels {
@@ -301,6 +343,45 @@ public final class LiveFrameAnalyzer {
                          layerCenters: centers, seeds: seeds, matte: matte, depth: map, lowLongSide: lowLongSide,
                          changedFraction: changed, depthAge: depthAge, personMaskStale: personStale,
                          objectMaskStale: objectStale)
+    }
+
+    /// 人像实例标签图（整个相机画面，任意分辨率；0 = 不是人，1…N = 各个人）按编号拆开：每个人一张遮罩，
+    /// 中心裁切 crop 倍、缩放到 w×h（0…1）
+    static func instanceMasks(_ labels: FloatMap, crop c: Float, width w: Int,
+                              height h: Int) -> [(label: Int, mask: FloatMap)] {
+        var ids = Set<Int>()
+        for v in labels.values where v > 0.5 { ids.insert(Int(v.rounded())) }
+        return ids.sorted().map { id in
+            let m = FloatMap(width: labels.width, height: labels.height,
+                             values: labels.values.map { Int($0.rounded()) == id ? 1 : 0 })
+            return (id, m.centerCropped(by: c).resized(width: w, height: h))
+        }
+    }
+
+    /// 不该和对焦的人一起保持清晰的人：不是对焦点所在的那个人，深度在对焦面 ±band 以内的又不到 personDepthAgreement
+    /// （对焦的人后面站着的同事）。站在旁边、和对焦的人差不多远的人照样保持清晰（系统相机也是这样）。
+    /// 返回这些人合起来的遮罩（和深度图一样大，0…1）；没有返回 nil
+    static func otherPeople(_ parts: [(label: Int, mask: FloatMap)], focusLabel: Int?, depth: FloatMap,
+                            focusDisparity df: Float, norm: Float, matte: SubjectMatteParameters) -> FloatMap? {
+        let w = depth.width, h = depth.height, n = w * h
+        var out: [Float]?
+        for part in parts where part.label != focusLabel && part.mask.width == w && part.mask.height == h {
+            let agree = SubjectMatte.depthAgreement(part.mask.values, depth: depth.values, focusDisparity: df,
+                                                    norm: norm, band: matte.band)
+            guard agree < matte.personDepthAgreement else { continue }
+            var v = out ?? [Float](repeating: 0, count: n)
+            for i in 0..<n { v[i] = max(v[i], part.mask.values[i]) }
+            out = v
+        }
+        return out.map { FloatMap(width: w, height: h, values: $0) }
+    }
+
+    /// 人像遮罩里去掉 others（任意分辨率，0…1），返回和人像遮罩一样大的
+    static func removing(_ others: FloatMap, from person: FloatMap) -> FloatMap {
+        let o = others.resized(width: person.width, height: person.height).values
+        var v = person.values
+        for i in 0..<v.count { v[i] *= 1 - min(1, max(0, o[i])) }
+        return FloatMap(width: person.width, height: person.height, values: v)
     }
 
     /// 物体遮罩（和深度图一样大）的深度和对焦面对得上，就并进人像遮罩（两者取大）；对不上原样返回人像遮罩
@@ -474,7 +555,8 @@ public final class LiveFrameAnalyzer {
     /// 拍下来的照片：没有时间历史，对焦点直接取中位数
     public static func stillPlan(disparity: FloatMap, relativeDepth: Bool, colors: PlanarImage?, fNumber: Float,
                                  focusPoint: (x: Float, y: Float), personMask: FloatMap?, outputLongSide: Int,
-                                 settings: Settings, objectLabels: FloatMap? = nil) -> FramePlan {
+                                 settings: Settings, objectLabels: FloatMap? = nil,
+                                 personInstances: FloatMap? = nil) -> FramePlan {
         let map = DepthRefiner.fillInvalid(disparity)
         let lowLongSide = max(320, outputLongSide / max(1, settings.blurDownscale))
         let focusD = DepthRefiner.focusDisparity(in: map, nx: focusPoint.x, ny: focusPoint.y)
@@ -498,8 +580,16 @@ public final class LiveFrameAnalyzer {
             let c = colors.map { $0.width == map.width && $0.height == map.height
                 ? $0 : $0.resized(width: map.width, height: map.height) }
             var person = personMask
+            // 后面挨着的别人（深度对不上的）不和对焦的人一起保持清晰（同 analyze）
+            if let pm = person, let labels = personInstances,
+               let others = otherPeople(instanceMasks(labels, crop: 1, width: map.width, height: map.height),
+                                        focusLabel: SubjectMatte.instanceLabel(labels, point: focusPoint), depth: map,
+                                        focusDisparity: focusD, norm: max(relativeScale ?? focusD, 1e-3),
+                                        matte: matte) {
+                person = removing(others, from: pm)
+            }
             if let labels = objectLabels, let inst = SubjectMatte.instanceAt(labels, point: focusPoint) {
-                person = addObject(inst.resized(width: map.width, height: map.height), to: personMask, depth: map,
+                person = addObject(inst.resized(width: map.width, height: map.height), to: person, depth: map,
                                    focusDisparity: focusD, norm: max(relativeScale ?? focusD, 1e-3), matte: matte,
                                    reach: max(2, Int((Float(max(map.width, map.height)) / 40).rounded())))
             }

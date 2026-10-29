@@ -522,4 +522,42 @@ final class BokehCoreTests: XCTestCase {
         XCTAssertEqual(same.changed, 0, accuracy: 1e-4)
         XCTAssertEqual(same.mask[40, 35], 1, accuracy: 1e-4)
     }
+
+    /// 对焦在坐着的人（B）身上，后面站着的同事（C）在画面上和 B 挨着：人像遮罩把两个人连成一片，
+    /// C 不能因此被当成主体保持清晰。有人像实例（每个人一个编号）时，不是对焦的那个人、深度也对不上的去掉；
+    /// 站在旁边、和 B 差不多远的人（A）照样保持清晰
+    func testPersonInstancesDropPersonBehind() {
+        let w = 100, h = 80
+        var d = [Float](repeating: 0.3, count: w * h)          // 背景 3.3 m
+        var m = [Float](repeating: 0, count: w * h)            // 人像遮罩：三个人连成一片
+        var labels = [Float](repeating: 0, count: w * h)       // 人像实例
+        for y in 20..<80 { for x in 25..<50 { let i = y * w + x; m[i] = 1; labels[i] = 1; d[i] = 1.4 } }   // B：0.7 m，对焦
+        for y in 5..<60 { for x in 50..<75 { let i = y * w + x; m[i] = 1; labels[i] = 2; d[i] = 0.5 } }    // C：2 m，挨着 B
+        for y in 20..<80 { for x in 8..<25 { let i = y * w + x; m[i] = 1; labels[i] = 3; d[i] = 1.35 } }   // A：和 B 差不多远
+        let disparity = FloatMap(width: w, height: h, values: d)
+        let mask = FloatMap(width: w, height: h, values: m)
+        let people = FloatMap(width: w, height: h, values: labels)
+        let analyzer = LiveFrameAnalyzer()
+        func plan(_ instances: FloatMap?) -> FramePlan {
+            analyzer.resetHistory()
+            return analyzer.analyze(LiveFrameAnalyzer.Frame(
+                disparity: disparity, relativeDepth: false, crop: 1, fNumber: 2.8, focusPoint: (0.37, 0.6),
+                focusTapped: true, time: 0, colors: nil, personMask: mask, outputLongSide: 480,
+                personInstances: instances))
+        }
+        // 只有人像遮罩：C 和 B 连着，被一起保持清晰（原来的问题）
+        XCTAssertGreaterThan(plan(nil).seeds?.person?[62, 30] ?? 0, 0.5)
+        let live = plan(people).seeds?.person
+        XCTAssertGreaterThan(live?[37, 50] ?? 0, 0.5, "对焦的 B")
+        XCTAssertLessThan(live?[62, 30] ?? 1, 0.05, "B 后面的 C 不算主体")
+        XCTAssertLessThan(live?[51, 40] ?? 1, 0.05, "C 贴着 B 的地方也不算")
+        XCTAssertGreaterThan(live?[15, 50] ?? 0, 0.5, "旁边和 B 差不多远的 A 照样算")
+        // 拍下来的照片：同样的规则
+        let still = LiveFrameAnalyzer.stillPlan(disparity: disparity, relativeDepth: false, colors: nil, fNumber: 2.8,
+                                                focusPoint: (0.37, 0.6), personMask: mask, outputLongSide: 480,
+                                                settings: LiveFrameAnalyzer.Settings(), personInstances: people)
+        XCTAssertGreaterThan(still.seeds?.person?[37, 50] ?? 0, 0.5)
+        XCTAssertLessThan(still.seeds?.person?[62, 30] ?? 1, 0.05)
+        XCTAssertGreaterThan(still.seeds?.person?[15, 50] ?? 0, 0.5)
+    }
 }

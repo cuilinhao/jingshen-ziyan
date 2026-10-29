@@ -16,6 +16,10 @@ import BokehCore
 /// 系统相机的盒子却干干净净。所以再跑一个「前景物体」分割（VNGenerateForegroundInstanceMaskRequest，
 /// 和相册「抠图」是同一个），对焦点落在某个物体上、深度也对得上时，整个物体保持清晰。
 ///
+/// 人像遮罩分不出是谁：画面上挨着的几个人连成一片（对焦坐着的人，后面站着的同事和他在画面上连着），
+/// 后面那个人也会被整个保持清晰，系统相机却会按深度虚化掉。所以再跑一个「人像实例」分割
+/// （VNGeneratePersonInstanceMaskRequest，每个人一个编号），分析时把不是对焦的那个人、深度也对不上的从遮罩里去掉。
+///
 /// 实时预览：在单独的队列上跑，每帧用上一次算好的结果，不增加这一帧的延迟；上一次还没算完就跳过这一帧。
 final class PersonSegmenter: @unchecked Sendable {   // 可变状态都由 lock 保护
     /// 最近一次的分割结果（都是传感器方向、整个相机画面），和算它们用的那一帧的小图
@@ -29,6 +33,11 @@ final class PersonSegmenter: @unchecked Sendable {   // 可变状态都由 lock 
         var objectColors: PlanarImage?
         /// 物体标签图每更新一次加 1（分析时按它缓存选出来的物体，不用每帧重新选）
         var objectRevision = 0
+        /// 人像实例标签图（0 = 不是人，1…N = 各个人）和算它那一帧的小图；没有人时为 nil
+        var personInstances: FloatMap?
+        var personInstanceColors: PlanarImage?
+        /// 人像实例标签图每更新一次加 1
+        var personInstanceRevision = 0
     }
 
     private let queue = DispatchQueue(label: "depthbokeh.segmentation", qos: .userInitiated)
@@ -40,6 +49,11 @@ final class PersonSegmenter: @unchecked Sendable {   // 可变状态都由 lock 
     private var objects: FloatMap?
     private var objectColors: PlanarImage?
     private var objectRevision = 0
+    /// 人像实例（每个人一个编号）、算它那一帧的小图、版本号、上一次开始算的时间
+    private var instances: FloatMap?
+    private var instanceColors: PlanarImage?
+    private var instanceRevision = 0
+    private var lastInstanceStart: TimeInterval = -1
     private var generation = 0
     /// 最近一秒每次分割的开始时间和耗时（毫秒），状态栏显示
     private var runs: [(start: TimeInterval, ms: Double)] = []
@@ -56,6 +70,8 @@ final class PersonSegmenter: @unchecked Sendable {   // 可变状态都由 lock 
     private var movedSinceObjects = false
     /// 物体分割的请求（只在 queue 上用；重复用同一个，不用每次重新准备模型）
     private let objectRequest = VNGenerateForegroundInstanceMaskRequest()
+    /// 人像实例分割的请求（只在 queue 上用）
+    private let personInstanceRequest = VNGeneratePersonInstanceMaskRequest()
     private let handler = VNSequenceRequestHandler()
     private let request: VNGeneratePersonSegmentationRequest = {
         let request = VNGeneratePersonSegmentationRequest()
@@ -76,7 +92,8 @@ final class PersonSegmenter: @unchecked Sendable {   // 可变状态都由 lock 
         lock.lock()
         defer { lock.unlock() }
         return Masks(person: mask, personColors: maskColors, objects: objects, objectColors: objectColors,
-                     objectRevision: objectRevision)
+                     objectRevision: objectRevision, personInstances: instances, personInstanceColors: instanceColors,
+                     personInstanceRevision: instanceRevision)
     }
 
     /// 最近一秒跑了几次分割、平均每次多少毫秒（状态栏）
@@ -103,6 +120,10 @@ final class PersonSegmenter: @unchecked Sendable {   // 可变状态都由 lock 
         objects = nil
         objectColors = nil
         objectRevision &+= 1
+        instances = nil
+        instanceColors = nil
+        instanceRevision &+= 1
+        lastInstanceStart = -1
         generation &+= 1
         lastStart = -1
         lastObjectStart = -1
@@ -148,6 +169,10 @@ final class PersonSegmenter: @unchecked Sendable {   // 可变状态都由 lock 
             personInterval = (personChanged ?? moving) ? 0.1 : 0.2
         }
         let doPerson = personPending || now - lastStart >= personInterval
+        // 人像实例（把对焦的人和画面上挨着的别人分开）：比人像遮罩跑得少。点了对焦 / 换了相机马上跑；
+        // 对焦在人身上时，人在动每秒 5 次，不动每秒 2 次（分析时会按整体平移挪到这一帧）；对焦点不在人身上不跑
+        let instanceInterval: TimeInterval = (personChanged ?? moving) ? 0.2 : 0.5
+        let doInstances = doPerson && (personPending || (onPerson && now - lastInstanceStart >= instanceInterval))
         if moving { movedSinceObjects = true }
         var doObjects = false
         if !onPerson {
@@ -170,6 +195,7 @@ final class PersonSegmenter: @unchecked Sendable {   // 可变状态都由 lock 
             lastStart = now
             personPending = false
         }
+        if doInstances { lastInstanceStart = now }
         if doObjects {
             lastObjectStart = now
             objectsPending = false
@@ -182,6 +208,11 @@ final class PersonSegmenter: @unchecked Sendable {   // 可变状态都由 lock 
             let t0 = Date().timeIntervalSinceReferenceDate
             let result = doPerson ? self.segment(pixelBuffer, orientation: orientation) : nil
             let hasPerson = result.map { m in m.values.contains { $0 > 0.5 } } ?? false
+            // 画面里有人时才分实例
+            let people = doInstances && hasPerson
+                ? Self.personInstanceLabels(pixelBuffer, request: self.personInstanceRequest, orientation: orientation)
+                : nil
+            let hasInstances = people.map { m in m.values.contains { $0 > 0.5 } } ?? false
             let labels = runObjects ? Self.objectLabels(pixelBuffer, request: self.objectRequest, orientation: orientation) : nil
             let hasObjects = labels.map { m in m.values.contains { $0 > 0.5 } } ?? false
             // 同一帧的小图（160 长边够判断哪里变了）
@@ -198,6 +229,11 @@ final class PersonSegmenter: @unchecked Sendable {   // 可变状态都由 lock 
                     self.objectColors = hasObjects ? thumb : nil
                     self.objectRevision &+= 1
                 }
+                if doInstances {
+                    self.instances = hasInstances ? people : nil
+                    self.instanceColors = hasInstances ? thumb : nil
+                    self.instanceRevision &+= 1
+                }
             }
             if hasPerson { self.lastPersonSeen = now }
             self.runs.append((now, ms))
@@ -211,6 +247,23 @@ final class PersonSegmenter: @unchecked Sendable {   // 可变状态都由 lock 
                              request: VNGenerateForegroundInstanceMaskRequest = VNGenerateForegroundInstanceMaskRequest(),
                              orientation: CGImagePropertyOrientation = .right) -> FloatMap? {
         let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: orientation, options: [:])
+        guard (try? handler.perform([request])) != nil, let obs = request.results?.first else { return nil }
+        return sensorMask(obs.instanceMask, labels: true, orientation: orientation)
+    }
+
+    /// 人像实例分割（传感器方向的标签图，0 = 不是人，1…N = 各个人）；失败返回 nil
+    static func personInstanceLabels(_ pixelBuffer: CVPixelBuffer,
+                                     request: VNGeneratePersonInstanceMaskRequest = VNGeneratePersonInstanceMaskRequest(),
+                                     orientation: CGImagePropertyOrientation = .right) -> FloatMap? {
+        let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: orientation, options: [:])
+        guard (try? handler.perform([request])) != nil, let obs = request.results?.first else { return nil }
+        return sensorMask(obs.instanceMask, labels: true, orientation: orientation)
+    }
+
+    /// 拍下来的照片（传感器方向）的人像实例标签图
+    static func photoPersonInstances(_ image: CGImage, orientation: CGImagePropertyOrientation = .right) -> FloatMap? {
+        let request = VNGeneratePersonInstanceMaskRequest()
+        let handler = VNImageRequestHandler(cgImage: image, orientation: orientation, options: [:])
         guard (try? handler.perform([request])) != nil, let obs = request.results?.first else { return nil }
         return sensorMask(obs.instanceMask, labels: true, orientation: orientation)
     }

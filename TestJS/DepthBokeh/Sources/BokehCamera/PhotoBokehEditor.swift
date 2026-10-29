@@ -107,7 +107,8 @@ public final class PhotoBokehEditor: ObservableObject, @unchecked Sendable {
         let plan = LiveFrameAnalyzer.stillPlan(disparity: d, relativeDepth: photo.isRelativeDepth, colors: colors,
                                                fNumber: fNumber, focusPoint: (Float(focus.x), Float(focus.y)),
                                                personMask: photo.personMask, outputLongSide: img.longSide,
-                                               settings: settings, objectLabels: photo.objectLabels)
+                                               settings: settings, objectLabels: photo.objectLabels,
+                                               personInstances: photo.personInstances)
         if let ui = renderOnGPU(plan) { return (ui, plan.focusDisparity) }
         return (renderOnCPU(plan), plan.focusDisparity)
     }

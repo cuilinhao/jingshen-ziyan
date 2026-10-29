@@ -26,6 +26,8 @@ public struct CapturedDepthPhoto: Identifiable {
     public let personMask: FloatMap?
     /// 物体分割的标签图（传感器方向，0 = 背景，1…N = 各个物体）；编辑器里按对焦点选物体
     public var objectLabels: FloatMap? = nil
+    /// 人像实例的标签图（传感器方向，0 = 不是人，1…N = 各个人）：对焦的人后面挨着的别人不跟着保持清晰
+    public var personInstances: FloatMap? = nil
 }
 
 /// 实时景深相机。
@@ -1127,7 +1129,9 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
                 personMask: masks?.person, outputLongSide: max(outW, outH),
                 personMaskColors: masks?.personColors, depthAge: depthAge,
                 objectLabels: masks?.objects, objectColors: masks?.objectColors,
-                objectRevision: masks?.objectRevision ?? 0))
+                objectRevision: masks?.objectRevision ?? 0, personInstances: masks?.personInstances,
+                personInstanceColors: masks?.personInstanceColors,
+                personInstanceRevision: masks?.personInstanceRevision ?? 0))
             // 下一帧决定分割跑多勤用：手机在动或画面里有东西在动
             sceneMoving = plan.cameraShift >= 0.5 || plan.cameraMoving || plan.changedFraction >= 0.005
             personMaskStale = plan.personMaskStale
@@ -1338,11 +1342,14 @@ extension DepthCameraController: AVCapturePhotoCaptureDelegate {
             let hasDepth = disparity != nil
             // 人像分割（高质量）：对焦在人身上时整个人保持清晰；物体分割：对焦的物体整个保持清晰。和预览一致
             let person = hasDepth ? PersonSegmenter.photoMask(cg, orientation: photoOrientation) : nil
+            // 人像实例：画面上和对焦的人挨着的别人（后面站着的同事）不跟着保持清晰
+            let people = person != nil ? PersonSegmenter.photoPersonInstances(cg, orientation: photoOrientation) : nil
             let objects = hasDepth ? PersonSegmenter.photoObjects(cg, orientation: photoOrientation) : nil
             let captured = CapturedDepthPhoto(image: image,
                                               disparity: disparity ?? FloatMap(width: 64, height: 48, repeating: 1),
                                               orientation: orientation, focusPoint: focus, fNumber: fNumber,
-                                              isRelativeDepth: relative, personMask: person, objectLabels: objects)
+                                              isRelativeDepth: relative, personMask: person, objectLabels: objects,
+                                              personInstances: people)
             DispatchQueue.main.async {
                 self.lastPhoto = captured
                 self.isCapturing = false
