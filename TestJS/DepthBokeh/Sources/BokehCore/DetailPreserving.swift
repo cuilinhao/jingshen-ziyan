@@ -182,7 +182,7 @@ extension BokehRenderer {
         let colors = full.resized(width: filled.width, height: filled.height)
         return SubjectMatte.seeds(depth: filled, colors: colors, focusDisparity: lens.focusDisparity,
                                   focusPoint: hint.point, parameters: hint.parameters, scale: lens.relativeScale,
-                                  personMask: hint.personMask)
+                                  personMask: hint.personMask, lens: lens)
     }
 
     /// 缩小到指定长边：整数倍时用盒式平均（快），否则用通用缩放

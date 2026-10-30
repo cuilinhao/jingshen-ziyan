@@ -11,6 +11,8 @@ struct ContentView: View {
     @State private var sliderValue: Double = ApertureScale.position(for: 2.8)
     @State private var focusMarker: CGPoint?
     @State private var editingPhoto: CapturedDepthPhoto?
+    /// 分割开关（看效果用）：关掉以后只按深度虚化
+    @State private var segmentationOn = true
 
     private var fNumber: Float { ApertureScale.fNumber(at: sliderValue) }
 
@@ -53,9 +55,19 @@ struct ContentView: View {
             }
 
             HStack(spacing: 28) {
-                // 与右侧按钮等宽，让快门保持居中。
-                Color.clear.frame(width: 48, height: 48)
-                    .accessibilityHidden(true)
+                // 分割开关（看效果用，和右侧按钮等宽，让快门保持居中）：黄色 = 开，划掉 = 关（只按深度虚化）
+                Button {
+                    segmentationOn.toggle()
+                    camera.useSegmentation = segmentationOn
+                } label: {
+                    Text("分割")
+                        .font(.caption.weight(.semibold))
+                        .strikethrough(!segmentationOn)
+                        .foregroundStyle(segmentationOn ? Color.black : Color.white.opacity(0.7))
+                        .frame(width: 48, height: 48)
+                        .background(segmentationOn ? Color.yellow : Color.white.opacity(0.15), in: Circle())
+                }
+                .accessibilityLabel(segmentationOn ? "关闭分割，只按深度虚化" : "打开分割")
 
                 Button {
                     camera.capturePhoto()

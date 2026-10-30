@@ -98,6 +98,7 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
     // MARK: - 渲染参数（UI 线程写、数据线程读，用锁保护）
     private let paramLock = NSLock()
     private var _fNumber: Float = 2.8
+    private var _useSegmentation = true
     /// 对焦点：当前相机画面（未裁切）里的归一化坐标，传感器方向
     private var _focusPoint = CGPoint(x: 0.5, y: 0.5)
     private var focusResetPending = false
@@ -111,6 +112,20 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
     public var fNumber: Float {
         get { paramLock.lock(); defer { paramLock.unlock() }; return _fNumber }
         set { paramLock.lock(); _fNumber = newValue; paramLock.unlock() }
+    }
+
+    /// 分割开关（人像遮罩、人像实例、物体分割）。关掉以后不跑 Vision 分割，虚化只按深度算：
+    /// 头发 / 眼镜的边不修，对焦的人和物体也不再整体保持清晰（深度核心、按颜色补边照常，它们只看深度和颜色）。
+    /// 看效果用的开关，代码都在；拍照也跟着这个开关。切换时清掉旧的分割结果，打开后马上重新分割
+    public var useSegmentation: Bool {
+        get { paramLock.lock(); defer { paramLock.unlock() }; return _useSegmentation }
+        set {
+            paramLock.lock()
+            let changed = _useSegmentation != newValue
+            _useSegmentation = newValue
+            paramLock.unlock()
+            if changed { segmenter.reset() }
+        }
     }
 
     /// 预览此刻应该显示的倍率（点数字后的平滑变焦过程中介于新旧倍率之间）。任意线程
@@ -1101,8 +1116,10 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
             paramLock.unlock()
 
             // 人像 / 物体分割在单独的队列上跑（用上一次的结果，不增加这一帧的延迟）。
-            // 跑多勤看画面动不动、有没有人、对焦点在哪儿（PersonSegmenter.update）：静止时很少跑，省电
-            if keepSubjectSharp {
+            // 跑多勤看画面动不动、有没有人、对焦点在哪儿（PersonSegmenter.update）：静止时很少跑，省电。
+            // 分割开关关掉时不跑，虚化只按深度（useSegmentation）
+            let segmentationOn = keepSubjectSharp && useSegmentation
+            if segmentationOn {
                 if tapped || firstRouteFrame { segmenter.focusChanged() }
                 segmenter.update(with: pixelBuffer, now: t0, moving: sceneMoving, personChanged: personMaskStale,
                                  objectChanged: objectMaskStale, focusPoint: (Float(p.x), Float(p.y)),
@@ -1124,7 +1141,7 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
             let colors = ImageBridge.planarImage(from: pixelBuffer, width: dw, height: dh, crop: crop)
             let fNumber = self.fNumber
             // 人像 / 物体遮罩是几帧之前算的：连同那一帧的小图一起交给分析，画面从那以后变了的地方（在动）不再相信遮罩
-            let masks = keepSubjectSharp ? segmenter.latest : nil
+            let masks = segmentationOn ? segmenter.latest : nil
             let plan = analyzer.analyze(LiveFrameAnalyzer.Frame(
                 disparity: fullDisparity, relativeDepth: relative, crop: Float(crop), fNumber: fNumber,
                 focusPoint: (Float(p.x), Float(p.y)), focusTapped: tapped, time: t0, colors: colors,
@@ -1215,7 +1232,9 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
             text += " · "
         }
         // 人像 / 物体分割（Vision）最近一秒跑了几次、每次多少毫秒：跑得越勤越热
-        if keepSubjectSharp {
+        if keepSubjectSharp && !useSegmentation {
+            text += "分割关 · "
+        } else if keepSubjectSharp {
             let load = segmenter.recentLoad(now: now)
             text += String(format: "分割 %d/s", load.count)
             if load.count > 0 { text += String(format: " %.0f ms", load.ms) }
@@ -1296,6 +1315,7 @@ extension DepthCameraController: AVCapturePhotoCaptureDelegate {
     public func photoOutput(_ output: AVCapturePhotoOutput, didFinishProcessingPhoto photo: AVCapturePhoto,
                             error: Error?) {
         let fNumber = self.fNumber, longSide = photoLongSide
+        let segmentationOn = useSegmentation
         paramLock.lock()
         let streamFocus = _focusPoint
         paramLock.unlock()
@@ -1345,10 +1365,11 @@ extension DepthCameraController: AVCapturePhotoCaptureDelegate {
             // 没有深度（光线太暗、AI 模型没准备好）：整张图当作在对焦面上
             let hasDepth = disparity != nil
             // 人像分割（高质量）：对焦在人身上时整个人保持清晰；物体分割：对焦的物体整个保持清晰。和预览一致
-            let person = hasDepth ? PersonSegmenter.photoMask(cg, orientation: photoOrientation) : nil
+            // 分割开关关掉时照片也只按深度
+            let person = hasDepth && segmentationOn ? PersonSegmenter.photoMask(cg, orientation: photoOrientation) : nil
             // 人像实例：画面上和对焦的人挨着的别人（后面站着的同事）不跟着保持清晰
             let people = person != nil ? PersonSegmenter.photoPersonInstances(cg, orientation: photoOrientation) : nil
-            let objects = hasDepth ? PersonSegmenter.photoObjects(cg, orientation: photoOrientation) : nil
+            let objects = hasDepth && segmentationOn ? PersonSegmenter.photoObjects(cg, orientation: photoOrientation) : nil
             let captured = CapturedDepthPhoto(image: image,
                                               disparity: disparity ?? FloatMap(width: 64, height: 48, repeating: 1),
                                               orientation: orientation, focusPoint: focus, fNumber: fNumber,

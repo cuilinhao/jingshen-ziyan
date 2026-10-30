@@ -524,8 +524,8 @@ final class BokehCoreTests: XCTestCase {
     }
 
     /// 对焦在坐着的人（B）身上，后面站着的同事（C）在画面上和 B 挨着：人像遮罩把两个人连成一片，
-    /// C 不能因此被当成主体保持清晰。有人像实例（每个人一个编号）时，不是对焦的那个人、深度也对不上的去掉；
-    /// 站在旁边、和 B 差不多远的人（A）照样保持清晰
+    /// C 不能因此被当成主体保持清晰。人像遮罩里只留对焦的那一个人（有人像实例按编号分，没有就按深度分），
+    /// 别人清不清晰交给深度：站在旁边、和 B 差不多远的人（A）按深度本来就清晰（在深度核心里）
     func testPersonInstancesDropPersonBehind() {
         let w = 100, h = 80
         var d = [Float](repeating: 0.3, count: w * h)          // 背景 3.3 m
@@ -545,20 +545,23 @@ final class BokehCoreTests: XCTestCase {
                 focusTapped: true, time: 0, colors: nil, personMask: mask, outputLongSide: 480,
                 personInstances: instances))
         }
-        // 只有人像遮罩：C 和 B 连着，被一起保持清晰（原来的问题）
-        XCTAssertGreaterThan(plan(nil).seeds?.person?[62, 30] ?? 0, 0.5)
-        let live = plan(people).seeds?.person
+        // 没有人像实例：C 和 B 在遮罩里连着，但 C 的深度对不上，也不跟着 B 保持清晰
+        XCTAssertLessThan(plan(nil).seeds?.person?[62, 30] ?? 1, 0.05)
+        XCTAssertGreaterThan(plan(nil).seeds?.person?[37, 50] ?? 0, 0.5)
+        let livePlan = plan(people)
+        let live = livePlan.seeds?.person
         XCTAssertGreaterThan(live?[37, 50] ?? 0, 0.5, "对焦的 B")
         XCTAssertLessThan(live?[62, 30] ?? 1, 0.05, "B 后面的 C 不算主体")
         XCTAssertLessThan(live?[51, 40] ?? 1, 0.05, "C 贴着 B 的地方也不算")
-        XCTAssertGreaterThan(live?[15, 50] ?? 0, 0.5, "旁边和 B 差不多远的 A 照样算")
+        XCTAssertGreaterThan(livePlan.seeds?.connect?[15, 50] ?? 0, 0.5, "旁边和 B 差不多远的 A 按深度本来就清晰")
+        XCTAssertLessThan(abs(livePlan.lens.signedBlurRadius(disparity: 1.35, imageLongSide: 1000)), 1.5)
         // 拍下来的照片：同样的规则
         let still = LiveFrameAnalyzer.stillPlan(disparity: disparity, relativeDepth: false, colors: nil, fNumber: 2.8,
                                                 focusPoint: (0.37, 0.6), personMask: mask, outputLongSide: 480,
                                                 settings: LiveFrameAnalyzer.Settings(), personInstances: people)
         XCTAssertGreaterThan(still.seeds?.person?[37, 50] ?? 0, 0.5)
         XCTAssertLessThan(still.seeds?.person?[62, 30] ?? 1, 0.05)
-        XCTAssertGreaterThan(still.seeds?.person?[15, 50] ?? 0, 0.5)
+        XCTAssertGreaterThan(still.seeds?.connect?[15, 50] ?? 0, 0.5)
     }
 
     /// 按焦距换算 = 视差差乘 s 再进模型（全清晰区除以 s、斜率乘 s）；1× 和更广不变
@@ -601,14 +604,14 @@ final class BokehCoreTests: XCTestCase {
         let mask = FloatMap(width: w, height: h, values: m)
         let people = FloatMap(width: w, height: h, values: labels)
         let analyzer = LiveFrameAnalyzer()
-        func plan(focus: (Float, Float), fl: Float?) -> FramePlan {
+        func plan(focus: (Float, Float), fl: Float?, instances: Bool = true) -> FramePlan {
             analyzer.resetHistory()
             var p: FramePlan!
             for t in 0..<10 {
                 p = analyzer.analyze(LiveFrameAnalyzer.Frame(
                     disparity: disparity, relativeDepth: true, crop: 1, fNumber: 1.4, focusPoint: focus,
                     focusTapped: t == 0, time: Double(t) / 30, colors: nil, personMask: mask, outputLongSide: 1440,
-                    personInstances: people, focalLength35mm: fl))
+                    personInstances: instances ? people : nil, focalLength35mm: fl))
             }
             return p
         }
@@ -629,14 +632,31 @@ final class BokehCoreTests: XCTestCase {
         // 4×：对焦 B，后面的 A 也明显虚化
         let back = plan(focus: (0.6, 0.4), fl: 100)
         XCTAssertLessThan(pct(back, 3.75), -0.5, "A")
-        // B 的深度只差一点、band 判断留下了它时，按镜头算会糊也要去掉
-        var parts = LiveFrameAnalyzer.instanceMasks(people, crop: 1, width: w, height: h)
-        parts.removeAll { $0.label == 1 }
-        var wideBand = SubjectMatteParameters()
-        wideBand.band = 0.6
-        XCTAssertNil(LiveFrameAnalyzer.otherPeople(parts, focusLabel: 1, depth: disparity, focusDisparity: 1 / 3.75 + off,
-                                                   norm: 1 / 3.75 + off, matte: wideBand))
-        XCTAssertNotNil(LiveFrameAnalyzer.otherPeople(parts, focusLabel: 1, depth: disparity, focusDisparity: 1 / 3.75 + off,
-                                                      norm: 1 / 3.75 + off, matte: wideBand, lens: tele.lens))
+        // 没有人像实例时（Vision 没给）：A、B 在遮罩里连成一片，B 也不能跟着 A 保持清晰
+        let noInstances = plan(focus: (0.25, 0.4), fl: 100, instances: false)
+        XCTAssertGreaterThan(noInstances.seeds?.person?[40, 48] ?? 0, 0.5, "对焦的 A")
+        XCTAssertLessThan(noInstances.seeds?.person?[96, 48] ?? 1, 0.05, "B")
+        XCTAssertLessThan(noInstances.seeds?.connect?[96, 48] ?? 1, 0.5, "B 也不在深度核心里")
+    }
+
+    /// 按人像遮罩修深度边缘：伸出脸外的眼镜框（深度测成了背景）拿回这个人的深度，
+    /// 人旁边一圈背景（测成了人）拿回背景的深度；人里面、远处的背景不动；遮罩不可信（画面变了）的地方不修
+    func testSegmentEdgeRepair() {
+        let w = 60, h = 40
+        var d = [Float](repeating: 0.25, count: w * h)                                    // 背景 4 m
+        var m = [Float](repeating: 0, count: w * h)
+        for y in 5..<40 { for x in 10..<30 { d[y * w + x] = 0.5; m[y * w + x] = 1 } }   // 人 2 m
+        for y in 15..<17 { for x in 30..<36 { m[y * w + x] = 1 } }                       // 眼镜框：深度还是背景
+        for y in 5..<40 { for x in 30..<32 where m[y * w + x] == 0 { d[y * w + x] = 0.5 } }   // 光晕
+        let depth = FloatMap(width: w, height: h, values: d), mask = FloatMap(width: w, height: h, values: m)
+        let out = SegmentEdgeRepair.repair(depth: depth, segments: mask, band: 2)
+        XCTAssertEqual(out[34, 16], 0.5, accuracy: 0.02, "眼镜框")
+        XCTAssertEqual(out[31, 25], 0.25, accuracy: 0.02, "光晕")
+        XCTAssertEqual(out[20, 25], 0.5, accuracy: 1e-6, "人里面不动")
+        XCTAssertEqual(out[50, 25], 0.25, accuracy: 1e-6, "远处背景不动")
+        var valid = [Float](repeating: 1, count: w * h)
+        for y in 0..<h { for x in 28..<w { valid[y * w + x] = 0 } }
+        let kept = SegmentEdgeRepair.repair(depth: depth, segments: mask, valid: valid, band: 2)
+        XCTAssertEqual(kept[34, 16], 0.25, accuracy: 1e-6, "画面变了的地方不修")
     }
 }

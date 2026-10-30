@@ -123,6 +123,23 @@ public struct LensParameters: Equatable {
         backSlope *= s
     }
 
+    /// 虚化半径不超过长边 limit（比例）的视差范围 [low, high]。虚化在对焦面两侧各自随视差差单调变大，
+    /// 所以「清不清晰」可以先算出这个范围，逐像素只比两次大小（不用每个像素都算一遍 tanh）
+    public func sharpDisparityRange(limit: Float) -> (low: Float, high: Float) {
+        let L = 1000, maxR = limit * Float(L)
+        func sharp(_ dd: Float) -> Bool { abs(signedBlurRadius(disparity: focusDisparity + dd, imageLongSide: L)) <= maxR }
+        func reach(_ sign: Float) -> Float {
+            var lo: Float = 0, hi: Float = 64
+            if sharp(sign * hi) { return hi }
+            for _ in 0..<40 {
+                let mid = (lo + hi) / 2
+                if sharp(sign * mid) { lo = mid } else { hi = mid }
+            }
+            return lo
+        }
+        return (focusDisparity - reach(-1), focusDisparity + reach(1))
+    }
+
     /// 相对对焦面的距离：(d − d_f) / 分母。正数 = 前景，−1 = 无穷远（绝对视差时）
     @inline(__always)
     public func relativeDistance(_ d: Float) -> Float {

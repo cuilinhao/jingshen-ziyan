@@ -36,13 +36,17 @@ public struct SubjectMatteParameters: Equatable {
     /// 物体分割（Vision 前景实例）里对焦的那个物体：深度在 ±band 以内的像素至少占这么多，才把整个物体当主体。
     /// 物体分割有时会把一大片（比如一路延伸到远处的桌面）当成一个物体，深度对不上就不用它
     public var objectDepthAgreement: Float = 0.6
-    /// 人像实例（Vision 的 VNGeneratePersonInstanceMaskRequest，每个人一个编号）里不是对焦的那个人：
-    /// 深度在 ±band 以内的像素至少占这么多，才和对焦的人一起保持清晰（站在旁边、和对焦的人差不多远的人）；
-    /// 不到的（对焦的人后面站着的同事）照常按深度虚化。人像遮罩本身分不出是谁，画面上挨着的人会连成一片
-    public var personDepthAgreement: Float = 0.5
-    /// 同上，不是对焦的那个人：按镜头算，虚化半径超过长边的这个比例（0.3%，1440 时约 4 像素）的像素占多数时，
-    /// 不管深度在不在 ±band 里都照常虚化。相对视差（双摄 / AI）对焦在远处时 band 很宽，近处的人只靠 band 去不掉
-    public var personMaxBlur: Float = 0.003
+    /// 「本来就清晰」的界线：按镜头算，虚化半径不超过长边的这个比例（0.15%，1440 宽约 2 像素）。
+    ///
+    /// 清晰还是虚化只由镜头（深度）决定，遮罩不能把镜头会明显虚化的东西拉清晰。所以：
+    ///  - 深度核心（和对焦点连通、直接拉到对焦面的那块）只收镜头算出来本来就清晰的像素，用来去掉深度噪声，
+    ///    不再用 ±band：±25% 是 1× 时定的，长焦时镜头的清晰范围窄得多，±25% 里连着的墙、桌面、后面的人
+    ///    会被整块拉清晰，一出范围又突然变糊（硬过渡）。1× 对焦 2 m 时 ±25% 的后沿正好是 0.15%，所以 1× 基本不变
+    ///  - 没有人像实例时，对焦的那个人只留人像遮罩里深度对得上的部分（见 LiveFrameAnalyzer.focusedPerson）
+    public var sharpLimit: Float = 0.0015
+    /// 按人像遮罩修深度边缘（SegmentEdgeRepair）：分界线两边各多宽的深度不可信（占深度图长边比例，0 = 不修；
+    /// 160 宽时 2 个像素）。LiDAR 的系统滤波一样会在人和远处背景之间抹出几个像素的过渡，用同一个宽度
+    public var edgeRepair: Float = 1.0 / 80
 
     public init() {}
 }
@@ -74,22 +78,42 @@ public enum SubjectMatte {
     ///   - focusPoint: 对焦点（归一化坐标）
     ///   - scale: 相对距离的分母（LensParameters.relativeScale），nil = 对焦视差
     ///   - personMask: 人像分割（同一块画面，任意分辨率）
+    ///   - lens: 这一帧的镜头。给了就按镜头定深度核心（虚化半径 ≤ sharpLimit，见 SubjectMatteParameters.sharpLimit）；
+    ///     nil = 旧规则（±band）
+    ///   - sharpPeople: 别的人身上按深度本来就清晰的像素（和 depth 一样大，0…1，见 LiveFrameAnalyzer.sharpPeople）：
+    ///     和对焦的人一样整片锁在对焦面，细的眼镜框、头发渲染时不会再被深度对齐抹糊
     public static func seeds(depth: FloatMap, colors: PlanarImage?, focusDisparity df: Float,
                              focusPoint: (Float, Float)?, parameters p: SubjectMatteParameters,
-                             scale: Float? = nil, personMask: FloatMap? = nil) -> SubjectSeeds {
+                             scale: Float? = nil, personMask: FloatMap? = nil,
+                             lens: LensParameters? = nil, sharpPeople: FloatMap? = nil) -> SubjectSeeds {
         let w = depth.width, h = depth.height, n = w * h
         var result = SubjectSeeds()
         guard df > 0, n > 0 else { return result }
         let d = depth.values
         let norm = max(scale ?? df, 1e-3)
-        var core = [Float](repeating: 0, count: n)
-        for i in 0..<n where abs((d[i] - df) / norm) < p.band { core[i] = 1 }
+        // 深度核心：±band 以内，并且按镜头算本来就清晰（渲染那边的深度核心 = ±band 以内 且 connect ≥ 0.5，
+        // 所以这里的核心必须是 ±band 的子集）
+        let bandCore = sharpCore(d, focusDisparity: df, norm: norm, band: p.band, lens: nil, limit: 0)
+        var core = lens.map { sharpCore(d, focusDisparity: df, norm: norm, band: p.band, lens: $0, limit: p.sharpLimit) }
+            ?? bandCore
+        var component = p.connectToFocus ? focusPoint.flatMap {
+            connectedComponent(core, width: w, height: h, near: $0, searchFraction: p.seedSearch)
+        } : nil
+        if component == nil, p.connectToFocus, lens != nil, let fp = focusPoint {
+            // 对焦点附近一个本来就清晰的像素都没有（深度噪声大）：退回 ±band
+            core = bandCore
+            component = connectedComponent(core, width: w, height: h, near: fp, searchFraction: p.seedSearch)
+        }
         var connected = core
-        if p.connectToFocus, let fp = focusPoint, let c = connectedComponent(core, width: w, height: h, near: fp,
-                                                                            searchFraction: p.seedSearch) {
+        if let c = component {
             connected = c
-            // 膨胀 1 像素：放大到低分辨率后，细化过的深度边缘可能比这里宽一点
-            result.connect = FloatMap(width: w, height: h, values: dilateBinary(c, width: w, height: h, radius: 1))
+            // 旧规则（±band）膨胀 1 像素：放大到低分辨率后，细化过的深度边缘可能比这里宽一点。
+            // 按镜头定核心时不膨胀：长焦时一个深度像素的桌面就差好几档虚化，多拉清晰一圈，过渡就变硬（边缘交给颜色补边）
+            let grow = lens != nil && core != bandCore ? 0 : 1
+            result.connect = FloatMap(width: w, height: h, values: dilateBinary(c, width: w, height: h, radius: grow))
+        } else if lens != nil {
+            // 不做连通限制时也要把按镜头定的范围交给渲染
+            result.connect = FloatMap(width: w, height: h, values: dilateBinary(core, width: w, height: h, radius: 1))
         }
         var extra = [Float](repeating: 0, count: n)
         var hasExtra = false
@@ -98,12 +122,35 @@ public enum SubjectMatte {
                                     image: colors, width: w, height: h, fraction: p.colorGrowth)
             for i in 0..<n where grown[i] > 0.5 { extra[i] = 1; hasExtra = true }
         }
-        if let mask = personMask, let person = personRegion(mask, width: w, height: h, focusPoint: focusPoint) {
+        var person = personMask.flatMap { personRegion($0, width: w, height: h, focusPoint: focusPoint) }
+        if let also = sharpPeople, also.width == w, also.height == h, also.values.contains(where: { $0 > 0.5 }) {
+            var v = person ?? [Float](repeating: 0, count: n)
+            for i in 0..<n { v[i] = max(v[i], also.values[i]) }
+            person = v
+        }
+        if let person {
             result.person = FloatMap(width: w, height: h, values: person)
             for i in 0..<n where person[i] > 0.5 { extra[i] = 1; hasExtra = true }
         }
         if hasExtra { result.extra = FloatMap(width: w, height: h, values: extra) }
         return result
+    }
+
+    /// 深度核心候选：|相对距离| < band，并且（给了镜头时）虚化半径不超过长边的 limit
+    static func sharpCore(_ d: [Float], focusDisparity df: Float, norm: Float, band: Float,
+                          lens: LensParameters?, limit: Float) -> [Float] {
+        var core = [Float](repeating: 0, count: d.count)
+        // ±band 和镜头的清晰范围都是视差区间，取交集后逐像素只比两次大小
+        var lo = df - band * norm, hi = df + band * norm
+        if let lens {
+            let r = lens.sharpDisparityRange(limit: limit)
+            lo = max(lo, r.low); hi = min(hi, r.high)
+        }
+        d.withUnsafeBufferPointer { dp in
+        core.withUnsafeMutableBufferPointer { cp in
+            for i in 0..<dp.count where dp[i] > lo && dp[i] < hi { cp[i] = 1 }
+        }}
+        return core
     }
 
     /// 低分辨率上：按种子定出主体核心，彩色引导滤波得到遮罩 α，修正视差。
