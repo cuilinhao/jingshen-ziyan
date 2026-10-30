@@ -41,8 +41,10 @@ public struct CapturedDepthPhoto: Identifiable {
 ///  - 松手或点数字约 0.3 秒后，换到这个倍率最合适的相机（LensCatalog）：
 ///      0.5×–0.99× 超广角 + AI 深度，1×–1.99× LiDAR，2×–4.16× 双摄 2×，100mm 双摄长焦
 ///  - 两个深度倍率点之间，画面和深度图都从中间裁（相机本身的倍率一旦打开就不再改）
-///  - 换相机期间保留最后一帧（继续跟着倍率放大），新相机出了 3 帧并且有深度（最多 0.8 秒）后，
-///    0.2 秒淡入
+///  - 换相机期间保留最后一帧（继续跟着倍率放大），新相机出了 2 帧就 0.2 秒淡入；这时深度还没到就先显示原图，
+///    深度到了再 0.2 秒淡入虚化（previewBeforeDepth；关掉则像以前一样一直等深度，最多 0.8 秒）
+///  - 换成另一个相机时，拆旧、建新放在同一次 begin/commitConfiguration 里，拍照输出留在会话里不重建；
+///    每次换相机各阶段的耗时打印到控制台（[DepthBokeh] 换 …），showSwitchTiming 时也在状态行显示 2 秒
 ///  - 点数字时预览在 0.3 秒内平滑变焦过去
 ///
 /// 每一帧：CPU 上的 LiveFrameAnalyzer 在深度图分辨率上做对焦、主体种子这些小活，GPU（MetalBokehRenderer）
@@ -100,6 +102,14 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
     public var minSubjectDistance: Float = 0.30
     /// 拍照后给编辑器的图像长边
     public var photoLongSide = 3024
+    /// 换相机时新相机已经出画面、深度还没到：先显示没虚化的新画面（画面不停住），深度到了 0.2 秒淡入虚化。
+    /// false = 以前的做法：一直停在上一帧，等新相机出帧并且深度到了（最多 0.8 秒）再淡入
+    public var previewBeforeDepth = true
+    /// 每次换相机后在状态行上显示 2 秒各阶段耗时（控制台总会打印）。排查切镜头卡顿用，不需要时关掉
+    public var showSwitchTiming = true
+    /// 换成另一个相机时拆旧、建新在同一次 begin/commitConfiguration 里，拍照输出不拆。
+    /// false = 以前的做法（先 commit 一个空会话，所有输出都拆掉重建），用来对比耗时或者真机上出问题时退回去
+    public var rebuildInOneTransaction = true
 
     // MARK: - 渲染参数（UI 线程写、数据线程读，用锁保护）
     private let paramLock = NSLock()
@@ -260,6 +270,12 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
         return glideFrom * pow(glideTo / glideFrom, eased)
     }
 
+    /// 平滑变焦在某个时刻的倍率（没在平滑变焦时就是刻度盘的倍率）。任意线程
+    private func glideZoom(at time: CFTimeInterval) -> CGFloat {
+        paramLock.lock(); defer { paramLock.unlock() }
+        return glideValueLocked(at: time)
+    }
+
     /// 当前传感器画面的显示方向（镜像由显示层单独处理）。
     @Published public private(set) var previewOrientation: UIImage.Orientation = .right
 
@@ -359,6 +375,33 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
     private var routeReady = true
     private var routeFrames = 0
     private var routeStart: CFTimeInterval = 0
+    /// 新相机的画面已经显示了，但深度还没到（显示的是原图）：深度一到就淡入虚化，在那之前快门不可用
+    private var depthFadePending = false
+    /// 这次换相机还在计时
+    private var routeTracing = false
+    /// 最近处理帧的平均间隔（秒）：往广的方向平滑变焦时按它提前出图
+    private var frameInterval: CFTimeInterval = 1.0 / 30
+    private var lastFrameStart: CFTimeInterval = 0
+    /// 新相机出几帧以后才替换屏幕上保留的最后一帧（头一两帧曝光、白平衡可能还没稳）
+    private static let routeSettleFrames = 2
+    /// 换相机后最多等深度多久（秒）
+    private static let routeDepthTimeout: CFTimeInterval = 0.8
+
+    // MARK: - 换镜头计时（排查卡顿用）
+    /// 一次换相机各阶段的时间点（CACurrentMediaTime）。主线程开始、sessionQueue 配置、dataQueue 收帧，traceLock 保护
+    private struct SwitchTrace {
+        var label: String
+        var requested: CFTimeInterval
+        var configStart: CFTimeInterval = 0
+        var rebuilt = false
+        var torndown: CFTimeInterval = 0
+        var committed: CFTimeInterval = 0
+        var firstVideo: CFTimeInterval = 0
+        var firstDepth: CFTimeInterval = 0
+        var firstShown: CFTimeInterval = 0
+    }
+    private let traceLock = NSLock()
+    private var trace: SwitchTrace?
     private var lastPublishedZoom: CGFloat = 1
     private var reportedSource: DepthSource = .starting
     // 拍照时用：最近一帧的裁切
@@ -526,6 +569,7 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
         glideToken &+= 1
         isZoomGliding = false
         showZoom(targetZoom, glide: false)
+        beginTrace(targetFront ? "前置" : "后置")
         sessionQueue.async {
             let applied = self.configureSession(displayZoom: targetZoom, front: targetFront, revision: revision)
             let restored = applied == nil
@@ -635,6 +679,7 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
         zoomOperationInFlight = true
         let previousZoom = activeDisplayZoom
         let front = isFrontCamera
+        beginTrace(Self.zoomText(target) + "×")
         sessionQueue.async {
             let applied = self.configureSession(displayZoom: target, front: front, revision: revision)
             let restored = applied == nil ? self.configureSession(displayZoom: previousZoom, front: front, revision: revision) : nil
@@ -745,6 +790,7 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
     /// 按 LensCatalog 给的顺序逐个尝试，打开这个倍率最合适的相机。返回打开的那条线路，都失败返回 nil
     @discardableResult
     private func configureSession(displayZoom: CGFloat, front: Bool = false, revision: Int = 0) -> CameraPlan? {
+        traceMark { if $0.configStart == 0 { $0.configStart = CACurrentMediaTime() } }
         let plans = front ? LensCatalog.frontPlans() : LensCatalog.settledPlans(displayZoom: displayZoom)
         for plan in plans where apply(plan, revision: revision) {
             return plan
@@ -777,6 +823,7 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
             // 同一个相机、同一个倍率（松手后继续裁当前画面）：保留深度历史，只等下一帧让快门恢复
             if let zoom = plan.zoom, abs(device.videoZoomFactor - zoom) <= 0.0001 {
                 activePlan = plan
+                cancelTrace()   // 相机和倍率都没变（松手后继续裁当前画面）：没有换镜头，不计时
                 dataQueue.sync {
                     self.streamZoom = plan.streamZoom
                     self.frameZoomRevision = revision
@@ -809,11 +856,15 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
                 return p
             }
             if let focus { focusDevice(at: focus) }
+            traceMark { $0.committed = CACurrentMediaTime() }
             return true
         }
 
-        // 1) 先单独拆掉旧的。同一个虚拟相机可能服务两颗镜头（比如双摄的 1× 和长焦），
-        //    改倍率之前旧的深度设置必须先去掉：开着深度时倍率有限制
+        // 1) 拆掉旧的。换成另一个相机时，拆旧、建新放在同一次 begin/commitConfiguration 里，相机管线只重建一次
+        //    （以前先 commit 一个空会话、再 commit 新的：旧相机先完全停下，新相机再从头起，中间画面一直停着）。
+        //    同一个虚拟相机换镜头（比如双摄的 1× 和长焦）才先单独 commit 拆掉：开着深度时倍率有限制，
+        //    改倍率之前旧的深度设置必须先去掉
+        let sameDevice = self.device?.uniqueID == device.uniqueID && !session.inputs.isEmpty
         session.beginConfiguration()
         synchronizer?.setDelegate(nil, queue: nil)
         synchronizer = nil
@@ -821,11 +872,16 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
         photoOutput.isDepthDataDeliveryEnabled = false
         videoOutput.setSampleBufferDelegate(nil, queue: nil)
         for input in session.inputs { session.removeInput(input) }
-        for output in session.outputs { session.removeOutput(output) }
-        session.commitConfiguration()
+        // 拍照输出留在会话里（换了输入系统会自动重新连上），不用每次拆掉、重建整条拍照管线
+        let oneTransaction = rebuildInOneTransaction
+        for output in session.outputs where !(oneTransaction && output === photoOutput) { session.removeOutput(output) }
+        if sameDevice || !oneTransaction {
+            session.commitConfiguration()
+            session.beginConfiguration()
+        }
+        traceMark { $0.rebuilt = true; $0.torndown = CACurrentMediaTime() }
 
         // 2) 建新的
-        session.beginConfiguration()
         videoOutput = AVCaptureVideoDataOutput()
         depthOutput = AVCaptureDepthDataOutput()
         // 全程 sRGB：预览、渲染和照片的颜色一致（ImageBridge 按 sRGB 解码）
@@ -900,10 +956,12 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
                 device.unlockForConfiguration()
             }
             useDepth = device.activeDepthDataFormat != nil
+            // 深度帧率在 commit 之前设好：commit 之后再改，正在跑的相机管线还要再重配一次
+            if useDepth { capDepthFrameRate(device) }
         }
 
-        var photoReady = false
-        if session.canAddOutput(photoOutput) {
+        var photoReady = session.outputs.contains(photoOutput)
+        if !photoReady, session.canAddOutput(photoOutput) {
             session.addOutput(photoOutput)
             photoReady = true
         }
@@ -1006,10 +1064,12 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
         }
         activePlan = plan
         DispatchQueue.main.async { self.previewOrientation = ImageBridge.uiOrientation(orientation) }
+        // commit 之前已经设过；只有 commit 把它重置了才会真的再设一次
         if useDepth { capDepthFrameRate(device) }
         if let focus { focusDevice(at: focus) }
         // 没有深度硬件的镜头用 AI 深度：现在加载（或下载）模型
         if !depthOn { DepthModelStore.shared.prepare() }
+        traceMark { $0.committed = CACurrentMediaTime() }
         return true
     }
 
@@ -1035,9 +1095,13 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
     private func capDepthFrameRate(_ device: AVCaptureDevice) {
         guard let depthFormat = device.activeDepthDataFormat,
               let range = depthFormat.videoSupportedFrameRateRanges.max(by: { $0.maxFrameRate < $1.maxFrameRate }),
-              range.maxFrameRate > 0, (try? device.lockForConfiguration()) != nil else { return }
-        device.activeDepthDataMinFrameDuration = CMTimeMinimum(
+              range.maxFrameRate > 0 else { return }
+        let target = CMTimeMinimum(
             CMTimeMaximum(CMTime(value: 1, timescale: 30), range.minFrameDuration), range.maxFrameDuration)
+        // 已经是这个值就不动：会话在跑的时候改它，相机管线会重配一次
+        guard CMTimeCompare(device.activeDepthDataMinFrameDuration, target) != 0,
+              (try? device.lockForConfiguration()) != nil else { return }
+        device.activeDepthDataMinFrameDuration = target
         device.unlockForConfiguration()
     }
 
@@ -1056,6 +1120,8 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
         notifyZoomFrame = true
         routeReady = false
         routeFrames = 0
+        depthFadePending = false
+        routeTracing = true
         reportedSource = .starting
 
         let ratio = newStreamZoom / max(streamZoom, 0.01)
@@ -1084,6 +1150,55 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
 
     private func setStatus(_ text: String) {
         DispatchQueue.main.async { self.statusText = text }
+    }
+
+    // MARK: - 换镜头计时
+
+    /// 主线程：开始给一次换相机计时
+    private func beginTrace(_ label: String) {
+        traceLock.lock()
+        trace = SwitchTrace(label: label, requested: CACurrentMediaTime())
+        traceLock.unlock()
+    }
+
+    private func cancelTrace() {
+        traceLock.lock()
+        trace = nil
+        traceLock.unlock()
+    }
+
+    /// 任意线程：记下这次换相机的某个时间点（没在计时就什么都不做）
+    private func traceMark(_ update: (inout SwitchTrace) -> Void) {
+        traceLock.lock()
+        if trace != nil { update(&trace!) }
+        traceLock.unlock()
+    }
+
+    /// dataQueue：新相机的画面带着深度显示出来了（或者等深度超时），打印这次换相机各阶段的耗时（毫秒）。
+    ///   画面停 = 点下去到屏幕换成新相机的画面；完成 = 到虚化也出来
+    ///   配置 = 点下去到 sessionQueue 上拆旧、建新、commit 完（相机管线停下再起）；出帧 = commit 完到新相机第一帧；
+    ///   等深度 = 新相机第一帧到第一张深度
+    private func finishTrace(now: CFTimeInterval) {
+        traceLock.lock()
+        let finished = trace
+        trace = nil
+        traceLock.unlock()
+        guard let t = finished, t.firstVideo > 0 else { return }
+        func ms(_ from: CFTimeInterval, _ to: CFTimeInterval) -> String {
+            from > 0 && to >= from ? String(Int(((to - from) * 1000).rounded())) : "–"
+        }
+        let depthWait = t.firstDepth > 0 ? ms(t.firstVideo, max(t.firstDepth, t.firstVideo)) : "没到"
+        let short = "换 \(t.label)：画面停 \(ms(t.requested, t.firstShown)) · 完成 \(ms(t.requested, now)) ms ｜ "
+            + "配置 \(ms(t.requested, t.committed)) · 出帧 \(ms(t.committed, t.firstVideo)) · 等深度 \(depthWait)"
+        var detail = "排队 \(ms(t.requested, t.configStart))"
+        if t.rebuilt {
+            detail += " · 拆旧 \(ms(t.configStart, t.torndown)) · 建新+commit \(ms(t.torndown, t.committed))"
+        } else {
+            detail += " · 只改倍率 \(ms(t.configStart, t.committed))"
+        }
+        print("[DepthBokeh] \(short)（\(detail)）")
+        guard showSwitchTiming else { return }
+        DispatchQueue.main.async { self.showStatusMessage(short) }
     }
 
     /// 临时提示（2 秒后恢复正常的状态行）
@@ -1163,6 +1278,11 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
         // GPU 上最多 2 帧：再来就丢掉这一帧（延迟不累积，也不白算）
         guard framesInFlight < 2 else { return }
         let t0 = CACurrentMediaTime()
+        if lastFrameStart > 0 {
+            let dt = t0 - lastFrameStart
+            if dt > 0.005 && dt < 0.2 { frameInterval += (dt - frameInterval) * 0.2 }
+        }
+        lastFrameStart = t0
 
         // 省电：画面静止一会儿以后隔帧处理；系统发热时处理得更少
         let power = powerLevel()
@@ -1218,16 +1338,43 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
         }
         let source: DepthSource = hardwareFrame ? hardwareSource : (disparity != nil ? .monocular : .unavailable)
 
-        // 3. 换相机后：新画面值得显示之前（曝光、白平衡稳定几帧，深度到了，最多 0.8 秒）保留屏幕上的最后一帧
+        // 3. 换相机后：新相机出了 routeSettleFrames 帧（曝光、白平衡稳一点）才替换屏幕上保留的最后一帧。
+        //    previewBeforeDepth 时不等深度：先显示没虚化的新画面，深度到了再淡入虚化（depthFadePending）；
+        //    关掉时像以前一样等到深度到了（最多 routeDepthTimeout）
         let now = CACurrentMediaTime()
+        if routeTracing, disparity != nil { traceMark { if $0.firstDepth == 0 { $0.firstDepth = now } } }
         var firstRouteFrame = false
         if !routeReady {
             routeFrames += 1
-            if routeFrames == 1 { routeStart = now }
-            routeReady = (routeFrames >= 3 && disparity != nil) || now - routeStart > 0.8
+            if routeFrames == 1 {
+                routeStart = now
+                traceMark { $0.firstVideo = now }
+            }
+            let timedOut = now - routeStart > Self.routeDepthTimeout
+            routeReady = (routeFrames >= Self.routeSettleFrames && (disparity != nil || previewBeforeDepth)) || timedOut
             guard routeReady else { return }
             firstRouteFrame = true
+            depthFadePending = disparity == nil && !timedOut
         }
+        // 先显示的是原图：深度到了的这一帧淡入虚化（等太久就不等了，比如太暗出不了深度）
+        var fadeToDepth = false
+        if depthFadePending {
+            if disparity != nil {
+                depthFadePending = false
+                fadeToDepth = true
+            } else if now - routeStart > Self.routeDepthTimeout {
+                depthFadePending = false
+            }
+        }
+        if routeTracing {
+            if firstRouteFrame { traceMark { $0.firstShown = now } }
+            if !depthFadePending {
+                routeTracing = false
+                finishTrace(now: now)
+            }
+        }
+        // 屏幕上原来那一帧要淡出：换相机后的第一帧，或者从原图换成带虚化的第一帧
+        let crossfade = firstRouteFrame || fadeToDepth
 
         // 4. 数码变焦：从相机画面中间裁到刻度盘的倍率
         var zoomNow = previewZoom
@@ -1240,6 +1387,10 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
             paramLock.unlock()
             DispatchQueue.main.async { self.markGliding() }
         }
+        // 往广的方向平滑变焦时，屏幕只能把帧再放大、不能变广，而帧是按相机帧率来的，画面会一跳一跳。
+        // 按下一帧大概到的时候（frameInterval + GPU）的倍率出图，两帧之间由屏幕往上补，变焦就跟着屏幕刷新走
+        let ahead = glideZoom(at: now + min(frameInterval + 0.012, 0.12))
+        if ahead < zoomNow { zoomNow = ahead }
         let crop = max(1, zoomNow / max(streamZoom, 0.01))
         let frameZoom = streamZoom * crop
         lastFrameCrop = crop
@@ -1254,7 +1405,7 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
         let region = MetalBokehRenderer.SourceRegion(x: Float((Double(W) - cw) / 2), y: Float((Double(H) - ch) / 2),
                                                      width: Float(cw), height: Float(ch))
         guard let camera = cameraTexture(pixelBuffer),
-              let output = nextOutput(width: outW, height: outH, fresh: firstRouteFrame),
+              let output = nextOutput(width: outW, height: outH, fresh: crossfade),
               let cb = gpu.commandQueue.makeCommandBuffer() else { return }
         cb.label = "预览帧"
 
@@ -1273,7 +1424,7 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
             let segmentationOn = keepSubjectSharp && useSegmentation
             let locked = focusLocked
             if segmentationOn {
-                if tapped || firstRouteFrame { segmenter.focusChanged() }
+                if tapped || crossfade { segmenter.focusChanged() }
                 segmenter.update(with: pixelBuffer, now: t0, moving: sceneMoving, personChanged: personMaskStale,
                                  objectChanged: objectMaskStale, focusPoint: (Float(p.x), Float(p.y)),
                                  orientation: frameOrientation)
@@ -1348,7 +1499,7 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
             let inputsChanged = lastRenderInputs.map { $0.fNumber != fNumber || abs($0.zoom - zoomNow) > 0.0005 } ?? true
             lastRenderInputs = (fNumber, zoomNow)
             let still = plan.cameraShift < 0.5 && !plan.cameraMoving && plan.changedFraction < 0.005
-                && !tapped && !inputsChanged && !firstRouteFrame
+                && !tapped && !inputsChanged && !crossfade
             if !still {
                 stillSince = nil
             } else if stillSince == nil {
@@ -1364,7 +1515,7 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
         }
 
         framesInFlight += 1
-        let holdPrevious = firstRouteFrame
+        let holdPrevious = crossfade
         let rotation = frameRotation
         let mirrored = frameMirrored
         cb.addCompletedHandler { [weak self] buffer in
@@ -1381,7 +1532,9 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
             }
         }
         cb.commit()
-        publish(zoom: frameZoom, crop: crop, source: source, text: text)
+        // 还在等深度（显示的是原图）：深度来源标签先不变，快门先不恢复
+        publish(zoom: frameZoom, crop: crop, source: depthFadePending ? .starting : source, text: text,
+                settled: !depthFadePending)
     }
 
     /// 状态行：倍率、分辨率、每帧 CPU / GPU 耗时、实际帧率
@@ -1431,12 +1584,13 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
     }
 
     /// dataQueue → 主线程：这一帧的状态（画面本身由 GPU 算完后直接交给 PreviewDisplay）
-    private func publish(zoom: CGFloat, crop: CGFloat, source: DepthSource, text: String) {
+    /// settled = false：换相机后还在等深度（屏幕上是原图），先不让快门恢复
+    private func publish(zoom: CGFloat, crop: CGFloat, source: DepthSource, text: String, settled: Bool = true) {
         lastPublishedZoom = zoom
         let sourceChanged = reportedSource != source
         reportedSource = source
-        let notify = notifyZoomFrame
-        notifyZoomFrame = false
+        let notify = notifyZoomFrame && settled
+        if notify { notifyZoomFrame = false }
         let revision = frameZoomRevision
         DispatchQueue.main.async {
             if !self.hasPreviewFrame { self.hasPreviewFrame = true }

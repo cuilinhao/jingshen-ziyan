@@ -46,12 +46,15 @@ public final class PreviewDisplay: @unchecked Sendable {   // 可变状态都由
         requestRedraw()
     }
 
-    /// 任意线程：显示一帧。holdPrevious = 换相机后的第一帧，屏幕上原来那一帧淡出
+    /// 任意线程：显示一帧。holdPrevious = 换相机后的第一帧（或者从原图换成带虚化的第一帧），屏幕上原来那一帧淡出
     func show(_ texture: MTLTexture, zoom: CGFloat, holdPrevious: Bool, rotation: Int = 90, mirrored: Bool = false) {
         lock.lock()
         let now = CACurrentMediaTime()
         if holdPrevious, let old = current {
-            held = (old, now)
+            // 上一段淡出还没走完（比如新相机先出了原图，紧接着深度到了）：让它接着淡完，不从中间换掉，免得闪一下
+            if held.map({ now - $0.start >= Self.fadeDuration }) ?? true {
+                held = (old, now)
+            }
             animateUntil = max(animateUntil, now + Self.fadeDuration + 0.05)
         }
         current = Shown(texture: texture, zoom: zoom, rotation: rotation, mirrored: mirrored)
