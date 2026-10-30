@@ -36,6 +36,8 @@ public struct LensParameters: Equatable {
     /// （2 的话对焦面前后一点点就糊到上限，双摄视差的噪声也被放大 17 倍）。觉得长焦虚化还不够可以往 1.5 调
     // linhao todo 修改长焦虚化的值
     // 如果觉得 4× 虚化还不够强，可以把 Lens.swift 里的 focalScalingExponent 从 1 调到 1.5。真实镜头物理上是 2
+    // 注意：长焦当主镜头时双摄视差的数值只有真实 1/米 的约 1/4（rec-20261029-183222 实测，主摄段约等于真实值），
+    // 所以这个指数在 4× 上实际作用在 1/4 的视差差上；上面「1 更接近系统相机」也是在这个单位下比的。见 README「4× 长焦」
     public static let focalScalingExponent: Float = 1 + 0.35
 
     public enum Model: Equatable { case system, thinLens }

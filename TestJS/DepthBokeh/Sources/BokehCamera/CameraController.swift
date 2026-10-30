@@ -30,6 +30,8 @@ public struct CapturedDepthPhoto: Identifiable {
     public var personInstances: FloatMap? = nil
     /// 拍照时画面的 35mm 等效焦距（毫米，含裁切）：长焦的虚化按它放大，和预览一致
     public var focalLength35mm: Float? = nil
+    /// 拍照时锁定了对焦：锁定的对焦视差（重新构图以后，对焦点上可能已经是别的东西）。编辑器里重新点了对焦点就不用它
+    public var lockedFocusDisparity: Float? = nil
 }
 
 /// 实时景深相机。
@@ -66,6 +68,10 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
     @Published public private(set) var depthSourceLabel = ""
     /// 点数字后的 0.3 秒平滑变焦进行中（界面在这段时间按显示刷新率更新）
     @Published public private(set) var isZoomGliding = false
+    /// 调试数据录制（DebugRecorder）：正在录、录制状态文字、录好打包的 zip（AirDrop 用）
+    @Published public private(set) var isDebugRecording = false
+    @Published public private(set) var debugRecordingStatus = ""
+    @Published public private(set) var debugRecordingZip: URL?
 
     // MARK: - 变焦（界面和交互复用 DepthBokehCamera 2 的 ContinuousZoomControl / ZoomScale）
     /// 刻度盘上的倍率（1× = 主摄 24mm）
@@ -99,6 +105,7 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
     private let paramLock = NSLock()
     private var _fNumber: Float = 2.8
     private var _useSegmentation = true
+    private var _focusLocked = false
     /// 对焦点：当前相机画面（未裁切）里的归一化坐标，传感器方向
     private var _focusPoint = CGPoint(x: 0.5, y: 0.5)
     private var focusResetPending = false
@@ -126,6 +133,116 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
             paramLock.unlock()
             if changed { segmenter.reset() }
         }
+    }
+
+    /// 锁定对焦：点一下对焦，对焦动画走完（约 0.4 秒）以后对焦距离就固定住，不再按对焦点重新测，镜头的对焦也锁住；
+    /// 主体走开、手机移动、重新构图都不变，直到再点一次或者关掉。拍照也用锁定的对焦。
+    /// 打开时锁住此刻的对焦；关掉以后回到「一直跟着对焦点测」
+    public var focusLocked: Bool {
+        get { paramLock.lock(); defer { paramLock.unlock() }; return _focusLocked }
+        set {
+            paramLock.lock()
+            let changed = _focusLocked != newValue
+            _focusLocked = newValue
+            let point = _focusPoint
+            paramLock.unlock()
+            guard changed else { return }
+            sessionQueue.async { self.lockDeviceFocus(newValue, point: point) }
+        }
+    }
+
+    /// sessionQueue：镜头的对焦锁住 / 恢复
+    private func lockDeviceFocus(_ locked: Bool, point: CGPoint) {
+        if !locked {
+            // 关掉：点过对焦就在那儿再对一次，没点过回到连续自动对焦
+            if point == CGPoint(x: 0.5, y: 0.5) { focusDeviceAtCenter() } else { focusDevice(at: point) }
+            return
+        }
+        guard let d = device, (try? d.lockForConfiguration()) != nil else { return }
+        Self.setFaceDrivenFocus(false, on: d)
+        // 点按对焦用的是单次自动对焦（对完就停），这里只需要把连续自动对焦停下来
+        if d.focusMode == .continuousAutoFocus && d.isFocusModeSupported(.locked) { d.focusMode = .locked }
+        d.unlockForConfiguration()
+    }
+
+    /// 录一段调试数据（主线程）：先按这条线路平时的深度滤波设置录 3 秒，再换成相反的设置录 2 秒（平时开的就关掉，
+    /// 平时关的就打开），然后恢复、写文件、打包。这样任何焦段录一次都能对比系统滤波补得对不对。
+    /// 录的时候手机尽量别动，保持出问题时的对焦和焦段。文件在 App 的 Documents/DebugRecordings 里（「文件」App 能看到），
+    /// 打好的 zip 可以直接 AirDrop 到 Mac
+    public func startDebugRecording() {
+        dispatchPrecondition(condition: .onQueue(.main))
+        guard !isDebugRecording, let rec = DebugRecorder() else { return }
+        isDebugRecording = true
+        debugRecordingZip = nil
+        debugRecordingStatus = "录制中…"
+        sessionQueue.async {
+            let normal = self.depthFiltering
+            func label(_ on: Bool) -> String { on ? "深度滤波开" : "深度滤波关" }
+            rec.mark(normal ? "start_filter_on" : "start_filter_off")
+            self.dataQueue.async { self.recorder = rec }
+            DispatchQueue.main.async { self.debugRecordingStatus = "录制中 · \(label(normal))（3 秒）" }
+            DispatchQueue.main.asyncAfter(deadline: .now() + Self.recordNormalSeconds) {
+                self.debugRecordingStatus = "录制中 · \(label(!normal))（2 秒）"
+                self.sessionQueue.async {
+                    self.depthOutput.isFilteringEnabled = !normal
+                    rec.mark(normal ? "filter_off" : "filter_on")
+                }
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + Self.recordNormalSeconds + Self.recordSwappedSeconds) {
+                self.debugRecordingStatus = "保存中…"
+                self.sessionQueue.async {
+                    self.depthOutput.isFilteringEnabled = self.depthFiltering
+                    rec.mark("filter_restored")
+                    let meta = self.recordingMeta()
+                    self.dataQueue.async {
+                        self.recorder = nil
+                        rec.finish(meta: meta) { zip in
+                            self.isDebugRecording = false
+                            self.debugRecordingZip = zip
+                            self.debugRecordingStatus = zip != nil ? "已保存 \(rec.folder.lastPathComponent)"
+                                : "已保存 \(rec.folder.lastPathComponent)（打包失败，可在「文件」App 里取）"
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// sessionQueue：录制的元数据（机型、系统、相机设备和格式）
+    private func recordingMeta() -> [String: Any] {
+        var sys = utsname()
+        uname(&sys)
+        let model = withUnsafeBytes(of: &sys.machine) { raw in
+            String(decoding: raw.prefix { $0 != 0 }, as: UTF8.self)
+        }
+        var meta: [String: Any] = [
+            "model": model,
+            "system": ProcessInfo.processInfo.operatingSystemVersionString,
+            "previewLongSide": previewLongSide,
+            "blurDownscale": blurDownscale,
+            "lens": ["referenceFocalLength": Double(LensParameters.referenceFocalLength),
+                     "focalScalingExponent": Double(LensParameters.focalScalingExponent),
+                     "defaultBlurK": Double(LensParameters.defaultBlurK)],
+            // 前一段按线路平时的设置（normalDepthFiltering），后一段相反
+            "recordNormalSeconds": Self.recordNormalSeconds,
+            "recordSwappedSeconds": Self.recordSwappedSeconds,
+            "normalDepthFiltering": depthFiltering,
+        ]
+        if let d = device {
+            meta["device"] = [
+                "type": d.deviceType.rawValue,
+                "name": d.localizedName,
+                "videoZoomFactor": Double(d.videoZoomFactor),
+                "activePrimaryConstituent": d.activePrimaryConstituent?.deviceType.rawValue ?? "",
+                "constituents": d.constituentDevices.map { $0.deviceType.rawValue },
+                "switchOverZoomFactors": d.virtualDeviceSwitchOverVideoZoomFactors.map { $0.doubleValue },
+                "format": "\(d.activeFormat)",
+                "depthFormat": d.activeDepthDataFormat.map { "\($0)" } ?? "",
+                "lensPosition": Double(d.lensPosition),
+                "focusMode": d.focusMode.rawValue,
+            ] as [String: Any]
+        }
+        return meta
     }
 
     /// 预览此刻应该显示的倍率（点数字后的平滑变焦过程中介于新旧倍率之间）。任意线程
@@ -244,6 +361,16 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
     private var reportedSource: DepthSource = .starting
     // 拍照时用：最近一帧的裁切
     private var lastFrameCrop: CGFloat = 1
+    /// 正在录的调试数据（dataQueue）
+    private var recorder: DebugRecorder?
+    /// 调试录制：先按这条线路平时的深度滤波设置录几秒，再换成相反的设置录几秒（对比系统滤波补洞补得对不对）
+    private static let recordNormalSeconds: Double = 3
+    private static let recordSwappedSeconds: Double = 2
+    /// 当前线路用不用系统的深度滤波（sessionQueue）。拍照的深度跟预览一致
+    private var depthFiltering = true
+    /// 最近一帧的对焦视差、那一帧是不是锁定了对焦（拍照用，dataQueue）
+    private var lastFocusDisparity: Float?
+    private var lastFocusWasLocked = false
 
     public override init() {
         display = PreviewDisplay()
@@ -571,7 +698,8 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
             if dims.width > 0 && dims.height > 0 { settings.maxPhotoDimensions = dims }
             if self.photoOutput.isDepthDataDeliveryEnabled {
                 settings.isDepthDataDeliveryEnabled = true
-                settings.isDepthDataFiltered = true   // 让系统先补洞、平滑
+                // 和预览一样：大多数线路让系统先补洞、平滑；长焦双摄不用（usesSystemDepthFilter），照片和预览才一致
+                settings.isDepthDataFiltered = self.depthFiltering
             }
             if let conn = self.photoOutput.connection(with: .video) {
                 if conn.isVideoRotationAngleSupported(self.captureRotationAngle) {
@@ -622,6 +750,21 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
         return nil
     }
 
+    /// 这条线路用不用系统的深度滤波（AVCaptureDepthDataOutput.isFilteringEnabled，拍照的 isDepthDataFiltered 跟着它）。
+    ///
+    /// 长焦双摄（4× 起）不用。实测（rec-20261029-183222，4.2× 对焦 5 m 的木棍，近处 1 m 的柜子和显示器）：
+    /// 不滤波时有 40% 的像素没有视差（白墙、显示器屏幕这种没纹理的地方），系统滤波把这些洞从画面边缘往里补，
+    /// 补出来的值比真实的近很多，连带把旁边有数据的远处也抹近了：木棍 0.02 → 0.13，墙 0.03 → 0.16（比木棍还「近」），
+    /// 柜子 0.20 不变。近和远的视差差从 0.18 压到 0.08，近处的柜子、显示器只剩一点点虚化，墙上的柜子反倒更糊。
+    /// 不滤波、交给我们自己补洞（DepthRefiner.fillInvalid(_:guide:)，从四周颜色相近、有数据的像素补）以后，回放同一段（ƒ2.8，对焦木棍）：
+    /// 柜子 / 显示器的虚化半径 0.20% / 0.32% → 0.59%（长边的百分比），木棍、墙、墙上的柜子 ≈ 0，逐帧一样稳。
+    ///
+    /// 其他线路（激光雷达、主摄段的双摄、前置）照旧用系统滤波：激光雷达原始深度只有约 30% 有效，系统补得很好；
+    /// 主摄段双摄还没有录到对比数据，没证据不改（调试录制会录一段相反的设置，录一次就能对比）
+    static func usesSystemDepthFilter(_ plan: CameraPlan) -> Bool {
+        !LensCatalog.streamsTelephotoStereo(plan)
+    }
+
     /// 打开一条线路。大多数倍率变化不换设备也不换格式，只改倍率；否则整个会话重建
     private func apply(_ plan: CameraPlan, revision: Int) -> Bool {
         let device = plan.device
@@ -651,6 +794,12 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
             } catch { return false }
             if let zoom = plan.zoom, abs(device.videoZoomFactor - zoom) > 0.0001 { return false }
             activePlan = plan
+            // 同一个双摄从主摄段换到长焦段（或反过来）：深度滤波跟着线路换
+            let filtering = Self.usesSystemDepthFilter(plan)
+            if filtering != depthFiltering, session.outputs.contains(depthOutput) {
+                depthFiltering = filtering
+                depthOutput.isFilteringEnabled = filtering
+            }
             let timestamp = CMClockGetTime(session.synchronizationClock ?? CMClockGetHostTimeClock())
             let focus = dataQueue.sync { () -> CGPoint? in
                 let p = self.resetForRoute(revision: revision, newStreamZoom: plan.streamZoom, minimumTimestamp: timestamp)
@@ -739,7 +888,8 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
         var useDepth = false
         if let depthFormat = pick?.depthFormat, session.canAddOutput(depthOutput) {
             session.addOutput(depthOutput)
-            depthOutput.isFilteringEnabled = true            // 系统做补洞 + 时域平滑
+            depthFiltering = Self.usesSystemDepthFilter(plan)
+            depthOutput.isFilteringEnabled = depthFiltering
             // 不丢晚到的深度：丢了这一帧就只能沿用旧深度，动的东西会错位（采集工具也是这样设的，录下来的深度每帧都对得上）
             depthOutput.alwaysDiscardsLateDepthData = false
             depthOutput.connection(with: .depthData)?.isEnabled = true
@@ -1119,6 +1269,7 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
             // 跑多勤看画面动不动、有没有人、对焦点在哪儿（PersonSegmenter.update）：静止时很少跑，省电。
             // 分割开关关掉时不跑，虚化只按深度（useSegmentation）
             let segmentationOn = keepSubjectSharp && useSegmentation
+            let locked = focusLocked
             if segmentationOn {
                 if tapped || firstRouteFrame { segmenter.focusChanged() }
                 segmenter.update(with: pixelBuffer, now: t0, moving: sceneMoving, personChanged: personMaskStale,
@@ -1152,7 +1303,26 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
                 personInstanceColors: masks?.personInstanceColors,
                 personInstanceRevision: masks?.personInstanceRevision ?? 0,
                 // 画面的等效焦距（1× = 24mm，同 ZoomScale.focalLength）：长焦虚化更强、全清晰区更窄
-                focalLength35mm: Float(frameZoom) * 24))
+                focalLength35mm: Float(frameZoom) * 24, focusLocked: locked))
+            lastFocusDisparity = plan.focusDisparity
+            lastFocusWasLocked = locked
+            // 调试录制：这一帧的原始数据和参数
+            if let rec = recorder {
+                var info: [String: Any] = [
+                    "pts": CMTimeGetSeconds(timestamp), "W": W, "H": H, "crop": Double(crop),
+                    "streamZoom": Double(streamZoom), "frameZoom": Double(frameZoom), "fl": Double(frameZoom) * 24,
+                    "rel": relative, "fx": Double(p.x), "fy": Double(p.y), "tap": tapped, "f": Double(fNumber),
+                    "lock": locked, "seg": segmentationOn, "source": source.label, "outW": outW, "outH": outH,
+                    "rotation": frameRotation, "focusDisparity": Double(plan.focusDisparity),
+                    "focusRecentered": plan.focusRecentered, "tooClose": plan.tooClose,
+                    "cameraShift": Double(plan.cameraShift), "changed": Double(plan.changedFraction),
+                    "depthW": fullDisparity.width, "depthH": fullDisparity.height,
+                ]
+                info["focusDistance"] = plan.focusDistance.map { Double($0) }
+                rec.addFrame(pixelBuffer: pixelBuffer, rawDepth: depthData,
+                             pipelineDepth: depthAge == 0 ? fullDisparity : nil, depthAge: depthAge,
+                             masks: masks, info: info)
+            }
             // 下一帧决定分割跑多勤用：手机在动或画面里有东西在动
             sceneMoving = plan.cameraShift >= 0.5 || plan.cameraMoving || plan.changedFraction >= 0.005
             personMaskStale = plan.personMaskStale
@@ -1327,8 +1497,9 @@ extension DepthCameraController: AVCapturePhotoCaptureDelegate {
             return
         }
         // 和预览一样的裁切（两个深度倍率点之间相机停在低的那个点）
-        let (crop, monoRoute, streamOrientation, frameZoom) = dataQueue.sync {
-            (self.lastFrameCrop, !self.depthExpected, self.frameOrientation, self.lastPublishedZoom)
+        let (crop, monoRoute, streamOrientation, frameZoom, lockedFocus) = dataQueue.sync {
+            (self.lastFrameCrop, !self.depthExpected, self.frameOrientation, self.lastPublishedZoom,
+             self.lastFocusWasLocked ? self.lastFocusDisparity : nil)
         }
         let depth = photo.depthData
         let orientationRaw = (photo.metadata[kCGImagePropertyOrientation as String] as? NSNumber)?.uint32Value ?? 1
@@ -1353,8 +1524,8 @@ extension DepthCameraController: AVCapturePhotoCaptureDelegate {
             var disparity: FloatMap?
             var relative = false
             if let depth {
-                // 只补洞；和图像的对齐在编辑器里按渲染分辨率做
-                disparity = DepthRefiner.fillInvalid(ImageBridge.disparityMap(from: depth).centerCropped(by: Float(c)))
+                // 洞留着（NaN），编辑器里按照片的颜色补（LiveFrameAnalyzer.stillPlan）；和图像的对齐也在编辑器里按渲染分辨率做
+                disparity = ImageBridge.disparityMap(from: depth).centerCropped(by: Float(c))
                 relative = depth.depthDataAccuracy == .relative
             } else if monoRoute, let estimator = DepthModelStore.shared.estimator,
                       let mono = estimator.estimate(cgImage: cg, orientation: photoOrientation) {
@@ -1374,7 +1545,8 @@ extension DepthCameraController: AVCapturePhotoCaptureDelegate {
                                               disparity: disparity ?? FloatMap(width: 64, height: 48, repeating: 1),
                                               orientation: orientation, focusPoint: focus, fNumber: fNumber,
                                               isRelativeDepth: relative, personMask: person, objectLabels: objects,
-                                              personInstances: people, focalLength35mm: Float(frameZoom) * 24)
+                                              personInstances: people, focalLength35mm: Float(frameZoom) * 24,
+                                              lockedFocusDisparity: lockedFocus)
             DispatchQueue.main.async {
                 self.lastPhoto = captured
                 self.isCapturing = false

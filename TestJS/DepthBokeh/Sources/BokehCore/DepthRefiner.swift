@@ -37,6 +37,32 @@ public enum DepthRefiner {
         return min(max(2, Int((radiusScale * upscale).rounded())), max(2, image.longSide / 40))
     }
 
+    /// 按颜色引导补洞时颜色差的尺度（sqrt(线性光)）：同一面墙上的明暗差约 0.05，白墙和蓝屏幕、黑边框差 0.3 以上
+    public static let fillColorSigma: Float = 0.1
+
+    /// 补洞，有这一帧的小图（和视差图一样大）时按颜色引导（PullPush.fillGuided）。
+    ///
+    /// 长焦双摄不用系统滤波（CameraController.usesSystemDepthFilter）以后，白墙、显示器屏幕这些没纹理的地方
+    /// 有成片的洞（实测 4.2× 时 40% 的像素），近处物体边上被挡住的那一条背景也没有数据。
+    /// 只按位置补的话，一大块洞会把旁边颜色、远近都不一样的东西平均进来；按颜色引导以后主要从同样颜色的那些像素补
+    public static func fillInvalid(_ map: FloatMap, guide: PlanarImage?) -> FloatMap {
+        guard let guide else { return fillInvalid(map) }
+        var weight = [Float](repeating: 0, count: map.values.count)
+        var anyInvalid = false
+        for i in 0..<map.values.count {
+            let v = map.values[i]
+            if v.isFinite && v > 0 { weight[i] = 1 } else { anyInvalid = true }
+        }
+        if !anyInvalid { return map }
+        let g = guide.width == map.width && guide.height == map.height
+            ? guide : guide.resized(width: map.width, height: map.height)
+        let channels = [g.r, g.g, g.b].map { $0.map { sqrtf(max(0, $0)) } }
+        let values = map.values.map { $0.isFinite ? $0 : 0 }
+        let filled = PullPush.fillGuided(values: values, weight: weight, guide: channels,
+                                         width: map.width, height: map.height, sigma: fillColorSigma)
+        return FloatMap(width: map.width, height: map.height, values: filled)
+    }
+
     /// 用拉推法（pull-push）填补视差图里的无效像素
     public static func fillInvalid(_ map: FloatMap) -> FloatMap {
         var weight = [Float](repeating: 0, count: map.values.count)

@@ -31,6 +31,8 @@ public struct FocusStabilizer {
     /// 变远时也只坚持 `nearHold`，否则扫过去时虚化要过 1.5 秒才跟上，看起来像延迟
     public var cameraMoving = false
 
+    /// 最近一次 update 的目标视差（时间平滑之前）。锁定对焦时锁的是它，平滑值继续走到它为止
+    public private(set) var lastTarget: Float?
     private var anchor: Float?
     private var diverged: Double = 0
     private var smoothed: Float?
@@ -50,6 +52,7 @@ public struct FocusStabilizer {
     /// - Returns: 平滑后的对焦视差
     public mutating func update(map: FloatMap, nx: Float, ny: Float, dt: Double) -> Float {
         let target = stabilizedTarget(map: map, nx: nx, ny: ny, dt: dt)
+        lastTarget = target
         guard let s = smoothed else { smoothed = target; return target }
         let a = Float(1 - exp(-max(0, dt) / max(1e-3, smoothingTime)))
         let v = s + (target - s) * a

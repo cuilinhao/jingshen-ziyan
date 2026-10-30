@@ -114,6 +114,9 @@ public final class LiveFrameAnalyzer {
         /// 渲染出来的画面的 35mm 等效焦距（毫米，已含数码裁切；1× = 24mm）。`.system` 模型按它放大虚化
         /// （LensParameters.scaleForFocalLength）；nil = 按 1× 的标定
         public var focalLength35mm: Float?
+        /// 锁定对焦：点按以后对焦动画走完（lockSettleTime），对焦的距离就固定住，不再按对焦点重新测
+        /// （主体走开、手机移动、重新构图都不变），直到再点一次或者关掉。false = 一直跟着对焦点测
+        public var focusLocked: Bool
 
         public init(disparity: FloatMap, relativeDepth: Bool, crop: Float, fNumber: Float,
                     focusPoint: (x: Float, y: Float), focusTapped: Bool, time: Double,
@@ -121,7 +124,8 @@ public final class LiveFrameAnalyzer {
                     personMaskColors: PlanarImage? = nil, depthAge: Int = 0,
                     objectLabels: FloatMap? = nil, objectColors: PlanarImage? = nil, objectRevision: Int = 0,
                     personInstances: FloatMap? = nil, personInstanceColors: PlanarImage? = nil,
-                    personInstanceRevision: Int = 0, focalLength35mm: Float? = nil) {
+                    personInstanceRevision: Int = 0, focalLength35mm: Float? = nil, focusLocked: Bool = false) {
+            self.focusLocked = focusLocked
             self.focalLength35mm = focalLength35mm
             self.personInstances = personInstances
             self.personInstanceColors = personInstanceColors
@@ -148,6 +152,12 @@ public final class LiveFrameAnalyzer {
     /// 测试用：覆盖对焦稳定器的最长坚持时间
     public var maxHoldOverride: Double?
     private var stabilizer = FocusStabilizer()
+    /// 最近一次测出来的对焦视差（锁定对焦时固定用它）、锁定前还要等对焦动画走完到什么时候
+    private var lockedFocus: Float?
+    private var lockedTarget: Float?
+    private var lockSettleUntil: Double = -1
+    /// 锁定对焦：点按后先照常测这么久（换焦动画、深度稳定），然后固定
+    public static let lockSettleTime: Double = 0.4
     private var effectAmount: Float = 1
     private var tooClose = false
     private var lastTime: Double?
@@ -170,6 +180,10 @@ public final class LiveFrameAnalyzer {
     /// 换了相机或相机倍率：所有和旧画面绑定的历史都不能再用
     public func resetHistory() {
         stabilizer = FocusStabilizer()
+        // 换了相机，深度的单位可能都不一样（LiDAR / 双摄 / AI）：锁定的对焦在新画面上重新测一次再锁
+        lockedFocus = nil
+        lockedTarget = nil
+        lockSettleUntil = -1
         smoothedNear = nil
         smoothedFar = nil
         lastTime = nil
@@ -195,17 +209,33 @@ public final class LiveFrameAnalyzer {
             recentered = true
         }
         let moving = frame.time < movingUntil
-        var map = DepthRefiner.fillInvalid(frame.disparity.centerCropped(by: c))
+        // 补洞按这一帧的颜色引导（长焦双摄不用系统滤波，白墙、屏幕上有成片的洞）
+        var map = DepthRefiner.fillInvalid(frame.disparity.centerCropped(by: c), guide: frame.colors)
         let lowLongSide = max(160, frame.outputLongSide / max(1, settings.blurDownscale))
 
-        // 1. 对焦（裁出来的画面坐标）。点按或回到中心时重新锁定；手机在动时变远也只坚持 0.3 秒
+        // 1. 对焦（裁出来的画面坐标）。点按或回到中心时重新锁定；手机在动时变远也只坚持 0.3 秒。
+        //    锁定对焦：点按后照常测 lockSettleTime（换焦动画），然后固定住这个距离，不再按对焦点测
         let fx = 0.5 + (p.x - 0.5) * c, fy = 0.5 + (p.y - 0.5) * c
-        if frame.focusTapped || recentered { stabilizer.reset() }
         let dt = lastTime.map { min(0.2, max(0, frame.time - $0)) } ?? (1.0 / 30)
         lastTime = frame.time
-        stabilizer.cameraMoving = moving
-        if let h = maxHoldOverride { stabilizer.maxHold = h }
-        let focusD = stabilizer.update(map: map, nx: fx, ny: fy, dt: dt)
+        let focusD: Float
+        if frame.focusLocked, !frame.focusTapped, var locked = lockedFocus, let target = lockedTarget,
+           frame.time >= lockSettleUntil {
+            // 锁住的是目标距离：换焦动画没走完的那一点照样平滑走完，然后一直停在那儿
+            locked += (target - locked) * Float(1 - exp(-dt / max(1e-3, stabilizer.smoothingTime)))
+            lockedFocus = locked
+            focusD = locked
+            // 锁定时对焦点被变焦裁到画面外也不回到中心（对焦距离不变）
+            recentered = false
+        } else {
+            if frame.focusTapped || recentered { stabilizer.reset() }
+            if frame.focusTapped || lockedFocus == nil { lockSettleUntil = frame.time + Self.lockSettleTime }
+            stabilizer.cameraMoving = moving
+            if let h = maxHoldOverride { stabilizer.maxHold = h }
+            focusD = stabilizer.update(map: map, nx: fx, ny: fy, dt: dt)
+            lockedFocus = focusD
+            lockedTarget = stabilizer.lastTarget ?? focusD
+        }
 
         // 2. 主体太近：关掉景深（0.15 秒淡出 / 淡入，进出留 12% 回差）。只有绝对深度能换算成米
         let distance: Float? = frame.relativeDepth ? nil : 1 / max(focusD, 1e-3)
@@ -662,10 +692,12 @@ public final class LiveFrameAnalyzer {
     public static func stillPlan(disparity: FloatMap, relativeDepth: Bool, colors: PlanarImage?, fNumber: Float,
                                  focusPoint: (x: Float, y: Float), personMask: FloatMap?, outputLongSide: Int,
                                  settings: Settings, objectLabels: FloatMap? = nil,
-                                 personInstances: FloatMap? = nil, focalLength35mm: Float? = nil) -> FramePlan {
-        var map = DepthRefiner.fillInvalid(disparity)
+                                 personInstances: FloatMap? = nil, focalLength35mm: Float? = nil,
+                                 lockedFocusDisparity: Float? = nil) -> FramePlan {
+        var map = DepthRefiner.fillInvalid(disparity, guide: colors)
         let lowLongSide = max(320, outputLongSide / max(1, settings.blurDownscale))
-        let focusD = DepthRefiner.focusDisparity(in: map, nx: focusPoint.x, ny: focusPoint.y)
+        // 拍照时锁定了对焦：用锁定的距离（重新构图以后对焦点上可能已经是别的东西）
+        let focusD = lockedFocusDisparity ?? DepthRefiner.focusDisparity(in: map, nx: focusPoint.x, ny: focusPoint.y)
         var relativeScale: Float?
         if relativeDepth, let range = map.percentiles(0.05, 0.95) {
             relativeScale = max(focusD, 0.25 * (range.high - range.low))

@@ -35,7 +35,9 @@ public final class PhotoBokehEditor: ObservableObject, @unchecked Sendable {
     private static var gpuUnavailable = false
 
     private let lock = NSLock()
-    private var pending: (fNumber: Float, focus: CGPoint)?
+    private var pending: (fNumber: Float, focus: CGPoint, useLock: Bool)?
+    /// 拍照时锁定了对焦：在编辑器里重新点对焦点之前，用锁定的对焦距离（lock 保护）
+    private var useLockedFocus = true
     private var busy = false
     // 以下只在 queue 上访问
     private var cpuRenderer: BokehRenderer?
@@ -57,7 +59,8 @@ public final class PhotoBokehEditor: ObservableObject, @unchecked Sendable {
     /// - Parameter focus: 原图归一化坐标
     public func request(fNumber: Float, focus: CGPoint) {
         lock.lock()
-        pending = (fNumber, focus)
+        if focus != photo.focusPoint { useLockedFocus = false }
+        pending = (fNumber, focus, useLockedFocus)
         let shouldStart = !busy
         if shouldStart { busy = true }
         lock.unlock()
@@ -79,7 +82,8 @@ public final class PhotoBokehEditor: ObservableObject, @unchecked Sendable {
             lock.unlock()
 
             let t0 = CACurrentMediaTime()
-            let (ui, focusD) = render(fNumber: p.fNumber, focus: p.focus)
+            let (ui, focusD) = render(fNumber: p.fNumber, focus: p.focus,
+                                      lockedFocus: p.useLock ? photo.lockedFocusDisparity : nil)
             let ms = (CACurrentMediaTime() - t0) * 1000
             DispatchQueue.main.async {
                 if let ui { self.image = ui }
@@ -91,7 +95,7 @@ public final class PhotoBokehEditor: ObservableObject, @unchecked Sendable {
     }
 
     /// queue
-    private func render(fNumber: Float, focus: CGPoint) -> (UIImage?, Float) {
+    private func render(fNumber: Float, focus: CGPoint, lockedFocus: Float?) -> (UIImage?, Float) {
         let img = photo.image
         var settings = LiveFrameAnalyzer.Settings()
         settings.blurDownscale = blurDownscale
@@ -109,7 +113,8 @@ public final class PhotoBokehEditor: ObservableObject, @unchecked Sendable {
                                                personMask: photo.personMask, outputLongSide: img.longSide,
                                                settings: settings, objectLabels: photo.objectLabels,
                                                personInstances: photo.personInstances,
-                                               focalLength35mm: photo.focalLength35mm)
+                                               focalLength35mm: photo.focalLength35mm,
+                                               lockedFocusDisparity: lockedFocus)
         if let ui = renderOnGPU(plan) { return (ui, plan.focusDisparity) }
         return (renderOnCPU(plan), plan.focusDisparity)
     }

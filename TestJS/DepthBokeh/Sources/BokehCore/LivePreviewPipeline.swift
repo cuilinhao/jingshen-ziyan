@@ -60,12 +60,15 @@ public final class LivePreviewPipeline {
         public var personInstances: FloatMap?
         /// 画面的 35mm 等效焦距（毫米，已含裁切；1× = 24mm）。nil = 按 1× 的标定（LiveFrameAnalyzer.Frame.focalLength35mm）
         public var focalLength35mm: Float?
+        /// 锁定对焦（LiveFrameAnalyzer.Frame.focusLocked）
+        public var focusLocked: Bool
 
         public init(image: PlanarImage, disparity: FloatMap?, relativeDepth: Bool, crop: Float, fNumber: Float,
                     focusPoint: (x: Float, y: Float), focusTapped: Bool, time: Double, personMask: FloatMap? = nil,
                     personMaskColors: PlanarImage? = nil, depthAge: Int = 0,
                     objectLabels: FloatMap? = nil, objectColors: PlanarImage? = nil, objectRevision: Int = 0,
-                    personInstances: FloatMap? = nil, focalLength35mm: Float? = nil) {
+                    personInstances: FloatMap? = nil, focalLength35mm: Float? = nil, focusLocked: Bool = false) {
+            self.focusLocked = focusLocked
             self.focalLength35mm = focalLength35mm
             self.personInstances = personInstances
             self.objectRevision = objectRevision
@@ -158,7 +161,7 @@ public final class LivePreviewPipeline {
             personMaskColors: frame.personMaskColors, depthAge: frame.depthAge,
             objectLabels: frame.objectLabels, objectColors: frame.objectColors,
             objectRevision: frame.objectRevision, personInstances: frame.personInstances,
-            focalLength35mm: frame.focalLength35mm))
+            focalLength35mm: frame.focalLength35mm, focusLocked: frame.focusLocked))
         lastPlan = plan
         lap("分析")
 

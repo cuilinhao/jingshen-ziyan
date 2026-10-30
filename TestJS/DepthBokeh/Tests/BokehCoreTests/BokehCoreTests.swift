@@ -659,4 +659,95 @@ final class BokehCoreTests: XCTestCase {
         let kept = SegmentEdgeRepair.repair(depth: depth, segments: mask, valid: valid, band: 2)
         XCTAssertEqual(kept[34, 16], 0.25, accuracy: 1e-6, "画面变了的地方不修")
     }
+
+    /// 按颜色引导补洞（长焦双摄不用系统滤波以后，白墙、屏幕上有成片的洞）：远处白墙 9 成没数据、
+    /// 挨着它的近处蓝屏幕 7 成没数据。只按位置补，墙会被屏幕的近处值拉近；按颜色补，墙补成墙、屏幕补成屏幕
+    func testGuidedHoleFill() {
+        let w = 320, h = 240, n = w * h
+        var d = [Float](repeating: .nan, count: n)
+        var r = [Float](repeating: 0.8, count: n), g = r, b = r                  // 白墙，6.5 m
+        func hash(_ i: Int) -> Float { let v = sinf(Float(i) * 12.9898 + 78.233) * 43758.5453; return v - floorf(v) }
+        for y in 0..<h {
+            for x in 0..<w {
+                let i = y * w + x, blk = hash((y / 4) * 977 + x / 4)
+                if x >= 140 && y >= 100 {                                        // 显示器屏幕，1 m
+                    r[i] = 0.35; g[i] = 0.55; b[i] = 0.9
+                    if blk < 0.3 { d[i] = 1.0 }
+                } else if blk < 0.1 {
+                    d[i] = 0.154
+                }
+            }
+        }
+        let map = FloatMap(width: w, height: h, values: d)
+        let guide = PlanarImage(width: w, height: h, r: r, g: g, b: b)
+        var guided = map, ms = Double.infinity, plainMs = Double.infinity
+        for _ in 0..<5 {
+            let t0 = Date()
+            guided = DepthRefiner.fillInvalid(map, guide: guide)
+            ms = min(ms, Date().timeIntervalSince(t0) * 1000)
+            let t1 = Date()
+            _ = DepthRefiner.fillInvalid(map)
+            plainMs = min(plainMs, Date().timeIntervalSince(t1) * 1000)
+        }
+        let plain = DepthRefiner.fillInvalid(map)
+        // 墙靠近屏幕的那一条（屏幕左边 12 像素以内）
+        var gw: [Float] = [], pw: [Float] = []
+        for y in 100..<h { for x in 128..<140 { gw.append(guided[x, y]); pw.append(plain[x, y]) } }
+        gw.sort(); pw.sort()
+        print(String(format: "补洞 320×240：按颜色 %.1f ms（只按位置 %.1f ms）；屏幕左边的墙 中位数 按颜色 %.3f / 只按位置 %.3f（真值 0.154）",
+                     ms, plainMs, gw[gw.count / 2], pw[pw.count / 2]))
+        XCTAssertLessThan(gw[gw.count / 2], 0.2, "墙补成墙")
+        XCTAssertGreaterThan(pw[pw.count / 2], gw[gw.count / 2] + 0.1, "只按位置补的话墙会被屏幕拉近（这个测试确实测到了差别）")
+        var screen: [Float] = []
+        for y in 110..<h { for x in 150..<w { screen.append(guided[x, y]) } }
+        screen.sort()
+        XCTAssertGreaterThan(screen[screen.count / 10], 0.9, "屏幕补成屏幕")
+        XCTAssertEqual(guided[10, 10], 0.154, accuracy: 0.01, "远离屏幕的墙")
+    }
+
+    /// 锁定对焦：点按后对焦动画走完（0.4 秒）就固定住对焦距离。主体走开（对焦点上换成了背景）、
+    /// 变焦把对焦点裁到画面外，都不变；再点一次重新对焦再锁；不锁的时候照常跟着对焦点走
+    func testFocusLock() {
+        let w = 80, h = 60
+        var subject = [Float](repeating: 0.3, count: w * h)
+        for y in 20..<40 { for x in 30..<50 { subject[y * w + x] = 1.0 } }     // 主体 1 m，背景 3.3 m
+        let withSubject = FloatMap(width: w, height: h, values: subject)
+        let gone = FloatMap(width: w, height: h, repeating: 0.3)                // 主体走开了
+        func run(locked: Bool) -> (Float, Bool) {
+            let a = LiveFrameAnalyzer()
+            a.maxHoldOverride = 0.3
+            var plan: FramePlan!
+            for k in 0..<90 {
+                let t = Double(k) / 30
+                plan = a.analyze(LiveFrameAnalyzer.Frame(
+                    disparity: t < 1 ? withSubject : gone, relativeDepth: false, crop: t < 2 ? 1 : 4, fNumber: 2.8,
+                    focusPoint: (0.5, 0.5 + (t < 2 ? 0 : 0.2)), focusTapped: k == 0, time: t, colors: nil,
+                    personMask: nil, outputLongSide: 480, focusLocked: locked))
+                if k == 20 { XCTAssertEqual(plan.focusDisparity, 1, accuracy: 0.02, "对焦动画走完，对在主体上") }
+            }
+            return (plan.focusDisparity, plan.focusRecentered)
+        }
+        let locked = run(locked: true)
+        XCTAssertEqual(locked.0, 1, accuracy: 0.02, "主体走开、变焦以后还是锁定的距离")
+        XCTAssertFalse(locked.1, "锁定时对焦点被裁到画面外也不回到中心")
+        let free = run(locked: false)
+        XCTAssertEqual(free.0, 0.3, accuracy: 0.02, "不锁：跟着对焦点上的东西走")
+        XCTAssertTrue(free.1)
+        // 锁定时再点一次：重新对焦再锁
+        let a = LiveFrameAnalyzer()
+        var plan: FramePlan!
+        for k in 0..<60 {
+            let t = Double(k) / 30
+            plan = a.analyze(LiveFrameAnalyzer.Frame(
+                disparity: withSubject, relativeDepth: false, crop: 1, fNumber: 2.8,
+                focusPoint: k < 30 ? (0.5, 0.5) : (0.1, 0.1), focusTapped: k == 0 || k == 30, time: t, colors: nil,
+                personMask: nil, outputLongSide: 480, focusLocked: true))
+        }
+        XCTAssertEqual(plan.focusDisparity, 0.3, accuracy: 0.02, "点到背景上，锁定到背景")
+        // 拍照：锁定的距离优先于对焦点上测到的
+        let still = LiveFrameAnalyzer.stillPlan(disparity: gone, relativeDepth: false, colors: nil, fNumber: 2.8,
+                                                focusPoint: (0.5, 0.5), personMask: nil, outputLongSide: 480,
+                                                settings: LiveFrameAnalyzer.Settings(), lockedFocusDisparity: 1)
+        XCTAssertEqual(still.focusDisparity, 1)
+    }
 }

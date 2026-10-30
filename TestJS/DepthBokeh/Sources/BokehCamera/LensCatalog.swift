@@ -288,6 +288,15 @@ enum LensCatalog {
         device.virtualDeviceSwitchOverVideoZoomFactors.last.map { CGFloat(truncating: $0) }
     }
 
+    /// 这条线路是不是长焦当主镜头的双摄立体视差（双摄虚拟相机开在最后一个切换倍率以上，4× 起）。
+    /// 这时不用系统的深度滤波，见 CameraController.usesSystemDepthFilter
+    static func streamsTelephotoStereo(_ plan: CameraPlan) -> Bool {
+        guard plan.source == .dualCamera,
+              plan.device.deviceType == .builtInDualCamera || plan.device.deviceType == .builtInTripleCamera,
+              let zoom = plan.zoom, let s = lastSwitchOver(plan.device) else { return false }
+        return zoom >= s - 0.0001
+    }
+
     /// A depth-capable device opened at the zoom factor that selects the wanted lens —
     /// only if some format can deliver depth at exactly that zoom.
     private static func depthPlan(_ type: AVCaptureDevice.DeviceType, _ position: AVCaptureDevice.Position,

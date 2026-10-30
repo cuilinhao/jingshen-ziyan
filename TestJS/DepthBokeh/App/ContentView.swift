@@ -13,6 +13,8 @@ struct ContentView: View {
     @State private var editingPhoto: CapturedDepthPhoto?
     /// 分割开关（看效果用）：关掉以后只按深度虚化
     @State private var segmentationOn = true
+    /// 锁定对焦：点一下对焦以后对焦距离固定住，不再跟着画面变
+    @State private var focusLocked = false
 
     private var fNumber: Float { ApertureScale.fNumber(at: sliderValue) }
 
@@ -149,6 +151,50 @@ struct ContentView: View {
             })
         }
         .aspectRatio(3.0 / 4.0, contentMode: .fit)
+        .overlay(alignment: .topTrailing) {
+            VStack(alignment: .trailing, spacing: 8) {
+                // 锁定对焦：打开后点一下对焦，对焦距离就固定住（主体走开、手机移动、重新构图都不变）
+                Button {
+                    focusLocked.toggle()
+                    camera.focusLocked = focusLocked
+                } label: {
+                    Label(focusLocked ? "对焦已锁定" : "锁定对焦", systemImage: focusLocked ? "lock.fill" : "lock.open")
+                        .font(.caption2.weight(.semibold))
+                        .padding(.horizontal, 8).padding(.vertical, 4)
+                        .background(focusLocked ? Color.yellow : Color.black.opacity(0.45), in: Capsule())
+                        .foregroundStyle(focusLocked ? Color.black : Color.white.opacity(0.9))
+                }
+                .accessibilityLabel(focusLocked ? "解除对焦锁定" : "锁定对焦")
+                // 录调试数据：出问题时按一下，录 5 秒原始数据（相机画面、深度、参数），录好可以 AirDrop 到 Mac
+                Button {
+                    camera.startDebugRecording()
+                } label: {
+                    Label(camera.isDebugRecording ? "录制中" : "录调试数据", systemImage: "record.circle")
+                        .font(.caption2.weight(.semibold))
+                        .padding(.horizontal, 8).padding(.vertical, 4)
+                        .background(camera.isDebugRecording ? Color.red : Color.black.opacity(0.45), in: Capsule())
+                        .foregroundStyle(Color.white.opacity(0.9))
+                }
+                .disabled(camera.isDebugRecording)
+                if !camera.debugRecordingStatus.isEmpty {
+                    Text(camera.debugRecordingStatus)
+                        .font(.caption2)
+                        .padding(.horizontal, 8).padding(.vertical, 4)
+                        .background(Color.black.opacity(0.55), in: Capsule())
+                        .foregroundStyle(Color.white)
+                }
+                if let zip = camera.debugRecordingZip {
+                    ShareLink(item: zip) {
+                        Label("发送数据", systemImage: "square.and.arrow.up")
+                            .font(.caption2.weight(.semibold))
+                            .padding(.horizontal, 8).padding(.vertical, 4)
+                            .background(Color.yellow, in: Capsule())
+                            .foregroundStyle(Color.black)
+                    }
+                }
+            }
+            .padding(10)
+        }
         .overlay(alignment: .topLeading) {
             if !camera.depthSourceLabel.isEmpty {
                 Text(camera.depthSourceLabel)

@@ -38,6 +38,8 @@ final class PersonSegmenter: @unchecked Sendable {   // 可变状态都由 lock 
         var personInstanceColors: PlanarImage?
         /// 人像实例标签图每更新一次加 1
         var personInstanceRevision = 0
+        /// 人像遮罩每更新一次加 1（调试录制按它决定要不要再存一张）
+        var personRevision = 0
     }
 
     private let queue = DispatchQueue(label: "depthbokeh.segmentation", qos: .userInitiated)
@@ -53,6 +55,7 @@ final class PersonSegmenter: @unchecked Sendable {   // 可变状态都由 lock 
     private var instances: FloatMap?
     private var instanceColors: PlanarImage?
     private var instanceRevision = 0
+    private var maskRevision = 0
     private var lastInstanceStart: TimeInterval = -1
     private var generation = 0
     /// 最近一秒每次分割的开始时间和耗时（毫秒），状态栏显示
@@ -93,7 +96,7 @@ final class PersonSegmenter: @unchecked Sendable {   // 可变状态都由 lock 
         defer { lock.unlock() }
         return Masks(person: mask, personColors: maskColors, objects: objects, objectColors: objectColors,
                      objectRevision: objectRevision, personInstances: instances, personInstanceColors: instanceColors,
-                     personInstanceRevision: instanceRevision)
+                     personInstanceRevision: instanceRevision, personRevision: maskRevision)
     }
 
     /// 最近一秒跑了几次分割、平均每次多少毫秒（状态栏）
@@ -223,6 +226,7 @@ final class PersonSegmenter: @unchecked Sendable {   // 可变状态都由 lock 
                 if doPerson {
                     self.mask = hasPerson ? result : nil
                     self.maskColors = hasPerson ? thumb : nil
+                    self.maskRevision &+= 1
                 }
                 if runObjects {
                     self.objects = hasObjects ? labels : nil

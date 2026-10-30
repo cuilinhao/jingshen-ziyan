@@ -34,6 +34,9 @@ final class ScenarioMatrixTests: XCTestCase {
         var measured: Float? = nil
         /// 细条（眼镜框、光晕）：取样时不往里缩
         var thin = false
+        /// 这一层多少像素没有深度（NaN，成块出现）。双摄在没纹理的地方（白墙、显示器屏幕）测不出视差；
+        /// 长焦不用系统滤波以后，这些洞由分析里的 DepthRefiner.fillInvalid 补
+        var holes: Float = 0
     }
 
     struct Scene {
@@ -121,6 +124,15 @@ final class ScenarioMatrixTests: XCTestCase {
             for x in 0..<w {
                 let blk = hash((y / 6) * 1000 + x / 6 + 7)
                 d[y * w + x] += amp * (0.6 * blk + 0.4 * hash(y * w + x))
+            }
+        }
+        // 双摄没有深度的地方（4×4 一块，按这一层的 holes 比例）。激光雷达走系统滤波、AI 每个像素都有值，不挖洞
+        if case .dual = source {
+            for y in 0..<h {
+                for x in 0..<w where label[y * w + x] >= 0 {
+                    let holes = scene.layers[label[y * w + x]].holes
+                    if holes > 0, (hash((y / 4) * 977 + x / 4 + 31) + 1) / 2 < holes { d[y * w + x] = .nan }
+                }
             }
         }
         let disparity = FloatMap(width: w, height: h, values: d)
@@ -360,6 +372,18 @@ final class ScenarioMatrixTests: XCTestCase {
               measured: 4, thin: true),
     ])
 
+    /// 用户录的 4.2× 现场（rec-20261029-183222）：对焦 5 m 的木棍时，1 m 的柜子（PGYTECH）和 Dell 显示器不该清晰。
+    /// 双摄在白墙（9 成）、显示器屏幕（7 成）上没有视差；以前系统滤波把这些洞补成了近处的值，柜子只剩一点虚化。
+    /// 这里的洞交给分析自己补，远处的洞要补成远处、近处的洞补成近处
+    static let teleDesk = Scene(name: "长焦桌面", layers: [
+        Layer(name: "白墙", kind: .stuff, color: (0.85, 0.86, 0.84), shape: rect(0, 1, 0, 1, 6.5), holes: 0.9),
+        Layer(name: "墙柜", kind: .stuff, color: (0.92, 0.92, 0.9), shape: rect(0.05, 0.6, 0.05, 0.3, 6), holes: 0.4),
+        Layer(name: "木棍", kind: .stuff, color: (0.75, 0.55, 0.3), shape: rect(0.26, 0.33, 0.25, 0.55, 5)),
+        Layer(name: "后排", kind: .stuff, color: (0.2, 0.2, 0.22), shape: rect(0.38, 0.52, 0.38, 0.5, 4.5)),
+        Layer(name: "柜子", kind: .stuff, color: (0.45, 0.42, 0.4), shape: rect(0.55, 0.9, 0.3, 0.8, 1.05), holes: 0.15),
+        Layer(name: "显示器", kind: .stuff, color: (0.6, 0.75, 0.95), shape: rect(0.12, 0.5, 0.6, 0.95, 1.0), holes: 0.7),
+    ])
+
     struct Case { var scene: Scene; var focus: String; var point: (Float, Float); var instances = true }
 
     static let cases: [Case] = [
@@ -384,6 +408,8 @@ final class ScenarioMatrixTests: XCTestCase {
         Case(scene: crowd, focus: "2米", point: (0.25, 0.6), instances: false),
         Case(scene: crowd, focus: "3米", point: (0.54, 0.4), instances: false),
         Case(scene: crowd, focus: "远人", point: (0.67, 0.35), instances: false),
+        Case(scene: teleDesk, focus: "木棍", point: (0.295, 0.45)),
+        Case(scene: teleDesk, focus: "柜子", point: (0.72, 0.5)),
     ]
 
     /// 各深度来源实际出现的焦段（LensCatalog）
