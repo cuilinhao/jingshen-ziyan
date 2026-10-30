@@ -564,23 +564,54 @@ final class BokehCoreTests: XCTestCase {
         XCTAssertGreaterThan(still.seeds?.connect?[15, 50] ?? 0, 0.5)
     }
 
-    /// 按焦距换算 = 视差差乘 s 再进模型（全清晰区除以 s、斜率乘 s）；1× 和更广不变
+    /// 按焦距换算：斜率乘 s = (f/24)^1.35，后面的全清晰区除以 s，前面的除以 t = (f/24)^2（最窄 0.04）；1× 和更广不变
     func testFocalLengthScaling() {
         let base = LensParameters(fNumber: 1.4, focusDisparity: 0.5)
         var tele = base
         tele.scaleForFocalLength(100)
-        let s = powf(100 / LensParameters.referenceFocalLength, LensParameters.focalScalingExponent)
+        let r = 100 / LensParameters.referenceFocalLength
+        let s = powf(r, LensParameters.focalScalingExponent), t = powf(r, LensParameters.toleranceScalingExponent)
+        XCTAssertEqual(tele.frontSlope, base.frontSlope * s, accuracy: 1e-4)
+        XCTAssertEqual(tele.backSlope, base.backSlope * s, accuracy: 1e-4)
+        XCTAssertEqual(tele.frontTolerance, max(base.frontTolerance / t, LensParameters.minScaledFrontTolerance), accuracy: 1e-6)
+        XCTAssertEqual(tele.backTolerance, base.backTolerance / s, accuracy: 1e-6)
+        var twoX = base
+        twoX.scaleForFocalLength(48)
+        XCTAssertEqual(twoX.frontTolerance, base.frontTolerance / 4, accuracy: 1e-6, "2× 按焦距平方收窄，没碰到下限")
+        XCTAssertEqual(tele.frontMax, base.frontMax)
+        XCTAssertEqual(tele.backMax, base.backMax)
         let L = 1440
         for dd: Float in [-0.3, -0.1, -0.02, 0.05, 0.1, 0.3] {
-            let a = tele.signedBlurRadius(disparity: 0.5 + dd, imageLongSide: L)
-            let b = base.signedBlurRadius(disparity: 0.5 + dd * s, imageLongSide: L)
-            XCTAssertEqual(a, b, accuracy: 1e-3, "Δd = \(dd)")
+            // 长焦时同样的视差差虚化不会比 1× 小
+            XCTAssertGreaterThanOrEqual(abs(tele.signedBlurRadius(disparity: 0.5 + dd, imageLongSide: L)),
+                                        abs(base.signedBlurRadius(disparity: 0.5 + dd, imageLongSide: L)), "Δd = \(dd)")
         }
         var wide = base
         wide.scaleForFocalLength(24)
         XCTAssertEqual(wide, base)
         wide.scaleForFocalLength(13)
         XCTAssertEqual(wide, base)
+    }
+
+    /// 用户录屏（2× / 48mm，demo1030 / xitong1030，DepthCapture S01_desk 的激光雷达距离）：对焦 14 m 外的墙，
+    /// 4.5 m 的桌子、电脑和 6.5 m 的工位，系统相机 2× ƒ1.4 都明显虚化（约长边的 0.30% / 0.12%）。
+    /// 以前全清晰区和斜率共用 (f/24)^1.35，前面 0.098 的全清晰区一直延伸到 5.7 m：4.5 m 只有 0.22%，6.5 m 是 0；
+    /// ƒ2.3 时 4.5 m 只剩 0.13%，又低于「本来就清晰」的界线（sharpLimit 0.15%），被深度核心整片拉成完全清晰
+    func testZoomedFarFocusBlursMidground() {
+        func blur(_ z: Float, focus zf: Float, f: Float, focal: Float) -> Float {
+            var lens = LensParameters(fNumber: f, focusDisparity: 1 / zf)
+            lens.scaleForFocalLength(focal)
+            return abs(lens.signedBlurRadius(disparity: 1 / z, imageLongSide: 1000)) / 10   // 长边的 %
+        }
+        XCTAssertGreaterThan(blur(4.5, focus: 14, f: 1.4, focal: 48), 0.3)
+        XCTAssertGreaterThan(blur(6.5, focus: 14, f: 1.4, focal: 48), 0.05)
+        // ƒ2.3 时 4.5 m 也要高过 sharpLimit，不会被深度核心拉成完全清晰
+        XCTAssertGreaterThan(blur(4.5, focus: 14, f: 2.3, focal: 48),
+                             SubjectMatteParameters().sharpLimit * 100)
+        // 反过来对焦 4.5 m，14 m 的墙：后面的虚化基本不变（全清晰区本来就窄）
+        XCTAssertEqual(blur(14, focus: 4.5, f: 1.4, focal: 48), 0.57, accuracy: 0.03)
+        // 1× 完全不变
+        XCTAssertEqual(blur(4.5, focus: 14, f: 1.4, focal: 24), blur(4.5, focus: 14, f: 1.4, focal: 13))
     }
 
     /// 用户录屏的场景（4× / 100mm，双摄相对视差 = 真实视差 + 0.3）：对焦远处 3.75 m 的 A，

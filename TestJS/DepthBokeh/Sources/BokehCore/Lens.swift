@@ -39,6 +39,20 @@ public struct LensParameters: Equatable {
     // 注意：长焦当主镜头时双摄视差的数值只有真实 1/米 的约 1/4（rec-20261029-183222 实测，主摄段约等于真实值），
     // 所以这个指数在 4× 上实际作用在 1/4 的视差差上；上面「1 更接近系统相机」也是在这个单位下比的。见 README「4× 长焦」
     public static let focalScalingExponent: Float = 1 + 0.35
+    /// 焦距变长时，对焦面**前面**的全清晰区按 (焦距 / 24)^这个指数 收窄（和上面的斜率分开换算）。
+    /// 镜头看起来清晰的范围（景深）和焦距的平方成反比，所以用 2。以前全清晰区和斜率共用 1.35：
+    /// 2×（48mm）对焦 14 m 的墙时，前面 0.25 / 2.55 ≈ 0.098 的全清晰区一直延伸到 5.7 m，5–7 m 的东西完全清晰，
+    /// 4.5 m 的桌子、电脑也只有长边的 0.22%（ƒ1.4）；同一场景系统相机 2× ƒ1.4 约 0.12% / 0.30%
+    /// （录屏 demo1030 / xitong1030，距离用 DepthCapture S01_desk 的激光雷达）。
+    /// 按 2 换算后是 0.0625：4.5 m 约 0.40%、6.5 m 约 0.09%。1× 和超广角不变。
+    /// 最窄到 minScaledFrontTolerance（见下）
+    public static let toleranceScalingExponent: Float = 2
+    /// 前面的全清晰区按焦距收窄时最窄到多少（视差差，1/米）：和 1× 时后面的全清晰区一样宽。
+    /// 再窄就和双摄视差的误差一个量级了：4×（100mm）长焦不用系统滤波，白墙、屏幕这种成片没数据的面靠补洞，
+    /// 补出来的视差差 ±0.03～0.05（场景矩阵「长焦桌面」：1.0 m 的显示器在 1.05 m 的柜子前面，补完只剩 0.016），
+    /// 全清晰区按 2 收到 0.014 的话，这点误差就会让对焦面附近的东西忽清忽糊。
+    /// 2× 是 0.0625（不受影响），3× 起是 0.04（以前 3× 0.057、4× 0.036）
+    public static let minScaledFrontTolerance: Float = 0.04
 
     public enum Model: Equatable { case system, thinLens }
 
@@ -113,13 +127,16 @@ public struct LensParameters: Equatable {
     /// 一直延伸到 1.9 m，近处 2.3 m 的人和他的椅背视差差只有 0.17～0.21，虚化半径正好是 0；后面 8 m 的背景也只有长边的 0.2%。
     /// 系统相机 4× 时前后都糊得很明显。
     ///
-    /// 做法：视差差先乘 s = (f / 24)^focalScalingExponent 再进模型，等价于全清晰区除以 s、斜率乘以 s（上限不变）。
-    /// 只放大不缩小（s ≥ 1）：1× 和超广角保持原来的标定。GPU 直接读换算后的这几个字段，着色器不用改
+    /// 做法：斜率乘 s = (f / 24)^focalScalingExponent（同样的视差差糊得更快，上限不变），后面的全清晰区除以 s；
+    /// 前面的全清晰区除以 t = (f / 24)^toleranceScalingExponent（景深和焦距的平方成反比），最窄到 minScaledFrontTolerance。
+    /// 只放大不缩小（f ≤ 24mm 时不换算）：1× 和超广角保持原来的标定。GPU 直接读换算后的这几个字段，着色器不用改
     public mutating func scaleForFocalLength(_ focalLength35mm: Float) {
         guard model == .system, focalLength35mm.isFinite, focalLength35mm > 0 else { return }
-        let s = powf(focalLength35mm / Self.referenceFocalLength, Self.focalScalingExponent)
-        guard s > 1 else { return }
-        frontTolerance /= s
+        let ratio = focalLength35mm / Self.referenceFocalLength
+        guard ratio > 1 else { return }
+        let s = powf(ratio, Self.focalScalingExponent)
+        let t = powf(ratio, Self.toleranceScalingExponent)
+        frontTolerance = max(frontTolerance / t, min(frontTolerance, Self.minScaledFrontTolerance))
         backTolerance /= s
         frontSlope *= s
         backSlope *= s

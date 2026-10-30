@@ -384,6 +384,16 @@ final class ScenarioMatrixTests: XCTestCase {
         Layer(name: "显示器", kind: .stuff, color: (0.6, 0.75, 0.95), shape: rect(0.12, 0.5, 0.6, 0.95, 1.0), holes: 0.7),
     ])
 
+    /// 用户录屏（2×，demo1030 / xitong1030；距离来自 DepthCapture S01_desk 的激光雷达）：对焦 14 m 外的墙，
+    /// 6.5 m、4.5 m 两排工位（电脑、桌子），3.4 m 的近处白桌子（和墙颜色接近，颜色补边不能把它拉清晰）。
+    /// 以前 2× 前面的全清晰区一直延伸到 5.7 m，工位几乎不糊（LensParameters.toleranceScalingExponent）
+    static let farWall = Scene(name: "远墙办公室", layers: [
+        Layer(name: "墙", kind: .stuff, color: (0.82, 0.82, 0.8), shape: rect(0, 1, 0, 1, 14)),
+        Layer(name: "远工位", kind: .stuff, color: (0.35, 0.36, 0.4), shape: rect(0.1, 0.9, 0.35, 0.5, 6.5)),
+        Layer(name: "工位", kind: .stuff, color: (0.2, 0.22, 0.26), shape: rect(0.2, 0.8, 0.5, 0.75, 4.5)),
+        Layer(name: "近桌", kind: .stuff, color: (0.88, 0.88, 0.86), shape: rect(0, 1, 0.75, 1, 3.4)),
+    ])
+
     struct Case { var scene: Scene; var focus: String; var point: (Float, Float); var instances = true }
 
     static let cases: [Case] = [
@@ -410,6 +420,7 @@ final class ScenarioMatrixTests: XCTestCase {
         Case(scene: crowd, focus: "远人", point: (0.67, 0.35), instances: false),
         Case(scene: teleDesk, focus: "木棍", point: (0.295, 0.45)),
         Case(scene: teleDesk, focus: "柜子", point: (0.72, 0.5)),
+        Case(scene: farWall, focus: "墙", point: (0.5, 0.15)),
     ]
 
     /// 各深度来源实际出现的焦段（LensCatalog）

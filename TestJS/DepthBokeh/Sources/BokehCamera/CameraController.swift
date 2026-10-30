@@ -222,6 +222,8 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
             "blurDownscale": blurDownscale,
             "lens": ["referenceFocalLength": Double(LensParameters.referenceFocalLength),
                      "focalScalingExponent": Double(LensParameters.focalScalingExponent),
+                     "toleranceScalingExponent": Double(LensParameters.toleranceScalingExponent),
+                     "minScaledFrontTolerance": Double(LensParameters.minScaledFrontTolerance),
                      "defaultBlurK": Double(LensParameters.defaultBlurK)],
             // 前一段按线路平时的设置（normalDepthFiltering），后一段相反
             "recordNormalSeconds": Self.recordNormalSeconds,
