@@ -209,7 +209,7 @@ public struct RenderQuality: Equatable {
     /// 平滑的高光提亮（预览不闪）。false = 旧算法（硬门限）
     public var smoothHighlights: Bool
 
-    public init(layersPerSide: Int = 8, highlightThreshold: Float = 0.6, highlightGain: Float = 2.5,
+    public init(layersPerSide: Int = 8, highlightThreshold: Float = 0.85, highlightGain: Float = 2.5,
                 smoothHighlights: Bool = true) {
         self.layersPerSide = layersPerSide
         self.highlightThreshold = highlightThreshold
@@ -222,9 +222,15 @@ public struct RenderQuality: Equatable {
         highlightThreshold = 0.9; highlightGain = 4; smoothHighlights = false
     }
 
+    /// 高光阈值 0.85（sRGB 约 237）：只提亮接近过曝的像素。传感器上过曝的灯珠、反光丢了亮度，才需要补；
+    /// 没过曝的白衣服、白桌边、白纸亮度是准的，提亮了就是假的。以前拍照是 0.6（sRGB 约 203）：
+    /// 被顶灯照亮的白 T 恤肩膀（约 0.8–0.9）被提亮 1.6–2.8 倍，模糊后糊成一大片过曝的光晕（录屏 baoguang）。
+    /// 提亮量是 k² 曲线，真正过曝的灯（≥ 0.97）基本不受影响：拍照 3.4 → 3.0 倍，1.0 时都是 3.5 倍。
+    /// 人身上另外整块不提亮（SubjectSeeds.people），过曝的白衣服也不会发光
+    ///
     /// 实时预览：层数少一些换速度；高光提亮更克制（预览里灯管、筒灯的亮度会随卷帘条纹和曝光起伏，
-    /// 提亮越狠，闪得越明显）
-    public static let preview = RenderQuality(layersPerSide: 5, highlightThreshold: 0.75, highlightGain: 1.5)
+    /// 提亮越狠，闪得越明显）。阈值和拍照一样，预览看到的光斑和拍出来的一致
+    public static let preview = RenderQuality(layersPerSide: 5, highlightThreshold: 0.85, highlightGain: 1.5)
     /// 拍照成片
-    public static let photo = RenderQuality(layersPerSide: 9, highlightThreshold: 0.6, highlightGain: 2.5)
+    public static let photo = RenderQuality(layersPerSide: 9, highlightThreshold: 0.85, highlightGain: 2.5)
 }

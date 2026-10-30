@@ -400,6 +400,8 @@ public final class LiveFrameAnalyzer {
                                        parameters: matte, scale: relativeScale, personMask: person, lens: lens,
                                        sharpPeople: allPeople.flatMap { Self.sharpPeople($0, depth: map, lens: lens,
                                                                                          limit: matte.sharpLimit) })
+            // 所有人（不只对焦的那个）：渲染时人身上不做焦外高光提亮
+            seeds?.people = allPeople?.resized(width: map.width, height: map.height)
         }
 
         return FramePlan(lens: lens, focusPoint: (fx, fy), streamFocusPoint: p, focusRecentered: recentered,
@@ -751,6 +753,8 @@ public final class LiveFrameAnalyzer {
                                        parameters: matte, scale: relativeScale, personMask: person, lens: lens,
                                        sharpPeople: allPeople.flatMap { sharpPeople($0, depth: map, lens: lens,
                                                                                     limit: matte.sharpLimit) })
+            // 所有人：人身上不做焦外高光提亮（同 analyze）
+            seeds?.people = allPeople?.resized(width: map.width, height: map.height)
         }
         return FramePlan(lens: lens, focusPoint: focusPoint, streamFocusPoint: focusPoint, focusRecentered: false,
                          focusDisparity: focusD, focusDistance: relativeDepth ? nil : 1 / max(focusD, 1e-3),

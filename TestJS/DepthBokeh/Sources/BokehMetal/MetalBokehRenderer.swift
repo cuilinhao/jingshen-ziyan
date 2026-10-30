@@ -177,6 +177,8 @@ public final class MetalBokehRenderer {
         let connectTex = seeds?.connect.map { slot.upload($0, into: \.connect, device: device) }
         let extraTex = seeds?.extra.map { slot.upload($0, into: \.extra, device: device) }
         let personTex = seeds?.person.map { slot.upload($0, into: \.person, device: device) }
+        // 所有人的遮罩：人身上不做焦外高光提亮（CPU 版 render 的 highlightExclusion）
+        let peopleTex = seeds?.people.map { slot.upload($0, into: \.people, device: device) }
 
         var gpuLens = GPULens(lens, longSide: L)
         let centers = plan.layerCenters
@@ -329,7 +331,8 @@ public final class MetalBokehRenderer {
         let hasBoostHistory = temporal.map { $0.hasBoostHistory && $0.hasDepthHistory } ?? false
         var lp = GPULayerParams(count: Int32(centers.count), zeroIndex: Int32(zeroIndex), tilesX: Int32(tilesX),
                                 tilesY: Int32(tilesY), highlightThreshold: quality.highlightThreshold,
-                                highlightGain: gain, hasBoostHistory: hasBoostHistory ? 1 : 0, pad: 0)
+                                highlightGain: gain, hasBoostHistory: hasBoostHistory ? 1 : 0,
+                                hasPeople: peopleTex != nil ? 1 : 0)
         var centerValues = centers
         run(enc, "cocKernel", lw, lh) { e in
             e.setTexture(depthCur, index: 0); e.setTexture(low, index: 1)
@@ -350,6 +353,7 @@ public final class MetalBokehRenderer {
             e.setTexture(hasBoostHistory ? prevBoost : self.dummy, index: 4)
             e.setTexture(temporal != nil ? ws.blend : self.dummy, index: 5)
             e.setTexture(boostOut, index: 6)
+            e.setTexture(peopleTex ?? self.dummy, index: 7)
             e.setBuffer(ws.src, offset: 0, index: 0)
             self.setValue(e, &lp, 1)
         }
@@ -758,6 +762,7 @@ final class UploadSlot {
     var connect: MTLTexture?
     var extra: MTLTexture?
     var person: MTLTexture?
+    var people: MTLTexture?
 
     func upload(_ map: FloatMap, into key: ReferenceWritableKeyPath<UploadSlot, MTLTexture?>, device: MTLDevice) -> MTLTexture {
         var t = self[keyPath: key]
@@ -857,7 +862,8 @@ struct GPULayerParams {
     var highlightThreshold: Float
     var highlightGain: Float
     var hasBoostHistory: Int32
-    var pad: Int32
+    /// 1 = boostKernel 有人像遮罩（texture 7），人身上不提亮。占的是原来的 pad，结构体大小不变
+    var hasPeople: Int32
 }
 
 struct GPULayerPass {

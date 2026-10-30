@@ -48,6 +48,8 @@ extension BokehRenderer {
         if let sh = subject, seeds == nil {
             seeds = Self.computeSeeds(full: full, disparity: disparity, lens: lens, hint: sh)
         }
+        // 所有人的遮罩：人身上不做焦外高光提亮。和 GPU 版一样，没有对焦视差时不用种子
+        let people = lens.focusDisparity > 0 ? seeds?.people : nil
         if scale >= 0.95 {
             let luma = full.perceptualLuma()
             var d = DepthRefiner.refine(disparity: disparity, guide: full, passes: refinePasses, guideLuma: luma)
@@ -61,7 +63,8 @@ extension BokehRenderer {
                                        parameters: sh.parameters, scale: lens.relativeScale, seeds: seeds).0
             }
             return render(image: full, disparity: d, lens: lens, quality: quality, temporal: temporal,
-                          centers: layerCenters)
+                          centers: layerCenters,
+                          highlightExclusion: people.map { SubjectMatte.sampleAt($0, width: full.width, height: full.height) })
         }
         stageTimings.removeAll(keepingCapacity: true)
         var mark = DispatchTime.now().uptimeNanoseconds
@@ -92,7 +95,8 @@ extension BokehRenderer {
         }
         lap("主体遮罩")
         var bokeh = render(image: low, disparity: dLow, lens: lens, quality: quality, temporal: temporal,
-                           centers: layerCenters)
+                           centers: layerCenters,
+                           highlightExclusion: people.map { SubjectMatte.sampleAt($0, width: lw, height: lh) })
         lap("虚化")
         stageTimings += renderTimings.map { ("虚化." + $0.0, $0.1) }
 
@@ -180,9 +184,11 @@ extension BokehRenderer {
     static func computeSeeds(full: PlanarImage, disparity: FloatMap, lens: LensParameters, hint: SubjectHint) -> SubjectSeeds {
         let filled = DepthRefiner.fillInvalid(disparity)
         let colors = full.resized(width: filled.width, height: filled.height)
-        return SubjectMatte.seeds(depth: filled, colors: colors, focusDisparity: lens.focusDisparity,
-                                  focusPoint: hint.point, parameters: hint.parameters, scale: lens.relativeScale,
-                                  personMask: hint.personMask, lens: lens)
+        var seeds = SubjectMatte.seeds(depth: filled, colors: colors, focusDisparity: lens.focusDisparity,
+                                       focusPoint: hint.point, parameters: hint.parameters, scale: lens.relativeScale,
+                                       personMask: hint.personMask, lens: lens)
+        seeds.people = hint.personMask?.resized(width: filled.width, height: filled.height)
+        return seeds
     }
 
     /// 缩小到指定长边：整数倍时用盒式平均（快），否则用通用缩放

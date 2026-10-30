@@ -38,9 +38,11 @@ public final class BokehRenderer {
 
     public init() {}
 
+    /// - highlightExclusion: 和 image 同尺寸的人像遮罩（0…1）：人身上不做焦外高光提亮（GPU 版 boostKernel 的 people）
     public func render(image: PlanarImage, disparity: FloatMap,
                        lens: LensParameters, quality: RenderQuality = .photo,
-                       temporal: TemporalState? = nil, centers givenCenters: [Float]? = nil) -> PlanarImage {
+                       temporal: TemporalState? = nil, centers givenCenters: [Float]? = nil,
+                       highlightExclusion: [Float]? = nil) -> PlanarImage {
         precondition(image.width == disparity.width && image.height == disparity.height,
                      "视差图需要先缩放到和图像相同的尺寸（见 DepthRefiner.refine）")
         let start = DispatchTime.now()
@@ -187,6 +189,11 @@ public final class BokehRenderer {
                 }
             }
             let smooth = quality.smoothHighlights
+            // 人身上（衣服、皮肤）不提亮：人不会是光源。被顶灯照亮的白 T 恤肩膀和旁边的黑椅子对比很强、面积又不大，
+            // 光看亮度和对比度分不出它和灯，提亮后模糊开就是一大片过曝的光晕。遮罩边缘放宽一点（0.1–0.5），衣服边也算
+            let keep: [Float]? = highlightExclusion.flatMap { e in
+                e.count == n ? e.map { 1 - Self.smoothstep(0.1, 0.5, $0) } : nil
+            }
             var boost = [Float](repeating: 1, count: n)
             boost.withUnsafeMutableBufferPointer { op in
             s.withUnsafeBufferPointer { sp in
@@ -196,8 +203,8 @@ public final class BokehRenderer {
                         let i = y * w + x
                         let m = maxC[i]
                         if m <= thr { continue }
-                        // 只对要被虚化的像素提亮，清晰区域保持原样
-                        let blurAmount = min(1, abs(S[i]) / 2)
+                        // 只对要被虚化的像素提亮，清晰区域保持原样；人身上不提亮
+                        let blurAmount = min(1, abs(S[i]) / 2) * (keep?[i] ?? 1)
                         if smooth {
                             // 新算法：提亮量随亮度、对比度平滑变化（过渡带宽 0.4，旧的只有 0.1），
                             // 亮度有 1% 的波动，提亮量只变 2–3%，而不是 20%

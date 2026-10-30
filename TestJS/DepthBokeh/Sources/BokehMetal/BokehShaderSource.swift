@@ -621,7 +621,7 @@ struct LayerParams {
     float highlightThreshold;
     float highlightGain;      // 0 = 不提亮
     int hasBoostHistory;
-    int pad;
+    int hasPeople;            // 1 = 有人像遮罩（boostKernel 的 texture 7）：人身上不提亮
 };
 
 // s = 带符号的模糊半径；layerOut = (lo, t)（lo 层占 1 − t，lo+1 层占 t）；maxC = max(r, g, b)
@@ -661,6 +661,7 @@ kernel void boostKernel(texture2d<float, access::read> low [[texture(0)]],
                         texture2d<float, access::read> prevBoost [[texture(4)]],
                         texture2d<float, access::read> blend [[texture(5)]],
                         texture2d<float, access::write> boostOut [[texture(6)]],
+                        texture2d<float, access::read> people [[texture(7)]],
                         device float4* srcOut [[buffer(0)]],
                         constant LayerParams& lp [[buffer(1)]],
                         uint2 gid [[thread_position_in_grid]]) {
@@ -671,7 +672,9 @@ kernel void boostKernel(texture2d<float, access::read> low [[texture(0)]],
     if (gain > 0.0f) {
         float m = maxC.read(gid).x;
         if (m > thr) {
-            float blurAmount = min(1.0f, fabs(sTex.read(gid).x) / 2.0f);
+            // 人身上不提亮（同 CPU：人像遮罩按 SubjectMatte.sampleAt 采样，边缘放宽到 0.1–0.5）
+            float keep = lp.hasPeople != 0 ? 1.0f - smoothstepf(0.1f, 0.5f, resampleTex(people, gid, w, h).x) : 1.0f;
+            float blurAmount = min(1.0f, fabs(sTex.read(gid).x) / 2.0f) * keep;
             float k = smoothstepf(thr, 1.0f, m);
             float contrast = smoothstepf(0.1f, 0.4f, m - localMean.read(gid).x);
             b = 1.0f + gain * k * k * contrast * blurAmount;
