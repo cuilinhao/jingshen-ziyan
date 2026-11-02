@@ -34,6 +34,12 @@ final class DepthModelStore: @unchecked Sendable {   // mutable state is guarded
     private var progressObservation: NSKeyValueObservation?
     private var lastReportedProgress = -1.0
     private let work = DispatchQueue(label: "depthbokeh.depthmodel", qos: .userInitiated)
+    /// 神经网络引擎版单独一个队列加载（它第一次要编译很久，不能挡住 GPU 版）
+    private let neuralEngineWork = DispatchQueue(label: "depthbokeh.depthmodel.ane", qos: .userInitiated)
+    /// 已经换上神经网络引擎版（lock 保护）
+    private var usingNeuralEngine = false
+    /// 还没加载完的版本数（lock 保护）
+    private var loadsPending = 0
     private let session: URLSession = {
         let config = URLSessionConfiguration.default
         config.timeoutIntervalForRequest = 20       // fail fast on a blocked host, then try the mirror
@@ -222,18 +228,43 @@ final class DepthModelStore: @unchecked Sendable {   // mutable state is guarded
         }
     }
 
+    /// 同一个模型同时加载两份，先好的先用：
+    ///  - GPU 版（.cpuAndGPU）：不用在神经网络引擎上编译，几秒就能用，切到 0.5× 不用干等
+    ///  - 神经网络引擎版（.all）：每次装到手机上后第一次加载要编译几十秒到一分钟（之后有系统缓存，一两秒就好）；
+    ///    推理更快、更省电，也不和预览的 Metal 渲染抢 GPU。好了就换上它，GPU 版随之释放
+    /// 有缓存时神经网络引擎版通常先好，GPU 版晚到就直接丢掉。
     private func load(compiledURL: URL) {
         setStatus(.compiling)
+        lock.lock()
+        usingNeuralEngine = false
+        loadsPending = 2
+        lock.unlock()
+        neuralEngineWork.async { self.load(compiledURL: compiledURL, neuralEngine: true) }
+        load(compiledURL: compiledURL, neuralEngine: false)   // work 队列
+    }
+
+    private func load(compiledURL: URL, neuralEngine: Bool) {
         let t0 = Date()
-        let estimator = MonocularDepthEstimator(compiledModelURL: compiledURL)
-        // 每次装到手机上后第一次加载会在神经网络引擎上编译，明显更慢；之后用系统缓存，很快
-        print(String(format: "[DepthModel] 加载%@，用时 %.1f 秒", estimator == nil ? "失败" : "完成", Date().timeIntervalSince(t0)))
-        if let estimator {
-            lock.lock()
+        let estimator = MonocularDepthEstimator(compiledModelURL: compiledURL,
+                                                computeUnits: neuralEngine ? .all : .cpuAndGPU)
+        print(String(format: "[DepthModel] %@加载%@，用时 %.1f 秒", neuralEngine ? "神经网络引擎版" : "GPU 版",
+                     estimator == nil ? "失败" : "完成", Date().timeIntervalSince(t0)))
+        lock.lock()
+        loadsPending -= 1
+        var becameReady = false
+        var swapped = false
+        // GPU 版晚到时不覆盖已经换上的神经网络引擎版
+        if let estimator, neuralEngine || !usingNeuralEngine {
+            becameReady = loadedEstimator == nil
+            swapped = !becameReady
             loadedEstimator = estimator
-            lock.unlock()
-            setStatus(.ready)
-        } else {
+            if neuralEngine { usingNeuralEngine = true }
+        }
+        let failed = loadsPending == 0 && loadedEstimator == nil
+        lock.unlock()
+        if becameReady { setStatus(.ready) }
+        if swapped { print("[DepthModel] 已换成神经网络引擎版") }
+        if failed {
             // A damaged install: delete it so the next attempt downloads a fresh copy.
             if compiledURL == installedURL { try? FileManager.default.removeItem(at: compiledURL) }
             setStatus(.failed("模型加载失败，点击重试"))

@@ -35,9 +35,11 @@ final class MonocularDepthEstimator: @unchecked Sendable {   // all mutable stat
     /// Set to false for a model that outputs metric depth (bigger = farther).
     static let outputIsInverseDepth = true
 
-    init?(compiledModelURL: URL) {
+    /// - Parameter computeUnits: `.all` 会用神经网络引擎（快、省电，但每次装到手机上后第一次加载要编译几十秒）；
+    ///   `.cpuAndGPU` 不用神经网络引擎，几秒就能加载好
+    init?(compiledModelURL: URL, computeUnits: MLComputeUnits = .all) {
         let config = MLModelConfiguration()
-        config.computeUnits = .all
+        config.computeUnits = computeUnits
         guard let model = try? MLModel(contentsOf: compiledModelURL, configuration: config) else {
             print("[Depth] cannot load \(compiledModelURL.lastPathComponent)")
             return nil
