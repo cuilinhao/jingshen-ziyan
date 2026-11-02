@@ -299,6 +299,22 @@ final class PersonSegmenter: @unchecked Sendable {   // 可变状态都由 lock 
                                        height: max(1, Int((Double(h) * s).rounded())), crop: 1)
     }
 
+    /// 预热拍照用到的 Vision 模型：每个请求在一张小灰图上跑一次，让模型提前加载好（Vision 会在进程里缓存模型）。
+    /// 第一次加载要一点时间，放在启动时的后台队列上做，第一张照片就不用等。
+    static func warmUpPhotoModels() {
+        let t0 = Date()
+        guard let ctx = CGContext(data: nil, width: 256, height: 192, bitsPerComponent: 8, bytesPerRow: 0,
+                                  space: CGColorSpaceCreateDeviceRGB(),
+                                  bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue) else { return }
+        ctx.setFillColor(CGColor(gray: 0.5, alpha: 1))
+        ctx.fill(CGRect(x: 0, y: 0, width: 256, height: 192))
+        guard let image = ctx.makeImage() else { return }
+        _ = photoMask(image)
+        _ = photoPersonInstances(image)
+        _ = photoObjects(image)
+        print(String(format: "[Photo] Vision 模型预热完成，用时 %.1f 秒", Date().timeIntervalSince(t0)))
+    }
+
     /// 拍下来的照片（传感器方向）用高质量的分割
     static func photoMask(_ image: CGImage, orientation: CGImagePropertyOrientation = .right) -> FloatMap? {
         let request = VNGeneratePersonSegmentationRequest()

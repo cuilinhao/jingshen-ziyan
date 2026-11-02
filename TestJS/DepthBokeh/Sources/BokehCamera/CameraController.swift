@@ -118,6 +118,8 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
     private var _focusLocked = false
     /// 对焦点：当前相机画面（未裁切）里的归一化坐标，传感器方向
     private var _focusPoint = CGPoint(x: 0.5, y: 0.5)
+    /// 按下快门的时间（拍照计时日志用，paramLock 保护）
+    private var captureRequestedAt: CFTimeInterval = 0
     private var focusResetPending = false
     // 预览平滑变焦（点数字时 0.3 秒、对数空间匀速）
     private var glideFrom: CGFloat = 1
@@ -446,9 +448,15 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
     // MARK: - 启停
 
     public func start() {
-        // 0.5× 超广角的 AI 深度模型：App 里打包了（或之前下载过）就马上加载
-        if DepthModelStore.shared.isAvailableOffline {
-            DepthModelStore.shared.prepare()
+        // 先预热拍照要用的 Vision 模型（高质量人像分割、人像实例、物体分割），再加载 0.5× 超广角的 AI 深度模型。
+        // 深度模型（Depth Anything V2）每次装到手机上后第一次加载，要在神经网络引擎上编译，可能几十秒到一分钟；
+        // 这期间拍照路径上的 Vision 模型第一次加载很可能排在它后面，第一张照片就要等它编完（第二张就快了），
+        // 用日志里的 [DepthModel] / [Photo] 计时确认。
+        // 先让 Vision 模型加载好，深度模型再慢慢编译，拍照就不用等它。
+        let loadDepthModel = DepthModelStore.shared.isAvailableOffline
+        DispatchQueue.global(qos: .userInitiated).async {
+            PersonSegmenter.warmUpPhotoModels()
+            if loadDepthModel { DepthModelStore.shared.prepare() }
         }
         switch AVCaptureDevice.authorizationStatus(for: .video) {
         case .authorized:
@@ -758,6 +766,9 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
                     conn.isVideoMirrored = false
                 }
             }
+            self.paramLock.lock()
+            self.captureRequestedAt = CACurrentMediaTime()
+            self.paramLock.unlock()
             self.photoOutput.capturePhoto(with: settings, delegate: self)
         }
     }
@@ -1644,7 +1655,9 @@ extension DepthCameraController: AVCapturePhotoCaptureDelegate {
         let segmentationOn = useSegmentation
         paramLock.lock()
         let streamFocus = _focusPoint
+        let requestedAt = captureRequestedAt
         paramLock.unlock()
+        let callbackAt = CACurrentMediaTime()
         guard error == nil, let cgFull = photo.cgImageRepresentation() else {
             DispatchQueue.main.async {
                 self.showStatusMessage("拍照失败：\(error?.localizedDescription ?? "没有图像数据")")
@@ -1657,6 +1670,7 @@ extension DepthCameraController: AVCapturePhotoCaptureDelegate {
             (self.lastFrameCrop, !self.depthExpected, self.frameOrientation, self.lastPublishedZoom,
              self.lastFocusWasLocked ? self.lastFocusDisparity : nil)
         }
+        let syncedAt = CACurrentMediaTime()
         let depth = photo.depthData
         let orientationRaw = (photo.metadata[kCGImagePropertyOrientation as String] as? NSNumber)?.uint32Value ?? 1
         let photoOrientation = CGImagePropertyOrientation(rawValue: orientationRaw) ?? .up
@@ -1675,8 +1689,18 @@ extension DepthCameraController: AVCapturePhotoCaptureDelegate {
                             y: min(max(0.5 + (photoFocus.y - 0.5) * c, 0), 1))
 
         photoQueue.async {
+            // 拍照计时日志：每一步用了多久（排查「第一张照片要等很久」）
+            var steps = [String(format: "相机出片 %.0fms", (callbackAt - requestedAt) * 1000),
+                         String(format: "等数据队列 %.0fms", (syncedAt - callbackAt) * 1000)]
+            var stepStart = CACurrentMediaTime()
+            func mark(_ name: String) {
+                let now = CACurrentMediaTime()
+                steps.append(String(format: "%@ %.0fms", name, (now - stepStart) * 1000))
+                stepStart = now
+            }
             let cg = ImageBridge.centerCrop(cgFull, by: c)
             let image = ImageBridge.planarImage(from: cg, maxLongSide: longSide)
+            mark("裁切转换")
             var disparity: FloatMap?
             var relative = false
             if let depth {
@@ -1689,14 +1713,19 @@ extension DepthCameraController: AVCapturePhotoCaptureDelegate {
                 disparity = mono
                 relative = true
             }
+            mark("深度")
             // 没有深度（光线太暗、AI 模型没准备好）：整张图当作在对焦面上
             let hasDepth = disparity != nil
             // 人像分割（高质量）：对焦在人身上时整个人保持清晰；物体分割：对焦的物体整个保持清晰。和预览一致
             // 分割开关关掉时照片也只按深度
             let person = hasDepth && segmentationOn ? PersonSegmenter.photoMask(cg, orientation: photoOrientation) : nil
+            mark("人像分割")
             // 人像实例：画面上和对焦的人挨着的别人（后面站着的同事）不跟着保持清晰
             let people = person != nil ? PersonSegmenter.photoPersonInstances(cg, orientation: photoOrientation) : nil
+            mark("人像实例")
             let objects = hasDepth && segmentationOn ? PersonSegmenter.photoObjects(cg, orientation: photoOrientation) : nil
+            mark("物体分割")
+            print("[Photo] " + steps.joined(separator: " · "))
             let captured = CapturedDepthPhoto(image: image,
                                               disparity: disparity ?? FloatMap(width: 64, height: 48, repeating: 1),
                                               orientation: orientation, focusPoint: focus, fNumber: fNumber,

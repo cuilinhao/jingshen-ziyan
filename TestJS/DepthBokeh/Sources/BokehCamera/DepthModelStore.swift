@@ -224,7 +224,11 @@ final class DepthModelStore: @unchecked Sendable {   // mutable state is guarded
 
     private func load(compiledURL: URL) {
         setStatus(.compiling)
-        if let estimator = MonocularDepthEstimator(compiledModelURL: compiledURL) {
+        let t0 = Date()
+        let estimator = MonocularDepthEstimator(compiledModelURL: compiledURL)
+        // 每次装到手机上后第一次加载会在神经网络引擎上编译，明显更慢；之后用系统缓存，很快
+        print(String(format: "[DepthModel] 加载%@，用时 %.1f 秒", estimator == nil ? "失败" : "完成", Date().timeIntervalSince(t0)))
+        if let estimator {
             lock.lock()
             loadedEstimator = estimator
             lock.unlock()

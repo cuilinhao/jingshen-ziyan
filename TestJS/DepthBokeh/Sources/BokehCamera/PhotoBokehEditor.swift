@@ -85,6 +85,7 @@ public final class PhotoBokehEditor: ObservableObject, @unchecked Sendable {
             let (ui, focusD) = render(fNumber: p.fNumber, focus: p.focus,
                                       lockedFocus: p.useLock ? photo.lockedFocusDisparity : nil)
             let ms = (CACurrentMediaTime() - t0) * 1000
+            print(String(format: "[Photo] 编辑器渲染 %.0fms", ms))
             DispatchQueue.main.async {
                 if let ui { self.image = ui }
                 self.renderMilliseconds = ms
