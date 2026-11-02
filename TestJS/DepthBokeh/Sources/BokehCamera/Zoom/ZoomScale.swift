@@ -45,7 +45,9 @@ public struct ZoomScale {
 
     public static func nativeIndex(for factor: CGFloat, nativeFactors: [CGFloat]) -> Int? {
         let valid = nativeFactors.enumerated().filter { $0.element.isFinite && $0.element > 0 }
-        let value = factor.isFinite ? factor : 1
+        // 刻度盘位置和倍率来回换算有浮点误差：点 48（2×）回来是 1.9999999999999998，会被算成 1× 那一档，
+        // 于是 24 的位置也显示成 48。差一点点也算到了这一档
+        let value = (factor.isFinite ? factor : 1) * (1 + 1e-6)
         return valid.filter { $0.element <= value }.max { $0.element < $1.element }?.offset
             ?? valid.min { $0.element < $1.element }?.offset
     }
