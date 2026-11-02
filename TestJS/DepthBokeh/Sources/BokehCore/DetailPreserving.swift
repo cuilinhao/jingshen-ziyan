@@ -94,9 +94,13 @@ extension BokehRenderer {
             dLow = res.0; matte = res.1
         }
         lap("主体遮罩")
+        // 高光在全分辨率上逐像素判断，再按面积缩小（和像素格子的相位无关，细灯管不会一节一节地闪）
+        let highlights = quality.highlightGain > 0 && quality.smoothHighlights
+            ? Self.highlightMaps(full, width: lw, height: lh, threshold: quality.highlightThreshold) : nil
         var bokeh = render(image: low, disparity: dLow, lens: lens, quality: quality, temporal: temporal,
                            centers: layerCenters,
-                           highlightExclusion: people.map { SubjectMatte.sampleAt($0, width: lw, height: lh) })
+                           highlightExclusion: people.map { SubjectMatte.sampleAt($0, width: lw, height: lh) },
+                           highlights: highlights)
         lap("虚化")
         stageTimings += renderTimings.map { ("虚化." + $0.0, $0.1) }
 

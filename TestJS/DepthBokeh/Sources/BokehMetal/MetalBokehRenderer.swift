@@ -193,11 +193,15 @@ public final class MetalBokehRenderer {
         // 低分辨率原图：实时预览时留两份轮流写（沿用旧深度的帧要和上一帧比，见 StaleDepth）
         let low = temporal.map { $0.color[$0.cur] } ?? ws.low
         let lumaTex = temporal?.luma[temporal!.cur] ?? ws.luma
+        // 同时在全分辨率上逐像素算高光图 ws.hi（BokehRenderer.highlightMaps），给 boostKernel 用
         var down = GPUDown(cropOrigin: composite.cropOrigin, cropSize: composite.cropSize,
                            samples: Int32(min(4, max(1, Int((reg.width / Float(lw) / 2).rounded(.up))))),
-                           boxFactor: Int32(boxFactor), boxOrigin: composite.readOrigin)
+                           boxFactor: Int32(boxFactor), boxOrigin: composite.readOrigin,
+                           highlightThreshold: quality.highlightThreshold,
+                           hasHighlights: quality.highlightGain > 0 ? 1 : 0)
         run(enc, "downsampleKernel", lw, lh) { e in
             e.setTexture(source, index: 0); e.setTexture(low, index: 1); e.setTexture(lumaTex, index: 2)
+            e.setTexture(ws.hi, index: 3)
             self.setValue(e, &down, 0)
         }
 
@@ -354,6 +358,7 @@ public final class MetalBokehRenderer {
             e.setTexture(temporal != nil ? ws.blend : self.dummy, index: 5)
             e.setTexture(boostOut, index: 6)
             e.setTexture(peopleTex ?? self.dummy, index: 7)
+            e.setTexture(ws.hi, index: 8)
             e.setBuffer(ws.src, offset: 0, index: 0)
             self.setValue(e, &lp, 1)
         }
@@ -709,6 +714,8 @@ final class Workspace {
     let f4a, f4b, f4c, m1, m2, m3: MTLTexture
     let core, depthCore, alpha, r1a, r1b: MTLTexture
     let s, maxC, localMean, boost, bokeh, w: MTLTexture
+    /// 高光图：rgb = 颜色 × k² 的面积平均，a = 覆盖范围里最亮像素的最亮通道（downsampleKernel 写，boostKernel 读）
+    let hi: MTLTexture
     /// 沿用旧深度时（StaleDepth）：变了的程度 U、贴边范围 Us；1/4 分辨率的颜色、U、运动
     let staleU, staleUs, qNow, qPrev, qU, qFlow: MTLTexture
     let src, layerPos, prefix, lowOut, acc, fg: MTLBuffer
@@ -733,6 +740,7 @@ final class Workspace {
         f4a = t4(); f4b = t4(); f4c = t4(); m1 = t4(); m2 = t4(); m3 = t4()
         core = t1(); depthCore = t1(); alpha = t1(); r1a = t1(); r1b = t1()
         s = t1(); maxC = t1(); localMean = t1(); boost = t1(); bokeh = t4(); w = t1()
+        hi = t4()
         staleU = t1(); staleUs = t1()
         let bw = (width + StaleDepth.block - 1) / StaleDepth.block, bh = (height + StaleDepth.block - 1) / StaleDepth.block
         qNow = Self.texture(device, bw, bh, .rgba32Float); qPrev = Self.texture(device, bw, bh, .rgba32Float)
@@ -827,6 +835,8 @@ struct GPUDown {
     var samples: Int32
     var boxFactor: Int32
     var boxOrigin: SIMD2<Int32>
+    var highlightThreshold: Float
+    var hasHighlights: Int32
 }
 
 struct GPUTemporal {

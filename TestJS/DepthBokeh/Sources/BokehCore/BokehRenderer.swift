@@ -39,10 +39,12 @@ public final class BokehRenderer {
     public init() {}
 
     /// - highlightExclusion: 和 image 同尺寸的人像遮罩（0…1）：人身上不做焦外高光提亮（GPU 版 boostKernel 的 people）
+    /// - highlights: image 是从全分辨率缩小来的时候，在全分辨率上算好的高光（BokehRenderer.highlightMaps）。
+    ///   nil = image 本身就是全分辨率，逐像素算
     public func render(image: PlanarImage, disparity: FloatMap,
                        lens: LensParameters, quality: RenderQuality = .photo,
                        temporal: TemporalState? = nil, centers givenCenters: [Float]? = nil,
-                       highlightExclusion: [Float]? = nil) -> PlanarImage {
+                       highlightExclusion: [Float]? = nil, highlights: HighlightMaps? = nil) -> PlanarImage {
         precondition(image.width == disparity.width && image.height == disparity.height,
                      "视差图需要先缩放到和图像相同的尺寸（见 DepthRefiner.refine）")
         let start = DispatchTime.now()
@@ -194,36 +196,51 @@ public final class BokehRenderer {
             let keep: [Float]? = highlightExclusion.flatMap { e in
                 e.count == n ? e.map { 1 - Self.smoothstep(0.1, 0.5, $0) } : nil
             }
-            var boost = [Float](repeating: 1, count: n)
+            // 平滑版的高光：在全分辨率上逐像素算 颜色 × k²（k = smoothstep(阈值, 1, 最亮通道)），再按面积缩小到这里；
+            // 「是不是高光」看覆盖范围里最亮的那个像素（peak）。
+            // 以前直接看缩小后的颜色：远处 3–4 像素宽的细灯管，缩小 3 倍时和像素格子对齐的那一段平均下来还是 1.0（过门限、
+            // 提亮 2.5 倍），错开半格的那一段只剩 0.6–0.7（不提亮）。灯管略微倾斜，就变成一节亮一节暗的珠子；
+            // 手一抖，格子相位变了，珠子跟着跳（录屏 dengshanshuo）。逐像素算再按面积积分，和格子的相位无关
+            let hl = smooth ? highlights.flatMap { $0.energy.width == w && $0.energy.height == h ? $0 : nil } : nil
+            // 提亮量 f（0 = 不提亮）：输出 = 颜色 + f × 高光能量
+            var boost = [Float](repeating: 0, count: n)
             boost.withUnsafeMutableBufferPointer { op in
             s.withUnsafeBufferPointer { sp in
                 let O = op.baseAddress!, S = sp.baseAddress!
                 parallelFor(h) { y in
                     for x in 0..<w {
                         let i = y * w + x
-                        let m = maxC[i]
+                        let m = hl?.peak[i] ?? maxC[i]
                         if m <= thr { continue }
                         // 只对要被虚化的像素提亮，清晰区域保持原样；人身上不提亮
                         let blurAmount = min(1, abs(S[i]) / 2) * (keep?[i] ?? 1)
                         if smooth {
                             // 新算法：提亮量随亮度、对比度平滑变化（过渡带宽 0.4，旧的只有 0.1），
-                            // 亮度有 1% 的波动，提亮量只变 2–3%，而不是 20%
-                            let k = Self.smoothstep(thr, 1, m)
+                            // 亮度有 1% 的波动，提亮量只变 2–3%，而不是 20%。k² 在高光能量里
                             let contrast = Self.smoothstep(0.1, 0.4, m - localMean[i])
-                            O[i] = 1 + gain * k * k * contrast * blurAmount
+                            O[i] = gain * contrast * blurAmount
                         } else {
                             let k = Self.smoothstep(thr, 1, m)
                             let small = 1 - Self.smoothstep(0.15, 0.5, brightFraction[i])
                             let contrast = Self.smoothstep(0.1, 0.3, m - localMean[i])
-                            O[i] = 1 + gain * k * small * contrast * blurAmount
+                            O[i] = gain * k * small * contrast * blurAmount
                         }
                     }
                 }
             }}
-            // 实时预览：提亮系数向上一帧靠拢，光斑不闪
+            // 实时预览：提亮量向上一帧靠拢，光斑不闪
             temporal?.stabilizeBoost(&boost)
-            for i in 0..<n where boost[i] != 1 {
-                br[i] *= boost[i]; bg[i] *= boost[i]; bb[i] *= boost[i]
+            for i in 0..<n where boost[i] != 0 {
+                let f = boost[i]
+                if let hl {
+                    br[i] += f * hl.energy.r[i]; bg[i] += f * hl.energy.g[i]; bb[i] += f * hl.energy.b[i]
+                } else if smooth {
+                    // image 就是全分辨率：逐像素的 颜色 × k²
+                    let k = Self.smoothstep(thr, 1, maxC[i]), k2 = k * k
+                    br[i] += f * (image.r[i] * k2); bg[i] += f * (image.g[i] * k2); bb[i] += f * (image.b[i] * k2)
+                } else {
+                    br[i] += f * image.r[i]; bg[i] += f * image.g[i]; bb[i] += f * image.b[i]
+                }
             }
         }
 
@@ -628,6 +645,82 @@ public final class BokehRenderer {
             }
         }
         return runs
+    }
+}
+
+/// 高光提亮的输入（BokehRenderer.render 的 highlights）：在全分辨率上逐像素判断，再按面积缩小到低分辨率
+public struct HighlightMaps {
+    /// 每个低分辨率像素覆盖的全分辨率像素里，颜色 × k² 的面积平均（k = smoothstep(阈值, 1, 最亮通道)；不到阈值的像素是 0）
+    public var energy: PlanarImage
+    /// 覆盖范围里最亮那个像素的最亮通道
+    public var peak: [Float]
+
+    public init(energy: PlanarImage, peak: [Float]) {
+        self.energy = energy
+        self.peak = peak
+    }
+}
+
+extension BokehRenderer {
+    /// 全分辨率 → lw×lh 的高光图（GPU 版在 downsampleKernel 里一起算，写 hi 纹理）。
+    /// 整数倍缩小时和 downsample 的盒式平均一一对应（同样的求和顺序）；否则按每个低分辨率像素在原图上覆盖的面积加权
+    public static func highlightMaps(_ img: PlanarImage, width lw: Int, height lh: Int, threshold thr: Float) -> HighlightMaps {
+        let W = img.width, H = img.height, n = lw * lh
+        var er = [Float](repeating: 0, count: n), eg = er, eb = er, pk = er
+        let k = W / max(1, lw)
+        let box = k >= 1 && W == lw * k && H == lh * k
+        let sx = Float(W) / Float(lw), sy = Float(H) / Float(lh)
+        img.r.withUnsafeBufferPointer { rp in img.g.withUnsafeBufferPointer { gp in img.b.withUnsafeBufferPointer { bp in
+        er.withUnsafeMutableBufferPointer { erp in eg.withUnsafeMutableBufferPointer { egp in
+        eb.withUnsafeMutableBufferPointer { ebp in pk.withUnsafeMutableBufferPointer { pkp in
+            let R = rp.baseAddress!, G = gp.baseAddress!, B = bp.baseAddress!
+            let ER = erp.baseAddress!, EG = egp.baseAddress!, EB = ebp.baseAddress!, PK = pkp.baseAddress!
+            parallelFor(lh) { y in
+                for x in 0..<lw {
+                    var r: Float = 0, g: Float = 0, b: Float = 0, p: Float = 0
+                    if box {
+                        for yy in 0..<k {
+                            let row = (y * k + yy) * W + x * k
+                            for xx in 0..<k {
+                                let cr = R[row + xx], cg = G[row + xx], cb = B[row + xx]
+                                let m = max(cr, max(cg, cb))
+                                p = max(p, m)
+                                if m > thr {
+                                    let kk = smoothstep(thr, 1, m), k2 = kk * kk
+                                    r += cr * k2; g += cg * k2; b += cb * k2
+                                }
+                            }
+                        }
+                        let inv = 1 / Float(k * k)
+                        r *= inv; g *= inv; b *= inv
+                    } else {
+                        let fx0 = Float(x) * sx, fx1 = Float(x + 1) * sx
+                        let fy0 = Float(y) * sy, fy1 = Float(y + 1) * sy
+                        for iy in max(0, Int(fy0))..<min(H, Int(fy1.rounded(.up))) {
+                            let wy = min(Float(iy + 1), fy1) - max(Float(iy), fy0)
+                            if wy <= 0 { continue }
+                            for ix in max(0, Int(fx0))..<min(W, Int(fx1.rounded(.up))) {
+                                let wx = min(Float(ix + 1), fx1) - max(Float(ix), fx0)
+                                if wx <= 0 { continue }
+                                let i = iy * W + ix
+                                let cr = R[i], cg = G[i], cb = B[i]
+                                let m = max(cr, max(cg, cb))
+                                p = max(p, m)
+                                if m > thr {
+                                    let kk = smoothstep(thr, 1, m), k2 = kk * kk * wx * wy
+                                    r += cr * k2; g += cg * k2; b += cb * k2
+                                }
+                            }
+                        }
+                        let inv = 1 / (sx * sy)
+                        r *= inv; g *= inv; b *= inv
+                    }
+                    let o = y * lw + x
+                    ER[o] = r; EG[o] = g; EB[o] = b; PK[o] = p
+                }
+            }
+        }}}}}}}
+        return HighlightMaps(energy: PlanarImage(width: lw, height: lh, r: er, g: eg, b: eb), peak: pk)
     }
 }
 

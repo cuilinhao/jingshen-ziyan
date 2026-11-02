@@ -115,26 +115,45 @@ struct DownParams {
     int samples;              // 采样路径：每个轴的采样数
     int boxFactor;            // > 0：整数倍，用 read() 做 k×k 盒式平均（和 CPU 的 downsample 一样）
     int2 boxOrigin;           // 盒式路径：源图的像素坐标
+    float highlightThreshold; // 高光图（hi）：k = smoothstep(阈值, 1, 最亮通道)
+    int hasHighlights;        // 1 = 写 hi（要做高光提亮时）
 };
 
+// hi = 高光图（BokehRenderer.highlightMaps）：rgb = 覆盖的全分辨率像素里 颜色 × k² 的面积平均，a = 其中最亮那个像素的最亮通道。
+// 高光在全分辨率上逐像素判断再按面积缩小，和像素格子的相位无关：以前看缩小后的颜色，远处 3–4 像素宽的细灯管
+// 和格子对齐的那段过门限、错开的那段不过，虚化后一节一节，手一抖就跳（录屏 dengshanshuo）
 kernel void downsampleKernel(texture2d<float, access::sample> src [[texture(0)]],
                              texture2d<float, access::write> low [[texture(1)]],
                              texture2d<float, access::write> luma [[texture(2)]],
+                             texture2d<float, access::write> hi [[texture(3)]],
                              constant DownParams& p [[buffer(0)]],
                              uint2 gid [[thread_position_in_grid]]) {
     uint w = low.get_width(), h = low.get_height();
     if (gid.x >= w || gid.y >= h) { return; }
+    float thr = p.highlightThreshold;
     float3 c;
+    float3 e = float3(0.0f);
+    float pk = 0.0f;
     if (p.boxFactor > 0) {
         int k = p.boxFactor;
         float3 s = float3(0.0f);
         for (int yy = 0; yy < k; yy++) {
             for (int xx = 0; xx < k; xx++) {
                 uint2 q = uint2(p.boxOrigin.x + int(gid.x) * k + xx, p.boxOrigin.y + int(gid.y) * k + yy);
-                s += src.read(q).rgb;
+                float3 v = src.read(q).rgb;
+                s += v;
+                if (p.hasHighlights != 0) {
+                    float m = maxComponent(v);
+                    pk = max(pk, m);
+                    if (m > thr) {
+                        float kk = smoothstepf(thr, 1.0f, m);
+                        e += v * (kk * kk);
+                    }
+                }
             }
         }
         c = s * (1.0f / float(k * k));
+        e *= 1.0f / float(k * k);
     } else {
         constexpr sampler smp(filter::linear, address::clamp_to_edge, coord::normalized);
         float2 cell = p.cropSize / float2(float(w), float(h));
@@ -148,8 +167,33 @@ kernel void downsampleKernel(texture2d<float, access::sample> src [[texture(0)]]
             }
         }
         c = s / float(n * n);
+        if (p.hasHighlights != 0) {
+            // 高光图按每个低分辨率像素在源图上覆盖的面积加权（逐像素 read，不用双线性采样：采样值也和相位有关）
+            int sw = int(src.get_width()), sh = int(src.get_height());
+            float2 f0 = origin * float2(float(sw), float(sh));
+            float2 f1 = (origin + cell) * float2(float(sw), float(sh));
+            int x0 = max(0, int(f0.x)), x1 = min(sw, int(ceil(f1.x)));
+            int y0 = max(0, int(f0.y)), y1 = min(sh, int(ceil(f1.y)));
+            for (int iy = y0; iy < y1; iy++) {
+                float wy = min(float(iy + 1), f1.y) - max(float(iy), f0.y);
+                if (wy <= 0.0f) { continue; }
+                for (int ix = x0; ix < x1; ix++) {
+                    float wx = min(float(ix + 1), f1.x) - max(float(ix), f0.x);
+                    if (wx <= 0.0f) { continue; }
+                    float3 v = src.read(uint2(ix, iy)).rgb;
+                    float m = maxComponent(v);
+                    pk = max(pk, m);
+                    if (m > thr) {
+                        float kk = smoothstepf(thr, 1.0f, m);
+                        e += v * (kk * kk * wx * wy);
+                    }
+                }
+            }
+            e *= 1.0f / max((f1.x - f0.x) * (f1.y - f0.y), 1e-6f);
+        }
     }
     low.write(float4(c, 1.0f), gid);
+    hi.write(float4(e, pk), gid);
     float y = 0.2126f * c.r + 0.7152f * c.g + 0.0722f * c.b;
     luma.write(float4(encodeSRGB(y), 0.0f, 0.0f, 0.0f), gid);
 }
@@ -654,6 +698,8 @@ kernel void cocKernel(texture2d<float, access::read> depth [[texture(0)]],
 }
 
 // 高光提亮（平滑版）+ 跨帧稳定。输出 src = 颜色 × 提亮 —— 分层模糊的输入
+// 输出 src = 颜色 + b × 高光能量（hi.rgb，k² 已经在里面），b = 提亮量（0 = 不提亮）。「是不是高光」看 hi.a（覆盖范围里最亮的像素）；
+// maxC（缩小后颜色的最亮通道）只用来算 localMean
 kernel void boostKernel(texture2d<float, access::read> low [[texture(0)]],
                         texture2d<float, access::read> sTex [[texture(1)]],
                         texture2d<float, access::read> maxC [[texture(2)]],
@@ -662,22 +708,25 @@ kernel void boostKernel(texture2d<float, access::read> low [[texture(0)]],
                         texture2d<float, access::read> blend [[texture(5)]],
                         texture2d<float, access::write> boostOut [[texture(6)]],
                         texture2d<float, access::read> people [[texture(7)]],
+                        texture2d<float, access::read> hi [[texture(8)]],
                         device float4* srcOut [[buffer(0)]],
                         constant LayerParams& lp [[buffer(1)]],
                         uint2 gid [[thread_position_in_grid]]) {
     uint w = boostOut.get_width(), h = boostOut.get_height();
     if (gid.x >= w || gid.y >= h) { return; }
     float thr = lp.highlightThreshold, gain = lp.highlightGain;
-    float b = 1.0f;
+    float b = 0.0f;
+    float3 energy = float3(0.0f);
     if (gain > 0.0f) {
-        float m = maxC.read(gid).x;
+        float4 hv = hi.read(gid);
+        energy = hv.rgb;
+        float m = hv.a;
         if (m > thr) {
             // 人身上不提亮（同 CPU：人像遮罩按 SubjectMatte.sampleAt 采样，边缘放宽到 0.1–0.5）
             float keep = lp.hasPeople != 0 ? 1.0f - smoothstepf(0.1f, 0.5f, resampleTex(people, gid, w, h).x) : 1.0f;
             float blurAmount = min(1.0f, fabs(sTex.read(gid).x) / 2.0f) * keep;
-            float k = smoothstepf(thr, 1.0f, m);
             float contrast = smoothstepf(0.1f, 0.4f, m - localMean.read(gid).x);
-            b = 1.0f + gain * k * k * contrast * blurAmount;
+            b = gain * contrast * blurAmount;
         }
         if (lp.hasBoostHistory != 0) {
             b += blend.read(gid).x * (prevBoost.read(gid).x - b);
@@ -685,7 +734,7 @@ kernel void boostKernel(texture2d<float, access::read> low [[texture(0)]],
     }
     boostOut.write(float4(b, 0.0f, 0.0f, 0.0f), gid);
     float3 c = low.read(gid).rgb;
-    if (b != 1.0f) { c *= b; }
+    if (b != 0.0f) { c += b * energy; }
     srcOut[gid.y * w + gid.x] = float4(c, 0.0f);
 }
 

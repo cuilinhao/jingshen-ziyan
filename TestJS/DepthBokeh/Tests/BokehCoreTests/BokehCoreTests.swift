@@ -706,6 +706,79 @@ final class BokehCoreTests: XCTestCase {
         XCTAssertLessThan(plan.seeds?.extra?[104, 78] ?? 1, 0.5)
     }
 
+    /// 录屏 dengshanshuo：对焦近处的柜子，远处天花板上细长的灯管（过曝、略微倾斜）虚化后一节亮一节暗，手一抖就闪。
+    /// 以前高光提亮看缩小 3 倍以后的颜色：4 像素宽的灯管和像素格子对齐的那段平均下来还是 1.0（提亮），
+    /// 错开半格的那段只剩 0.6–0.7（不提亮）。现在在全分辨率上逐像素判断再按面积缩小（BokehRenderer.highlightMaps）
+    func testThinTubeHighlightIsPhaseInvariant() {
+        let W = 720, H = 540, dw = 160, dh = 120
+        var d = [Float](repeating: 1 / 5, count: dw * dh)                       // 远处 5 m
+        for y in dh * 6 / 10..<dh { for x in 0..<dw { d[y * dw + x] = 1 / 0.6 } } // 近处的柜子 0.6 m（对焦）
+        let disparity = FloatMap(width: dw, height: dh, values: d)
+        /// beads：灯管中心线上亮度的起伏（(p95 − p5) / 平均）；segments：每 16 列一段、跟着灯管走的 ±30 像素窗口里的总亮度
+        func render(dy: Float, gain: Float = RenderQuality.preview.highlightGain) -> (beads: Float, segments: [Float]) {
+            var r = [Float](repeating: 0.12, count: W * H)
+            for y in 0..<H {
+                for x in 0..<W {
+                    let i = y * W + x
+                    if y >= H * 6 / 10 { r[i] = 0.5; continue }
+                    // 4 像素宽、每 16 像素往下斜 1 像素的过曝灯管，按覆盖比例抗锯齿
+                    let c = 120 + dy + Float(x) / 16, fy = Float(y) + 0.5
+                    let cover = max(0, min(fy + 0.5, c + 2) - max(fy - 0.5, c - 2))
+                    r[i] = 0.12 + cover * 0.88
+                }
+            }
+            let pipeline = LivePreviewPipeline()
+            pipeline.settings.quality.highlightGain = gain
+            var out: PlanarImage!
+            for t in 0..<3 {
+                out = pipeline.process(LivePreviewPipeline.Frame(
+                    image: PlanarImage(width: W, height: H, r: r, g: r, b: r), disparity: disparity, relativeDepth: false,
+                    crop: 1, fNumber: 2.8, focusPoint: (0.5, 0.8), focusTapped: t == 0, time: Double(t) / 30,
+                    focalLength35mm: 24)).image
+            }
+            var line: [Float] = [], segments: [Float] = []
+            for x0 in stride(from: 96, to: 624, by: 16) {
+                var sum: Float = 0
+                for x in x0..<(x0 + 16) {
+                    let c = 120 + dy + Float(x) / 16
+                    line.append(out.r[Int(c) * W + x])
+                    for y in (Int(c) - 30)...(Int(c) + 30) { sum += out.r[y * W + x] }
+                }
+                segments.append(sum)
+            }
+            line.sort()
+            let mean = line.reduce(0, +) / Float(line.count)
+            return ((line[line.count * 95 / 100] - line[line.count * 5 / 100]) / mean, segments)
+        }
+        func change(_ a: [Float], _ b: [Float]) -> Float {
+            zip(a, b).map { abs($1 / $0 - 1) }.max()!
+        }
+        let a = render(dy: 0), b = render(dy: 1), c = render(dy: 1.5), off = render(dy: 0, gain: 0)
+        // 不提亮时这样量出来的起伏约 6%（取中心线时整数行的误差）；以前提亮后约 59%，挪 1 像素同一段亮度变 20%
+        XCTAssertLessThan(a.beads, off.beads + 0.05, "沿灯管亮度均匀，不是一节一节的")
+        XCTAssertLessThan(change(a.segments, b.segments), 0.02, "手抖挪 1 像素，同一段灯管亮度不变")
+        XCTAssertLessThan(change(a.segments, c.segments), 0.02, "挪半格也不变")
+        XCTAssertGreaterThan(a.segments.reduce(0, +), off.segments.reduce(0, +) * 1.1, "灯管照样提亮成光斑")
+    }
+
+    /// 高光图：整数倍缩小时和 downsample 的盒式平均一致；不到门限的像素没有能量；peak 是覆盖范围里最亮的
+    func testHighlightMaps() {
+        var img = PlanarImage(width: 6, height: 3)
+        img.r = [0.2, 0.2, 0.2, 1, 0.9, 0.2,
+                 0.2, 0.2, 0.2, 0.2, 0.2, 0.2,
+                 0.2, 0.2, 0.2, 0.2, 0.2, 0.2]
+        img.g = img.r; img.b = img.r
+        let m = BokehRenderer.highlightMaps(img, width: 2, height: 1, threshold: 0.85)
+        XCTAssertEqual(m.peak, [0.2, 1])
+        XCTAssertEqual(m.energy.r[0], 0)
+        let k = BokehRenderer.smoothstep(0.85, 1, 0.9)
+        XCTAssertEqual(m.energy.r[1], (1 + 0.9 * k * k) / 9, accuracy: 1e-6)
+        // 不是整数倍：按面积加权，总能量守恒
+        let n = BokehRenderer.highlightMaps(img, width: 4, height: 1, threshold: 0.85)
+        XCTAssertEqual(n.energy.r.reduce(0, +) * 6 * 3 / 4, 1 + 0.9 * k * k, accuracy: 1e-5)
+        XCTAssertEqual(n.peak[2], 1)
+    }
+
     /// 按人像遮罩修深度边缘：伸出脸外的眼镜框（深度测成了背景）拿回这个人的深度，
     /// 人旁边一圈背景（测成了人）拿回背景的深度；人里面、远处的背景不动；遮罩不可信（画面变了）的地方不修
     func testSegmentEdgeRepair() {
