@@ -399,7 +399,8 @@ public final class LiveFrameAnalyzer {
             seeds = SubjectMatte.seeds(depth: map, colors: colors, focusDisparity: focusD, focusPoint: (fx, fy),
                                        parameters: matte, scale: relativeScale, personMask: person, lens: lens,
                                        sharpPeople: allPeople.flatMap { Self.sharpPeople($0, depth: map, lens: lens,
-                                                                                         limit: matte.sharpLimit) })
+                                                                                         limit: matte.sharpLimit,
+                                                                                         band: matte.band) })
             // 所有人（不只对焦的那个）：渲染时人身上不做焦外高光提亮
             seeds?.people = allPeople?.resized(width: map.width, height: map.height)
         }
@@ -452,15 +453,27 @@ public final class LiveFrameAnalyzer {
             ? label : nil
     }
 
-    /// 人像遮罩（所有人）里按镜头算本来就清晰的像素（修过边的深度，虚化 ≤ 长边 limit），和深度图一样大，保留遮罩的软边；
-    /// 一个都没有返回 nil。按深度定，不看是谁：和对焦的人一样远的人整个算进来，远的、近的人一个像素都不算
-    static func sharpPeople(_ people: FloatMap, depth: FloatMap, lens: LensParameters, limit: Float) -> FloatMap? {
+    /// 人像遮罩（所有人）里要锁在对焦面的像素（修过边的深度），和深度图一样大，保留遮罩的软边；一个都没有返回 nil。
+    /// 按深度定，不看是谁：和对焦的人一样远的人整个算进来，远的、近的人一个像素都不算。
+    ///
+    /// 锁住的像素：
+    ///  - 和对焦面差不多远（|相对距离| < band）并且按镜头算本来就清晰（虚化 ≤ 长边 limit）：和深度核心
+    ///    （SubjectMatte.sharpCore）同一个标准；
+    ///  - 或者按镜头算虚化正好是 0（在全清晰区里）：锁不锁糊多少都一样，只是防止细眼镜框被深度对齐抹糊。
+    ///
+    /// 以前只看「虚化 ≤ limit」：1× 前面有 0.25 的全清晰区，ƒ2.8 时对焦 1.94 m 的人，1.07 m 以外的东西都算「本来就清晰」。
+    /// 近处的人伸到 1.1 m 外笔记本上的手（激光雷达在细手指上还会被拉向后面的桌面）被整片锁在对焦面，
+    /// 再被彩色引导滤波往外带一圈：手完全清晰，旁边同样远的键盘却按镜头虚化了（录屏 ren-gebo、zhuozi-wenti）
+    static func sharpPeople(_ people: FloatMap, depth: FloatMap, lens: LensParameters, limit: Float,
+                            band: Float) -> FloatMap? {
         let w = depth.width, h = depth.height, n = w * h
         let pm = people.resized(width: w, height: h).values
-        let r = lens.sharpDisparityRange(limit: limit)
+        let r = lens.sharpDisparityRange(limit: limit), zero = lens.sharpDisparityRange(limit: 0)
+        let df = lens.focusDisparity, norm = max(lens.relativeScale ?? df, 1e-3)
+        let low = min(max(r.low, df - band * norm), zero.low), high = max(min(r.high, df + band * norm), zero.high)
         var v = [Float](repeating: 0, count: n)
         var any = false
-        for i in 0..<n where pm[i] > 0.05 && depth.values[i] >= r.low && depth.values[i] <= r.high {
+        for i in 0..<n where pm[i] > 0.05 && depth.values[i] >= low && depth.values[i] <= high {
             v[i] = pm[i]
             if pm[i] > 0.5 { any = true }
         }
@@ -752,7 +765,8 @@ public final class LiveFrameAnalyzer {
             seeds = SubjectMatte.seeds(depth: map, colors: c, focusDisparity: focusD, focusPoint: focusPoint,
                                        parameters: matte, scale: relativeScale, personMask: person, lens: lens,
                                        sharpPeople: allPeople.flatMap { sharpPeople($0, depth: map, lens: lens,
-                                                                                    limit: matte.sharpLimit) })
+                                                                                    limit: matte.sharpLimit,
+                                                                                    band: matte.band) })
             // 所有人：人身上不做焦外高光提亮（同 analyze）
             seeds?.people = allPeople?.resized(width: map.width, height: map.height)
         }

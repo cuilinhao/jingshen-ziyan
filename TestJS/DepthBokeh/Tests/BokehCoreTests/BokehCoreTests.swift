@@ -670,6 +670,42 @@ final class BokehCoreTests: XCTestCase {
         XCTAssertLessThan(noInstances.seeds?.connect?[96, 48] ?? 1, 0.5, "B 也不在深度核心里")
     }
 
+    /// 用户录屏 ren-gebo / zhuozi-wenti（1×、激光雷达、ƒ2.8）：对焦远处 1.94 m 的 C，近处 B 的手搭在 1.15 m 外的笔记本上。
+    /// 手按镜头只虚化长边的约 0.09%，以前低于「本来就清晰」的界线（sharpLimit），被 sharpPeople 整片锁在对焦面：
+    /// 手完全清晰，旁边一样远的键盘却虚化了。现在只锁和对焦面差不多远（±band）的人，或者虚化本来就是 0 的
+    func testNearPersonHandNotLockedSharp() {
+        let w = 160, h = 120
+        var d = [Float](repeating: 1 / 6, count: w * h)                       // 墙 6 m
+        var m = [Float](repeating: 0, count: w * h)
+        var labels = [Float](repeating: 0, count: w * h)
+        func fill(_ x0: Float, _ x1: Float, _ y0: Float, _ y1: Float, _ body: (Int) -> Void) {
+            for y in Int(y0 * Float(h))..<Int(y1 * Float(h)) {
+                for x in Int(x0 * Float(w))..<Int(x1 * Float(w)) { body(y * w + x) }
+            }
+        }
+        fill(0.35, 0.6, 0.1, 0.5) { d[$0] = 1 / 1.94; m[$0] = 1; labels[$0] = 2 }     // C（对焦）
+        fill(0.62, 0.75, 0.1, 0.45) { d[$0] = 1 / 2.0; m[$0] = 1; labels[$0] = 3 }    // D：C 旁边差不多远的人
+        fill(0.55, 0.95, 0.55, 0.85) { d[$0] = 1 / 1.15 }                              // 笔记本
+        fill(0.6, 0.7, 0.6, 0.7) { d[$0] = 1 / 1.15; m[$0] = 1; labels[$0] = 1 }      // B 的手，搭在笔记本上
+        fill(0, 0.3, 0.3, 1) { d[$0] = 1 / 0.5; m[$0] = 1; labels[$0] = 1 }           // B 的头、身体
+        let analyzer = LiveFrameAnalyzer()
+        var plan: FramePlan!
+        for t in 0..<10 {
+            plan = analyzer.analyze(LiveFrameAnalyzer.Frame(
+                disparity: FloatMap(width: w, height: h, values: d), relativeDepth: false, crop: 1, fNumber: 2.8,
+                focusPoint: (0.47, 0.3), focusTapped: t == 0, time: Double(t) / 30, colors: nil,
+                personMask: FloatMap(width: w, height: h, values: m), outputLongSide: 1440,
+                personInstances: FloatMap(width: w, height: h, values: labels), focalLength35mm: 24))
+        }
+        let hand = plan.lens.signedBlurRadius(disparity: 1 / 1.15, imageLongSide: 1000) / 10
+        XCTAssertGreaterThan(hand, 0.05, "手按镜头本来就有一点虚化")
+        XCTAssertLessThan(hand, SubjectMatteParameters().sharpLimit * 100, "而且低于 sharpLimit（以前会被锁住）")
+        XCTAssertGreaterThan(plan.seeds?.person?[75, 36] ?? 0, 0.5, "对焦的 C")
+        XCTAssertGreaterThan(plan.seeds?.person?[110, 33] ?? 0, 0.5, "C 旁边一样远的 D 照样锁住（眼镜框不被抹糊）")
+        XCTAssertLessThan(plan.seeds?.person?[104, 78] ?? 1, 0.05, "B 的手不锁在对焦面，和旁边的键盘一样按镜头虚化")
+        XCTAssertLessThan(plan.seeds?.extra?[104, 78] ?? 1, 0.5)
+    }
+
     /// 按人像遮罩修深度边缘：伸出脸外的眼镜框（深度测成了背景）拿回这个人的深度，
     /// 人旁边一圈背景（测成了人）拿回背景的深度；人里面、远处的背景不动；遮罩不可信（画面变了）的地方不修
     func testSegmentEdgeRepair() {

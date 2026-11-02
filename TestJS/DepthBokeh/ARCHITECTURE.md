@@ -189,7 +189,8 @@ r = g · blurK / ƒ · 长边                        blurK = 0.016，上限 1.4%
      - 加上 `person > 0.5` 的像素。
    - **`person`（软边遮罩）**：
      - 点中的那个人或物体（`personRegion`：和对焦点连着的那块），
-     - 取最大值合并 `sharpPeople`：所有人身上按镜头本来就清晰（≤ 0.15%）的像素，锁在对焦面，防止细眼镜框在渲染时再被抹糊。
+     - 取最大值合并 `sharpPeople`：所有人身上和对焦面差不多远（±25%）并且按镜头本来就清晰（≤ 0.15%）的像素，或者虚化正好是 0 的像素，锁在对焦面，防止细眼镜框在渲染时再被抹糊。
+       以前只看 ≤ 0.15%：1× 前面有 0.25 的全清晰区，ƒ2.8 对焦 1.94 m 时 1.07 m 以外都算「本来就清晰」，近处的人搭在笔记本上的手被整片锁住，比旁边一样远的键盘还清晰（录屏 ren-gebo、zhuozi-wenti）。
 
 ---
 
@@ -236,7 +237,7 @@ r = g · blurK / ƒ · 长边                        blurK = 0.016，上限 1.4%
 | 7 | 引导滤波软边 | `gf*Color` 的 α | 核心外约 1/70 以内部分拉向 d_f | 颜色 |
 | 8 | 点中的人 | `person` | 拉到 d_f | **身份**（实例）+ 对焦点附近 ≤ 0.3% |
 | 9 | 点中的物体 | `addObject` → `person` | 拉到 d_f | **身份** + ±25% 一致率 60% |
-| 10 | 别人本来清晰的像素 | `sharpPeople` → `person` | 拉到 d_f（原本就 ≤ 0.15%） | 镜头 |
+| 10 | 别人本来清晰的像素 | `sharpPeople` → `person` | 拉到 d_f（原本就 ≤ 0.15% 且在 ±25% 内，或原本就是 0） | **镜头**（和深度核心同一标准） |
 | 11 | 没实例时的外圈 | `depthRestricted` | 清晰部分外扩约 1/30 | 分割 |
 | 12 | leak | `subjectFix` | 核心里 α 低的 → 附近最远视差 | 颜色 |
 
@@ -255,7 +256,7 @@ r = g · blurK / ƒ · 长边                        blurK = 0.016，上限 1.4%
 | 镜头全清晰区 | 前 0.25 / 后 0.04（1/米）；长焦时前面 ÷ (焦距/24)²、最窄 0.04，后面 ÷ s | 虚化量本身 |
 | `sharpLimit` | 长边的 0.15% | 深度核心、`sharpPeople` |
 | 2 × `sharpLimit` | 长边的 0.3% | `focusedInstance`、`depthRestricted` |
-| `band` | 对焦面 ±25%（分母 `relativeScale`） | 深度核心的外框、颜色补边的前方上限、物体一致率、`refineObject`、leak 的判断 |
+| `band` | 对焦面 ±25%（分母 `relativeScale`） | 深度核心的外框、`sharpPeople` 的外框、颜色补边的前方上限、物体一致率、`refineObject`、leak 的判断 |
 | `objectDepthAgreement` | 60% | 物体整体清晰的门槛 |
 | `FocusStabilizer.relativeTolerance` | ±15% | 对焦稳定 |
 
