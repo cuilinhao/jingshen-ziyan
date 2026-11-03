@@ -32,6 +32,9 @@ public struct CapturedDepthPhoto: Identifiable {
     public var focalLength35mm: Float? = nil
     /// 拍照时锁定了对焦：锁定的对焦视差（重新构图以后，对焦点上可能已经是别的东西）。编辑器里重新点了对焦点就不用它
     public var lockedFocusDisparity: Float? = nil
+    /// 照片里过曝、但 HDR 增益图说不是光源的地方（被灯照亮的白色表面），视差图分辨率，0…1：不做焦外高光提亮
+    /// （HDRHighlights.nonLightMask）。照片没带增益图时为 nil，照旧只按亮度判断
+    public var highlightExclusion: FloatMap? = nil
 }
 
 /// 实时景深相机。
@@ -102,6 +105,9 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
     public var minSubjectDistance: Float = 0.30
     /// 拍照后给编辑器的图像长边
     public var photoLongSide = 3024
+    /// 每拍一张都存一份拍照调试包（PhotoDebugDump：原始照片文件、交给编辑器的图和深度、按快门那一刻的相机曝光参数），
+    /// 相机界面右上角「发送数据」AirDrop 到 Mac。排查成片过曝（录屏 0.5x-baoguang）用；每张约 20–40 MB，查完关掉
+    public var savePhotoDebug = false
     /// 换相机时新相机已经出画面、深度还没到：先显示没虚化的新画面（画面不停住），深度到了 0.2 秒淡入虚化。
     /// false = 以前的做法：一直停在上一帧，等新相机出帧并且深度到了（最多 0.8 秒）再淡入
     public var previewBeforeDepth = true
@@ -120,6 +126,8 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
     private var _focusPoint = CGPoint(x: 0.5, y: 0.5)
     /// 按下快门的时间（拍照计时日志用，paramLock 保护）
     private var captureRequestedAt: CFTimeInterval = 0
+    /// 按下快门那一刻的相机状态（拍照调试包用，paramLock 保护）
+    private var captureCameraState: [String: Any] = [:]
     private var focusResetPending = false
     // 预览平滑变焦（点数字时 0.3 秒、对数空间匀速）
     private var glideFrom: CGFloat = 1
@@ -766,8 +774,16 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
                     conn.isVideoMirrored = false
                 }
             }
+            var state: [String: Any] = [:]
+            if self.savePhotoDebug, let d = self.device {
+                state = PhotoDebugDump.cameraState(d)
+                state["photoQualityPrioritization"] = settings.photoQualityPrioritization.rawValue
+                state["maxPhotoQualityPrioritization"] = self.photoOutput.maxPhotoQualityPrioritization.rawValue
+                state["maxPhotoDimensions"] = [Int(settings.maxPhotoDimensions.width), Int(settings.maxPhotoDimensions.height)]
+            }
             self.paramLock.lock()
             self.captureRequestedAt = CACurrentMediaTime()
+            self.captureCameraState = state
             self.paramLock.unlock()
             self.photoOutput.capturePhoto(with: settings, delegate: self)
         }
@@ -1656,6 +1672,7 @@ extension DepthCameraController: AVCapturePhotoCaptureDelegate {
         paramLock.lock()
         let streamFocus = _focusPoint
         let requestedAt = captureRequestedAt
+        let cameraState = captureCameraState
         paramLock.unlock()
         let callbackAt = CACurrentMediaTime()
         guard error == nil, let cgFull = photo.cgImageRepresentation() else {
@@ -1688,6 +1705,38 @@ extension DepthCameraController: AVCapturePhotoCaptureDelegate {
         let focus = CGPoint(x: min(max(0.5 + (photoFocus.x - 0.5) * c, 0), 1),
                             y: min(max(0.5 + (photoFocus.y - 0.5) * c, 0), 1))
 
+        // 原始照片文件：HDR 增益图（分辨过曝的灯和过曝的白色表面，HDRHighlights）和拍照调试包都要用，只能在回调里取
+        let dumpDebug = savePhotoDebug
+        let fileData = photo.fileDataRepresentation()
+        let photoMetadata: [String: Any] = dumpDebug ? photo.metadata : [:]
+        var debugInfo: [String: Any] = [:]
+        if dumpDebug {
+            debugInfo["model"] = PhotoDebugDump.machineModel()
+            debugInfo["system"] = ProcessInfo.processInfo.operatingSystemVersionString
+            debugInfo["camera"] = cameraState
+            let resolved = photo.resolvedSettings.photoDimensions
+            debugInfo["resolvedPhotoDimensions"] = [Int(resolved.width), Int(resolved.height)]
+            debugInfo["fullImage"] = [cgFull.width, cgFull.height]
+            debugInfo["crop"] = Double(c)
+            debugInfo["streamFocusPoint"] = [Double(streamFocus.x), Double(streamFocus.y)]
+            debugInfo["focusPoint"] = [Double(focus.x), Double(focus.y)]
+            debugInfo["orientation"] = Int(orientationRaw)
+            debugInfo["fNumber"] = Double(fNumber)
+            debugInfo["frameZoom"] = Double(frameZoom)
+            debugInfo["focalLength35mm"] = Double(frameZoom) * 24
+            debugInfo["monoRoute"] = monoRoute
+            debugInfo["lockedFocusDisparity"] = lockedFocus.map { Double($0) as Any } ?? NSNull()
+            debugInfo["segmentation"] = segmentationOn
+            debugInfo["photoLongSide"] = longSide
+            // 编辑器（PhotoBokehEditor）的默认参数和拍照的渲染质量
+            debugInfo["editor"] = ["blurDownscale": 3, "focusTolerance": 0.06, "lensModel": "system",
+                                   "keepSubjectSharp": true, "virtualFocalLength": 52,
+                                   "layersPerSide": RenderQuality.photo.layersPerSide,
+                                   "highlightThreshold": Double(RenderQuality.photo.highlightThreshold),
+                                   "highlightGain": Double(RenderQuality.photo.highlightGain)] as [String: Any]
+        }
+        let dumpInfo = debugInfo
+
         photoQueue.async {
             // 拍照计时日志：每一步用了多久（排查「第一张照片要等很久」）
             var steps = [String(format: "相机出片 %.0fms", (callbackAt - requestedAt) * 1000),
@@ -1714,6 +1763,18 @@ extension DepthCameraController: AVCapturePhotoCaptureDelegate {
                 relative = true
             }
             mark("深度")
+            // HDR 增益图：照片里过曝、但不是光源的地方（被灯照亮的白色表面）不做焦外高光提亮（HDRHighlights）。
+            // 16 Pro 超广角会把这些表面直接压到 255，只看照片分不出它和灯（录屏 0.5x-baoguang）
+            var exclusion: FloatMap?
+            var alignedGain: FloatMap?
+            if let disparity, let fileData, let gain = ImageBridge.hdrGainMap(from: fileData) {
+                let g = HDRHighlights.align(gain.centerCropped(by: Float(c)), to: image)
+                alignedGain = g
+                exclusion = HDRHighlights.nonLightMask(image: image, gainMap: g,
+                                                       threshold: RenderQuality.photo.highlightThreshold,
+                                                       width: disparity.width, height: disparity.height)
+            }
+            mark(alignedGain != nil ? "增益图" : "没有增益图")
             // 没有深度（光线太暗、AI 模型没准备好）：整张图当作在对焦面上
             let hasDepth = disparity != nil
             // 人像分割（高质量）：对焦在人身上时整个人保持清晰；物体分割：对焦的物体整个保持清晰。和预览一致
@@ -1731,11 +1792,23 @@ extension DepthCameraController: AVCapturePhotoCaptureDelegate {
                                               orientation: orientation, focusPoint: focus, fNumber: fNumber,
                                               isRelativeDepth: relative, personMask: person, objectLabels: objects,
                                               personInstances: people, focalLength35mm: Float(frameZoom) * 24,
-                                              lockedFocusDisparity: lockedFocus)
+                                              lockedFocusDisparity: lockedFocus, highlightExclusion: exclusion)
             DispatchQueue.main.async {
                 self.lastPhoto = captured
                 self.isCapturing = false
                 if !hasDepth { self.showStatusMessage("这张照片没有深度数据") }
+            }
+            if dumpDebug {
+                let gainForDump = alignedGain
+                DispatchQueue.global(qos: .utility).async {
+                    let zip = PhotoDebugDump.save(photo: captured, fileData: fileData, metadata: photoMetadata,
+                                                  info: dumpInfo, gainMap: gainForDump)
+                    DispatchQueue.main.async {
+                        guard let zip, !self.isDebugRecording else { return }
+                        self.debugRecordingZip = zip
+                        self.debugRecordingStatus = "拍照调试包 \(zip.deletingPathExtension().lastPathComponent)"
+                    }
+                }
             }
         }
     }

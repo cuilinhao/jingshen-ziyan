@@ -209,7 +209,7 @@ public struct RenderQuality: Equatable {
     /// 平滑的高光提亮（预览不闪）。false = 旧算法（硬门限）
     public var smoothHighlights: Bool
 
-    public init(layersPerSide: Int = 8, highlightThreshold: Float = 0.85, highlightGain: Float = 2.5,
+    public init(layersPerSide: Int = 8, highlightThreshold: Float = 0.95, highlightGain: Float = 2.5,
                 smoothHighlights: Bool = true) {
         self.layersPerSide = layersPerSide
         self.highlightThreshold = highlightThreshold
@@ -222,15 +222,19 @@ public struct RenderQuality: Equatable {
         highlightThreshold = 0.9; highlightGain = 4; smoothHighlights = false
     }
 
-    /// 高光阈值 0.85（sRGB 约 237）：只提亮接近过曝的像素。传感器上过曝的灯珠、反光丢了亮度，才需要补；
-    /// 没过曝的白衣服、白桌边、白纸亮度是准的，提亮了就是假的。以前拍照是 0.6（sRGB 约 203）：
-    /// 被顶灯照亮的白 T 恤肩膀（约 0.8–0.9）被提亮 1.6–2.8 倍，模糊后糊成一大片过曝的光晕（录屏 baoguang）。
-    /// 提亮量是 k² 曲线，真正过曝的灯（≥ 0.97）基本不受影响：拍照 3.4 → 3.0 倍，1.0 时都是 3.5 倍。
-    /// 人身上另外整块不提亮（SubjectSeeds.people），过曝的白衣服也不会发光
+    /// 高光阈值 0.95（sRGB 约 250）：只提亮照片里真正过曝的像素。传感器上过曝的灯珠、灯管、反光点丢了亮度，才需要补；
+    /// 没过曝的白衣服、白桌边、白纸、白色塑料亮度是准的，提亮了就是假的。
+    ///  - 最早拍照是 0.6（sRGB 约 203）：被顶灯照亮的白 T 恤肩膀（约 0.8–0.9）被提亮 1.6–2.8 倍，模糊后糊成一大片过曝的光晕
+    ///    （录屏 baoguang）。人身上另外整块不提亮（SubjectSeeds.people），过曝的白衣服也不会发光
+    ///  - 后来是 0.85（sRGB 约 237）：录屏 0.5x-baoguang（iPhone 16 Pro 超广角，对焦近处的盒子），远处白色收纳盒朝着顶灯的
+    ///    顶面在照片里约 sRGB 245–250（线性 0.91–0.96），后面是深灰墙、对比很强，被当成灯提亮到 1.25–2.5 倍，成片里一条过曝的亮边。
+    ///    物体身上没有人像遮罩能挡。k² 曲线在 0.85 以上很陡（拍照：sRGB 240 不变、243 刚好到 1.0、248 到 1.9），
+    ///    照片把白色压得亮几个色阶的机型就会出（16 Pro 超广角会，17 / 18 Pro Max 不会）
+    /// 0.95 以后 sRGB 248 及以下的表面完全不动；过曝的灯照样提亮：1.0 时拍照还是 3.5 倍，sRGB 252（0.97）约 1.5 倍
     ///
     /// 实时预览：层数少一些换速度；高光提亮更克制（预览里灯管、筒灯的亮度会随卷帘条纹和曝光起伏，
     /// 提亮越狠，闪得越明显）。阈值和拍照一样，预览看到的光斑和拍出来的一致
-    public static let preview = RenderQuality(layersPerSide: 5, highlightThreshold: 0.85, highlightGain: 1.5)
+    public static let preview = RenderQuality(layersPerSide: 5, highlightThreshold: 0.95, highlightGain: 1.5)
     /// 拍照成片
-    public static let photo = RenderQuality(layersPerSide: 9, highlightThreshold: 0.85, highlightGain: 2.5)
+    public static let photo = RenderQuality(layersPerSide: 9, highlightThreshold: 0.95, highlightGain: 2.5)
 }

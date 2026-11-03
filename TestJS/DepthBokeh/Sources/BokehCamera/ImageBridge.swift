@@ -1,6 +1,7 @@
 #if os(iOS)
 import AVFoundation
 import CoreGraphics
+import ImageIO
 import UIKit
 import BokehCore
 
@@ -91,6 +92,32 @@ public enum ImageBridge {
             for x in 0..<w {
                 let v = row[x]
                 if v.isFinite && (relative || v > 0) { values[y * w + x] = v }
+            }
+        }
+        return FloatMap(width: w, height: h, values: values)
+    }
+
+    /// 照片文件（AVCapturePhoto.fileDataRepresentation）里的 HDR 增益图：Apple 的 hdrgainmap 辅助图，单通道 8 位，转成 0…1。
+    /// 没有增益图、格式不认识返回 nil。方向不一定和 cgImageRepresentation 的像素方向一样，用之前先 HDRHighlights.align
+    public static func hdrGainMap(from fileData: Data) -> FloatMap? {
+        guard let src = CGImageSourceCreateWithData(fileData as CFData, nil),
+              let info = CGImageSourceCopyAuxiliaryDataInfoAtIndex(src, 0, kCGImageAuxiliaryDataTypeHDRGainMap)
+                as? [String: Any],
+              let data = info[kCGImageAuxiliaryDataInfoData as String] as? Data,
+              let desc = info[kCGImageAuxiliaryDataInfoDataDescription as String] as? [String: Any],
+              let w = (desc["Width"] as? NSNumber)?.intValue, let h = (desc["Height"] as? NSNumber)?.intValue,
+              w > 0, h > 0 else { return nil }
+        let bpr = (desc["BytesPerRow"] as? NSNumber)?.intValue ?? w
+        let format = (desc["PixelFormat"] as? NSNumber)?.uint32Value ?? kCVPixelFormatType_OneComponent8
+        guard format == kCVPixelFormatType_OneComponent8, bpr >= w, data.count >= bpr * (h - 1) + w else {
+            print("[Photo] HDR 增益图的格式不认识，不用：\(desc)")
+            return nil
+        }
+        var values = [Float](repeating: 0, count: w * h)
+        data.withUnsafeBytes { raw in
+            let p = raw.bindMemory(to: UInt8.self)
+            for y in 0..<h {
+                for x in 0..<w { values[y * w + x] = Float(p[y * bpr + x]) / 255 }
             }
         }
         return FloatMap(width: w, height: h, values: values)

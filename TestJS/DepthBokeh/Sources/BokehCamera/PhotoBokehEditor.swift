@@ -115,7 +115,8 @@ public final class PhotoBokehEditor: ObservableObject, @unchecked Sendable {
                                                settings: settings, objectLabels: photo.objectLabels,
                                                personInstances: photo.personInstances,
                                                focalLength35mm: photo.focalLength35mm,
-                                               lockedFocusDisparity: lockedFocus)
+                                               lockedFocusDisparity: lockedFocus,
+                                               highlightExclusion: photo.highlightExclusion)
         if let ui = renderOnGPU(plan) { return (ui, plan.focusDisparity) }
         return (renderOnCPU(plan), plan.focusDisparity)
     }

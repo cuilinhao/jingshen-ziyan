@@ -779,6 +779,133 @@ final class BokehCoreTests: XCTestCase {
         XCTAssertEqual(n.peak[2], 1)
     }
 
+    /// 录屏 0.5x-baoguang（iPhone 16 Pro 超广角，对焦近处的盒子）：远处白色收纳盒朝着顶灯的顶面在照片里约 sRGB 245
+    /// （线性 0.91，没过曝），后面是深灰墙、对比很强。门限 0.85 时被当成灯提亮，成片里一条过曝的亮边；
+    /// 现在门限 0.95：没过曝的白色表面不提亮，真正过曝的灯（1.0）照样提亮成光斑
+    func testBrightSurfaceNotBoostedButClippedLampIs() {
+        let W = 720, H = 540, dw = 160, dh = 120
+        var d = [Float](repeating: 1 / 5, count: dw * dh)                       // 远处 5 m
+        for y in dh * 6 / 10..<dh { for x in 0..<dw { d[y * dw + x] = 1 / 0.6 } } // 近处 0.6 m（对焦）
+        let disparity = FloatMap(width: dw, height: dh, values: d)
+        // 远处一条 180 × 12 像素的亮条（收纳盒顶面 / 灯管），四周是深灰墙；量亮条外扩 40 像素的窗口里的总亮度
+        let x0 = 270, x1 = 450, y0 = 150, y1 = 162, pad = 40
+        func energy(value: Float, quality: RenderQuality) -> Float {
+            var r = [Float](repeating: 0.06, count: W * H)
+            for y in 0..<H {
+                for x in 0..<W {
+                    let i = y * W + x
+                    if y >= H * 6 / 10 { r[i] = 0.5 } else if y >= y0 && y < y1 && x >= x0 && x < x1 { r[i] = value }
+                }
+            }
+            let pipeline = LivePreviewPipeline()
+            pipeline.settings.quality = quality
+            var out: PlanarImage!
+            for t in 0..<3 {
+                out = pipeline.process(LivePreviewPipeline.Frame(
+                    image: PlanarImage(width: W, height: H, r: r, g: r, b: r), disparity: disparity, relativeDepth: false,
+                    crop: 1, fNumber: 2.8, focusPoint: (0.5, 0.8), focusTapped: t == 0, time: Double(t) / 30,
+                    focalLength35mm: 24)).image
+            }
+            var sum: Float = 0
+            for y in (y0 - pad)..<(y1 + pad) { for x in (x0 - pad)..<(x1 + pad) { sum += out.r[y * W + x] } }
+            return sum
+        }
+        var off = RenderQuality.photo; off.highlightGain = 0
+        var old = RenderQuality.photo; old.highlightThreshold = 0.85
+        let surface: Float = 0.913                                               // sRGB 245
+        let surfaceOff = energy(value: surface, quality: off)
+        XCTAssertGreaterThan(energy(value: surface, quality: old), surfaceOff * 1.1, "门限 0.85 时白色表面被提亮（复现问题）")
+        XCTAssertLessThan(energy(value: surface, quality: .photo), surfaceOff * 1.01, "没过曝的白色表面不提亮")
+        XCTAssertLessThan(energy(value: surface, quality: .preview), surfaceOff * 1.01, "预览也一样")
+        XCTAssertGreaterThan(energy(value: 1, quality: .photo), energy(value: 1, quality: off) * 1.5, "过曝的灯照样提亮成光斑")
+    }
+
+    /// 录屏 0.5x-baoguang 第二轮（拍照调试包 photo-20261103-160822，iPhone 16 Pro 超广角）：照片把被顶灯照亮的白色收纳盒顶边
+    /// 直接压到了 255，在 SDR 里和灯管一模一样，门限调多高都会被当成灯提亮。照片带的 HDR 增益图分得开：
+    /// 灯管 ≥ 245/255，过曝的白色表面 ≤ 198/255。这里一条过曝的「白色表面」（增益 0.75）和一条过曝的「灯管」
+    /// （核心增益 1.0、边上一像素只有 0.78，增益图只有照片一半分辨率时真实照片就是这样）：
+    /// 表面不提亮（和完全不提亮一样），灯管照样提亮成光斑，边上也不被啃掉
+    func testHDRGainMapKeepsClippedSurfacesFromBlooming() {
+        let W = 720, H = 540, dw = 160, dh = 120
+        var d = [Float](repeating: 1 / 5, count: dw * dh)                       // 远处 5 m
+        for y in dh * 6 / 10..<dh { for x in 0..<dw { d[y * dw + x] = 1 / 0.6 } } // 近处 0.6 m（对焦）
+        let disparity = FloatMap(width: dw, height: dh, values: d)
+        let surface = (x0: 120, x1: 300, y0: 150, y1: 162), lamp = (x0: 420, x1: 600, y0: 150, y1: 162), pad = 40
+        func inside(_ b: (x0: Int, x1: Int, y0: Int, y1: Int), _ x: Int, _ y: Int) -> Bool {
+            x >= b.x0 && x < b.x1 && y >= b.y0 && y < b.y1
+        }
+        var r = [Float](repeating: 0.06, count: W * H)                          // 深灰墙
+        for y in 0..<H {
+            for x in 0..<W {
+                if y >= H * 6 / 10 { r[y * W + x] = 0.5 } else if inside(surface, x, y) || inside(lamp, x, y) { r[y * W + x] = 1 }
+            }
+        }
+        let image = PlanarImage(width: W, height: H, r: r, g: r, b: r)
+        // 增益图：照片一半的分辨率；墙 0.5、近处 0.6、白色表面 0.75、灯管核心 1.0、灯管边上一圈 0.78
+        let gw = W / 2, gh = H / 2
+        var g = [Float](repeating: 0.5, count: gw * gh)
+        for y in 0..<gh {
+            for x in 0..<gw {
+                let fx = x * 2, fy = y * 2
+                if fy >= H * 6 / 10 { g[y * gw + x] = 0.6 }
+                if inside(surface, fx, fy) { g[y * gw + x] = 0.75 }
+                if inside(lamp, fx, fy) {
+                    let edge = fx < lamp.x0 + 2 || fx >= lamp.x1 - 2 || fy < lamp.y0 + 2 || fy >= lamp.y1 - 2
+                    g[y * gw + x] = edge ? 0.78 : 1
+                }
+            }
+        }
+        let gain = FloatMap(width: gw, height: gh, values: g)
+        let exclusion = HDRHighlights.nonLightMask(image: image, gainMap: gain, threshold: RenderQuality.photo.highlightThreshold,
+                                                   width: dw, height: dh)
+        XCTAssertGreaterThan(exclusion[210 * dw / W, 156 * dh / H], 0.9, "白色表面：不是光源")
+        XCTAssertLessThan(exclusion[510 * dw / W, 156 * dh / H], 0.05, "灯管中间：是光源")
+        XCTAssertLessThan(exclusion[(lamp.x0 + 1) * dw / W, 156 * dh / H], 0.05, "灯管边上（增益图掉下来的那一圈）也是光源")
+
+        func energy(_ b: (x0: Int, x1: Int, y0: Int, y1: Int), quality: RenderQuality, exclusion: FloatMap?) -> Float {
+            var settings = LiveFrameAnalyzer.Settings()
+            settings.layersPerSide = RenderQuality.photo.layersPerSide
+            let plan = LiveFrameAnalyzer.stillPlan(disparity: disparity, relativeDepth: false,
+                                                   colors: image.resized(width: dw, height: dh), fNumber: 2.8,
+                                                   focusPoint: (0.5, 0.8), personMask: nil, outputLongSide: W,
+                                                   settings: settings, focalLength35mm: 24, highlightExclusion: exclusion)
+            let hint = plan.seeds.map { SubjectHint(point: plan.focusPoint, parameters: plan.matte, seeds: $0) }
+            let out = BokehRenderer().renderDetailPreserving(full: image, disparity: plan.depth, lens: plan.lens,
+                                                             lowLongSide: plan.lowLongSide, quality: quality, refinePasses: 2,
+                                                             subject: hint, layerCenters: plan.layerCenters)
+            var sum: Float = 0
+            for y in (b.y0 - pad)..<(b.y1 + pad) { for x in (b.x0 - pad)..<(b.x1 + pad) { sum += out.r[y * W + x] } }
+            return sum
+        }
+        var off = RenderQuality.photo; off.highlightGain = 0
+        XCTAssertGreaterThan(energy(surface, quality: .photo, exclusion: nil), energy(surface, quality: off, exclusion: nil) * 1.2,
+                             "没有增益图：过曝的白色表面被当成灯提亮（复现问题）")
+        XCTAssertLessThan(energy(surface, quality: .photo, exclusion: exclusion), energy(surface, quality: off, exclusion: nil) * 1.01,
+                          "有增益图：白色表面不提亮")
+        let lampOff = energy(lamp, quality: off, exclusion: nil)
+        XCTAssertGreaterThan(energy(lamp, quality: .photo, exclusion: exclusion), lampOff * 1.5, "灯管照样提亮成光斑")
+        XCTAssertEqual(energy(lamp, quality: .photo, exclusion: exclusion), energy(lamp, quality: .photo, exclusion: nil),
+                       accuracy: lampOff * 0.02, "灯管的光斑和没有增益图时一样")
+    }
+
+    /// 增益图的方向不一定和照片像素一样（HEIF 的旋转可能只挂在主图上）：按和画面亮度的相关性转回来
+    func testHDRGainMapAlignment() {
+        let W = 96, H = 72
+        var r = [Float](repeating: 0.1, count: W * H)
+        for y in 0..<H { for x in 0..<W { r[y * W + x] = 0.1 + 0.8 * Float(x) / Float(W) * (y < H / 3 ? 1 : 0.3) } }
+        let image = PlanarImage(width: W, height: H, r: r, g: r, b: r)
+        let gain = FloatMap(width: W / 2, height: H / 2, values: (0..<(W / 2 * H / 2)).map { i in
+            let x = i % (W / 2), y = i / (W / 2)
+            return r[(y * 2) * W + x * 2]
+        })
+        for candidate in [HDRHighlights.rotated90(gain, clockwise: true), HDRHighlights.rotated90(gain, clockwise: false),
+                          HDRHighlights.rotated180(gain), gain] {
+            let aligned = HDRHighlights.align(candidate, to: image)
+            XCTAssertEqual(aligned.width, gain.width)
+            XCTAssertEqual(aligned.values, gain.values)
+        }
+    }
+
     /// 按人像遮罩修深度边缘：伸出脸外的眼镜框（深度测成了背景）拿回这个人的深度，
     /// 人旁边一圈背景（测成了人）拿回背景的深度；人里面、远处的背景不动；遮罩不可信（画面变了）的地方不修
     func testSegmentEdgeRepair() {

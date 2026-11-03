@@ -708,7 +708,7 @@ public final class LiveFrameAnalyzer {
                                  focusPoint: (x: Float, y: Float), personMask: FloatMap?, outputLongSide: Int,
                                  settings: Settings, objectLabels: FloatMap? = nil,
                                  personInstances: FloatMap? = nil, focalLength35mm: Float? = nil,
-                                 lockedFocusDisparity: Float? = nil) -> FramePlan {
+                                 lockedFocusDisparity: Float? = nil, highlightExclusion: FloatMap? = nil) -> FramePlan {
         var map = DepthRefiner.fillInvalid(disparity, guide: colors)
         let lowLongSide = max(320, outputLongSide / max(1, settings.blurDownscale))
         // 拍照时锁定了对焦：用锁定的距离（重新构图以后对焦点上可能已经是别的东西）
@@ -769,6 +769,11 @@ public final class LiveFrameAnalyzer {
                                                                                     band: matte.band) })
             // 所有人：人身上不做焦外高光提亮（同 analyze）
             seeds?.people = allPeople?.resized(width: map.width, height: map.height)
+            // 照片的 HDR 增益图说不是光源的过曝亮区（白色表面，HDRHighlights.nonLightMask）：和人一样不提亮
+            if let ex = highlightExclusion, seeds != nil {
+                let people = seeds?.people
+                seeds?.people = HDRHighlights.maxMerge(people, ex.resized(width: map.width, height: map.height))
+            }
         }
         return FramePlan(lens: lens, focusPoint: focusPoint, streamFocusPoint: focusPoint, focusRecentered: false,
                          focusDisparity: focusD, focusDistance: relativeDepth ? nil : 1 / max(focusD, 1e-3),

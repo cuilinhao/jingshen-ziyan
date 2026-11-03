@@ -61,8 +61,10 @@ public struct SubjectSeeds {
     public var extra: FloatMap?
     /// 对焦的那个人的软边遮罩（0…1），引导滤波之后再取最大值
     public var person: FloatMap?
-    /// 画面里所有人的遮罩（0…1，深度图分辨率，不只是对焦的那个人）：人身上不做焦外高光提亮。
-    /// 人不会是光源，被顶灯照亮的白衣服、肩膀哪怕过曝了，提亮以后也只会糊成一大片假的过曝光晕
+    /// 不做焦外高光提亮的地方（0…1，深度图分辨率）：画面里所有人（不只是对焦的那个人），
+    /// 拍照时再加上 HDR 增益图说不是光源的过曝亮区（白色表面，HDRHighlights.nonLightMask）。
+    /// 人和白色表面都不会是光源，被顶灯照亮的白衣服、肩膀、白盒子边哪怕过曝了，提亮以后也只会糊成一大片假的过曝光晕。
+    /// CPU（DetailPreserving 的 highlightExclusion）和 GPU（boostKernel 的 people 纹理）都只拿它做这一件事
     public var people: FloatMap?
 
     public init(connect: FloatMap? = nil, extra: FloatMap? = nil, person: FloatMap? = nil, people: FloatMap? = nil) {
