@@ -4,8 +4,11 @@
 //   倍率            实际用的相机                     画面裁切        深度来源
 //   0.5×–0.99×     超广角 0.5×                      1–1.98×        AI 单目深度（Depth Anything V2）
 //   1×–1.99×       LiDAR 1×                         1–1.99×        LiDAR
-//   2×–4.16×       双摄广角 2×（主摄原生 2× 裁切）    1–2.08×        双摄视差
-//   4.17×（100mm） 双摄长焦                          无             双摄视差
+//   2×–长焦以下     双摄广角 2×（主摄原生 2× 裁切）    1–2.08×（16 Pro 1–2.5×）  双摄视差
+//   长焦            双摄长焦（17 Pro Max 4.17× = 100mm，16 Pro 5× = 120mm）  无   双摄视差（这个倍率系统不给深度就 AI 深度）
+//
+// 刻度最长到这台手机的长焦，至少 100mm（maxDialZoom）：16 Pro 的长焦是 5×（120mm），以前刻度写死 100mm，
+// 长焦被截在刻度外面用不上，最后一个数字也只有 48。
 //
 // 实时深度只在几个倍率点上有（iPhone 17 Pro Max：1×、2×、100mm 长焦）。两个点之间相机停在低的那个点，
 // App 自己从中间裁切画面和深度图补足剩下的倍率 —— 开着深度时相机的非原生倍率本来就是数码放大，
@@ -254,9 +257,13 @@ enum LensCatalog {
         return plans.compactMap { $0.map { var plan = $0; plan.streamZoom = streamZoom; return plan } }
     }
 
-    /// Longest focal length on the dial (35mm equivalent; 1× = 24mm). 17 Pro Max: its 100mm telephoto.
-    static let maxFocalLength: CGFloat = 100
-    static let maxDialZoom: CGFloat = maxFocalLength / 24
+    /// 刻度盘最长至少到多少（35mm 等效，1× = 24mm）。没有长焦、或者长焦更短的机型用裁切补到这里
+    static let minimumMaxFocalLength: CGFloat = 100
+    /// 刻度盘的最大倍率：这台手机最长的镜头，至少 100mm（17 Pro Max 4.17× = 100mm，16 Pro 5× = 120mm）
+    static let maxDialZoom: CGFloat = ZoomScale.maxDialZoom(nativeFactors: lensOptions.map(\.nativeZoom),
+                                                            minimumFocalLength: minimumMaxFocalLength)
+    /// Longest focal length on the dial (35mm equivalent).
+    static var maxFocalLength: CGFloat { maxDialZoom * 24 }
 
     /// Limit the dial to `maxFocalLength`, intersected with real format limits.
     static func zoomRange(for lenses: [LensOption]) -> ClosedRange<CGFloat> {
@@ -278,6 +285,27 @@ enum LensCatalog {
         // A lens sitting at the limit is the limit, so rounding in its magnification cannot drop its stop.
         let cap = back.map(\.nativeZoom).first { abs($0 / maxDialZoom - 1) < 0.01 } ?? maxDialZoom
         return first.nativeZoom...max(first.nativeZoom, min(cap, maximum))
+    }
+
+    /// 这台手机的镜头、刻度范围、每个能出深度的相机在哪些倍率上出深度。启动时打印一次（[Lens]），换机型排查用：
+    /// 比如 16 Pro 的 5× 长焦能不能出双摄视差，看 builtInDualCamera 那一行有没有 5
+    static func summary() -> String {
+        let lenses = availableLenses()
+        let range = zoomRange(for: lenses)
+        func f(_ v: CGFloat) -> String { String(format: "%.3f", Double(v)) }
+        func mm(_ v: CGFloat) -> String { "\(ZoomScale.focalLength(for: v))mm" }
+        let lensText = lenses.map { "\($0.kind.rawValue) \(f($0.nativeZoom))× \(mm($0.nativeZoom))" }.joined(separator: " · ")
+        let anchorText = depthAnchors.map { f($0) + "×" }.joined(separator: " ")
+        var lines: [String] = []
+        lines.append("镜头 " + lensText)
+        lines.append("刻度 \(f(range.lowerBound))×–\(f(range.upperBound))×（\(mm(range.lowerBound))–\(mm(range.upperBound))），深度倍率点 \(anchorText)")
+        for type in [AVCaptureDevice.DeviceType.builtInLiDARDepthCamera, .builtInDualWideCamera, .builtInDualCamera] {
+            guard let d = device(type, position: .back), let profile = formatProfiles[d.uniqueID] else { continue }
+            let switchOver = d.virtualDeviceSwitchOverVideoZoomFactors.map { f(CGFloat($0.doubleValue)) }.joined(separator: ", ")
+            let depthPoints = profile.depth.boundaries.map { f($0) }.joined(separator: ", ")
+            lines.append("\(type.rawValue)：切换倍率 [\(switchOver)]，能出深度的相机倍率 [\(depthPoints)]")
+        }
+        return lines.joined(separator: "\n")
     }
 
     private static func firstSwitchOver(_ device: AVCaptureDevice) -> CGFloat? {

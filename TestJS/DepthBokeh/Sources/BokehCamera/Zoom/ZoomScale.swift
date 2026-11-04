@@ -37,6 +37,15 @@ public struct ZoomScale {
         return clamped(range.lowerBound * pow(range.upperBound / range.lowerBound, position))
     }
 
+    /// 刻度盘的最大倍率（1× = 24mm）：这台手机最长的那颗镜头和 minimumFocalLength 里取大的。
+    /// 长焦比 minimumFocalLength 还长（16 Pro 的 5× = 120mm）就到长焦本身，最后一个数字是真实的长焦镜头；
+    /// 没有长焦、或者长焦更短（17 Pro Max 的 4× 正好 100mm、更早的 3× 77mm）就用裁切补到 minimumFocalLength
+    public static func maxDialZoom(nativeFactors: [CGFloat], minimumFocalLength: CGFloat) -> CGFloat {
+        let minimum = minimumFocalLength / 24
+        let longest = nativeFactors.filter { $0.isFinite && $0 > 0 }.max() ?? minimum
+        return max(minimum, longest)
+    }
+
     /// Equivalent focal length follows Cam's 24mm main-camera display convention.
     public static func focalLength(for factor: CGFloat) -> Int {
         guard factor.isFinite else { return 24 }

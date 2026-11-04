@@ -226,7 +226,7 @@ public struct ContinuousZoomControl: View {
         let count = max(0, min(400, Int(floor((range.upperBound - first) / step + 0.0001))))
         var ticks = (0...count).map { first + CGFloat($0) * step }
             .filter { range.contains($0) }
-        // Stops off the grid (0.5×, the 100mm telephoto at 4.17×) still get their own tick.
+        // Stops off the grid (0.5×, the telephoto: 100mm at 4.17× on 17 Pro Max) still get their own tick.
         for factor in [0.5] + stops.map(\.factor)
         where range.contains(factor) && !ticks.contains(where: { abs($0 - factor) < 0.0001 }) {
             ticks.append(factor)
@@ -255,7 +255,7 @@ public struct ContinuousZoomControl: View {
         onZoomChange(displayedFactor)
     }
 
-    /// Releasing the dial within ±5% of a stop lands exactly on it. The stops (1×, 2×, 100mm) are where
+    /// Releasing the dial within ±5% of a stop lands exactly on it. The stops (1×, 2×, the telephoto) are where
     /// the camera itself delivers depth, uncropped — 1× is the LiDAR route.
     private func snapToStop() -> Bool {
         let factor = displayedFactor
