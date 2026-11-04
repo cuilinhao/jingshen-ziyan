@@ -1,11 +1,14 @@
 import SwiftUI
 import UIKit
 import QuartzCore
+import Photos
+import PhotosUI
 import BokehCamera
 
 /// 取景界面：实时虚化预览 + 焦段调节 + 景深（ƒ）滑块 + 点按对焦 + 快门
 /// 焦段调节的界面和交互直接复用 DepthBokehCamera 2 的 ContinuousZoomControl（13mm 到这台手机的长焦，至少 100mm）：
 /// 点数字跳到对应焦段，左右拖动或长按展开刻度，松手 ±5% 内吸附到数字，约 1 秒收起
+/// 左上角「相册」：从相册选一张图（别的 App 拍的也行，没有深度就用 AI 估计）进编辑器调景深、点按换主体
 struct ContentView: View {
     @StateObject private var camera = DepthCameraController()
     @State private var sliderValue: Double = ApertureScale.position(for: 2.8)
@@ -15,6 +18,10 @@ struct ContentView: View {
     @State private var segmentationOn = true
     /// 锁定对焦：点一下对焦以后对焦距离固定住，不再跟着画面变
     @State private var focusLocked = false
+    /// 相册导入：选中的图片、进度文字（非 nil = 正在导入）、出错提示
+    @State private var pickedItem: PhotosPickerItem?
+    @State private var importStatus: String?
+    @State private var importError: String?
 
     private var fNumber: Float { ApertureScale.fNumber(at: sliderValue) }
 
@@ -101,6 +108,33 @@ struct ContentView: View {
         }
         .padding(.top, 8)
         .background(Color.black.ignoresSafeArea())
+        .overlay {
+            if let importStatus {
+                ZStack {
+                    Color.black.opacity(0.55).ignoresSafeArea()
+                    VStack(spacing: 14) {
+                        ProgressView().controlSize(.large).tint(.white)
+                        Text(importStatus)
+                            .font(.subheadline)
+                            .foregroundStyle(.white)
+                            .multilineTextAlignment(.center)
+                    }
+                    .padding(.horizontal, 28).padding(.vertical, 24)
+                    .frame(minWidth: 180)
+                    .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+                    .padding(.horizontal, 40)
+                }
+                .transition(.opacity)
+            }
+        }
+        .alert("导入失败", isPresented: Binding(get: { importError != nil }, set: { if !$0 { importError = nil } })) {
+            Button("好", role: .cancel) {}
+        } message: {
+            Text(importError ?? "")
+        }
+        .onChange(of: pickedItem) { _, item in
+            if let item { importPhoto(item) }
+        }
         .onAppear {
             camera.fNumber = fNumber
             camera.start()
@@ -136,9 +170,7 @@ struct ContentView: View {
                     ProgressView()
                 }
                 if let m = focusMarker {
-                    RoundedRectangle(cornerRadius: 2)
-                        .stroke(.yellow, lineWidth: 1.5)
-                        .frame(width: 70, height: 70)
+                    FocusMarker(size: 70)
                         .position(m)
                         .allowsHitTesting(false)
                 }
@@ -196,15 +228,71 @@ struct ContentView: View {
             .padding(10)
         }
         .overlay(alignment: .topLeading) {
-            if !camera.depthSourceLabel.isEmpty {
-                Text(camera.depthSourceLabel)
-                    .font(.caption2.weight(.medium))
-                    .padding(.horizontal, 8).padding(.vertical, 4)
-                    .background(.black.opacity(0.45), in: Capsule())
-                    .foregroundStyle(.white.opacity(0.9))
-                    .padding(10)
-                    .allowsHitTesting(false)
+            VStack(alignment: .leading, spacing: 8) {
+                if !camera.depthSourceLabel.isEmpty {
+                    Text(camera.depthSourceLabel)
+                        .font(.caption2.weight(.medium))
+                        .padding(.horizontal, 8).padding(.vertical, 4)
+                        .background(.black.opacity(0.45), in: Capsule())
+                        .foregroundStyle(.white.opacity(0.9))
+                        .allowsHitTesting(false)
+                }
+                // 从相册选一张图调景深。.current：拿原始文件（不转码），照片自带的深度和 HDR 增益图才不会丢；
+                // photoLibrary: .shared()：选中的照片带相册里的编号，人像照片要靠它取没虚化过的原图
+                PhotosPicker(selection: $pickedItem, matching: .images, preferredItemEncoding: .current,
+                             photoLibrary: .shared()) {
+                    Label("相册", systemImage: "photo.on.rectangle")
+                        .font(.caption2.weight(.semibold))
+                        .padding(.horizontal, 8).padding(.vertical, 4)
+                        .background(Color.black.opacity(0.45), in: Capsule())
+                        .foregroundStyle(Color.white.opacity(0.9))
+                }
+                .disabled(importStatus != nil || camera.isCapturing)
+                .accessibilityLabel("从相册选照片调景深")
             }
+            .padding(10)
+        }
+    }
+
+    /// 相册里选的图 → 编辑器（和拍完照一样）。导入要几百毫秒到一两秒，第一次用 AI 深度还要等模型加载；
+    /// 期间暂停预览（不和导入抢 CPU / GPU），编辑器关掉时由 fullScreenCover 的 onDismiss 恢复
+    private func importPhoto(_ item: PhotosPickerItem) {
+        importStatus = "读取照片…"
+        camera.setPreviewPaused(true)
+        let segmentation = segmentationOn
+        Task {
+            do {
+                guard var data = try await item.loadTransferable(type: Data.self) else {
+                    throw PhotoLibraryImporter.ImportError.unreadable
+                }
+                // 带深度的照片（人像照片）：PhotosPicker 给的是当前版本，系统的人像虚化已经画进像素里了
+                // （背景本来就糊：点人清晰不了，ƒ16 也还是糊）。改用没编辑过的原图（清晰 + 深度），和系统相册一样
+                // 当前版本里没留深度、但相册说它是人像照片（已经有权限时才查得到）也一样
+                var notice: String?
+                let isPortrait = item.itemIdentifier.map { PhotoLibraryImporter.isPortraitAsset(localIdentifier: $0) } ?? false
+                if PhotoLibraryImporter.hasEmbeddedDepth(data) || isPortrait {
+                    importStatus = "读取原图…"
+                    if let id = item.itemIdentifier,
+                       let original = await PhotoLibraryImporter.unadjustedOriginal(localIdentifier: id) {
+                        data = original
+                    } else {
+                        notice = "拿不到原图（要允许访问相册），这张用的是已经虚化过的版本"
+                    }
+                }
+                var photo = try await PhotoLibraryImporter.makePhoto(from: data, segmentation: segmentation) { status in
+                    Task { @MainActor in
+                        if importStatus != nil { importStatus = status }
+                    }
+                }
+                photo.notice = notice
+                importStatus = nil
+                editingPhoto = photo
+            } catch {
+                importStatus = nil
+                importError = error.localizedDescription
+                camera.setPreviewPaused(false)
+            }
+            pickedItem = nil
         }
     }
 

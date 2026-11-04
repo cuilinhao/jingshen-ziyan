@@ -40,7 +40,7 @@
 | 模块 | 内容 | 平台 |
 |---|---|---|
 | `App/` | SwiftUI 界面：取景、ƒ 滑块、变焦刻度、点按对焦、「锁定对焦」「分割」「录调试数据」开关、拍后编辑 | iOS |
-| `BokehCamera` | 相机层。`CameraController`：会话、换镜头、深度输出、每帧调度。`LensCatalog`：倍率 → 相机路线。`PersonSegmenter`：Vision 分割。`MonocularDepthEstimator`：0.5× 的 AI 深度。`PhotoBokehEditor`：拍后编辑。`DebugRecorder`：录调试数据。`MetalPreviewView`：显示 | iOS |
+| `BokehCamera` | 相机层。`CameraController`：会话、换镜头、深度输出、每帧调度。`LensCatalog`：倍率 → 相机路线。`PersonSegmenter`：Vision 分割。`MonocularDepthEstimator`：0.5× 和相册照片的 AI 深度。`PhotoBokehEditor`：拍后编辑。`StillPhotoBuilder`：一张照片 + 深度 → `CapturedDepthPhoto`（增益图、三种分割、组装，拍照和相册导入共用）。`PhotoLibraryImporter`：相册导入。`DebugRecorder`：录调试数据。`MetalPreviewView`：显示 | iOS |
 | `BokehCore` | 纯 Swift 算法。`LiveFrameAnalyzer`：每帧分析。`Lens`：虚拟镜头。`SubjectMatte`：主体遮罩。`SegmentEdgeRepair`：按分割修边。`DepthRefiner` / `PullPush`：补洞、上采样、引导滤波。`TemporalState` / `StaleDepth`：跨帧稳定、没有新深度时搬深度。`FocusStabilizer`：对焦稳定。`BokehRenderer` / `DetailPreserving`：CPU 参考渲染。`LivePreviewPipeline`：电脑上的完整流水线 | iOS / macOS / Linux |
 | `BokehMetal` | `MetalBokehRenderer` + 着色器 `BokehShaderSource`：GPU 渲染，和 CPU 参考实现逐像素一致 | Apple |
 | `bokeh-cli` | 电脑上跑单张，或 `--live` 重放录好的数据 | 全平台 |
@@ -295,6 +295,16 @@ r = g · blurK / ƒ · 长边                        blurK = 0.016，上限 1.4%
   - 改 ƒ 值、换对焦点后整张重新渲染；
   - 走同一套 Metal 着色器，GPU 不可用时退回 CPU；
   - 拖动滑块时只渲染最新一组参数。
+- **组装**（`StillPhotoBuilder.build`）：深度由调用方给，这里做 HDR 增益图、人像分割、人像实例、物体分割，组装成 `CapturedDepthPhoto`。
+  相机拍照和相册导入都走它。
+- **相册导入**（`PhotoLibraryImporter`，入口是预览左上角「相册」）：
+  - 原始文件（PhotosPicker `.current`）→ ImageIO 按 EXIF 方向解成正向、长边 3024 的图，之后方向一律 `.up`；
+    带深度或者相册标成人像（`photoDepthEffect`）的照片，`.current` 里已经画进了系统的人像虚化，改取 `.unadjusted` 原图（要相册读权限）；
+  - 深度：照片自带的（`kCGImageAuxiliaryDataTypeDisparity` / `Depth`，`applyingExifOrientation` 转正；宽高比差 3% 以上或有效像素不到 1/4 不用）
+    → 没有就 AI 单目深度（`MonocularDepthEstimator.estimateStill`：转正送入、不拉伸，模型不接受照片比例时补边，结果只取画面那块）；
+  - 焦距：只有照片自带深度时用 EXIF 的 35mm 等效焦距；AI 深度不按焦距放大；
+  - 打开时的对焦点：最大的人脸 → 最大的人像实例 → 最大的物体 → EXIF 主体区域 → 中心；ƒ4.5；
+  - 之后和拍完照一模一样：点按换主体全在 `stillPlan`。
 
 ---
 
@@ -340,7 +350,8 @@ r = g · blurK / ƒ · 长边                        blurK = 0.016，上限 1.4%
 ## 14. 已知问题和待定事项
 
 - **4× 视差单位**：长焦当主镜头时，双摄视差只有真实值的约 1/4，所以 4× 实际比 2×–3.9× 虚化弱。暗光或很近时系统会换回主摄裁切，虚化会突然变强。乘回 4 倍会放大深度噪声，需要配一层去噪，暂时没做。
-- **0.5× AI 深度**每帧归一化，不是真实距离，所以虚化量不是物理意义上的。
+- **0.5× AI 深度**每帧归一化，不是真实距离，所以虚化量不是物理意义上的。相册导入用 AI 深度时一样：风景照也会被拉开成大景深差。
+- **相册里的系统人像照**：取的是 `.unadjusted` 原图，照片在相册里的其他编辑（滤镜、裁剪）会丢；没有相册读权限时只能用已经虚化过的当前版本。
 - **2× 系统滤波**是否也会补错，还没有对比录制。
 - **Vision 人像实例最多 4 人**：超出的人照样按深度虚化，但只能走 `depthRestricted` 这条更粗的路。
 - **对焦在修边之前测**：点在头发、眼镜边上时，对焦面可能取到背景深度（3% 窗口中位数通常能扛住）。

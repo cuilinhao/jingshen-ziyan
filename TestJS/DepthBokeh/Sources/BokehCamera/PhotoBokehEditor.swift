@@ -16,6 +16,8 @@ public final class PhotoBokehEditor: ObservableObject, @unchecked Sendable {
     @Published public private(set) var renderMilliseconds: Double = 0
     /// 对焦距离（米）；相对深度的照片为 0
     @Published public private(set) var focusDistanceMeters: Float = 0
+    /// 不虚化的原图（光圈拨到「关闭」时显示、保存它）；第一次 `prepareOriginal()` 以后才有
+    @Published public private(set) var originalImage: UIImage?
 
     public let photo: CapturedDepthPhoto
     /// 只在 `lensModel = .thinLens` 时使用
@@ -49,6 +51,16 @@ public final class PhotoBokehEditor: ObservableObject, @unchecked Sendable {
     public init(photo: CapturedDepthPhoto) {
         self.photo = photo
         request(fNumber: photo.fNumber, focus: photo.focusPoint)
+    }
+
+    /// 在后台把原图转成 UIImage（照片分辨率要几十毫秒），只做一次
+    public func prepareOriginal() {
+        guard originalImage == nil else { return }
+        let photo = self.photo
+        Self.queue.async {
+            let ui = ImageBridge.uiImage(from: photo.image, orientation: photo.orientation)
+            DispatchQueue.main.async { if self.originalImage == nil { self.originalImage = ui } }
+        }
     }
 
     deinit {

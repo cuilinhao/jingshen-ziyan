@@ -20,6 +20,7 @@
 4. Target → Info 里添加两个权限说明：
    - `Privacy - Camera Usage Description`（NSCameraUsageDescription），比如「拍摄带深度信息的照片」
    - `Privacy - Photo Library Additions Usage Description`（NSPhotoLibraryAddUsageDescription），比如「保存虚化后的照片」
+   - `Privacy - Photo Library Usage Description`（NSPhotoLibraryUsageDescription），比如「读取人像照片没有虚化过的原图和深度」（相册导入人像照片时用）
 5. **Product → Scheme → Edit Scheme → Run → Build Configuration 改成 Release。** 虚化在 GPU 上算，但每帧 CPU 上的分析（对焦、主体种子）是纯 Swift 循环，Debug 模式不开优化会慢很多、更耗电。
 6. 选你的 iPhone，运行。
 7. （可选，0.5× 超广角要用）把 `DepthAnythingV2SmallF16.mlpackage`（Apple 的 Core ML 版 Depth Anything V2，约 48 MB）拖进 App target。
@@ -158,6 +159,41 @@
   每帧的相机整帧（jpg）、系统给的原始深度和 App 实际用的深度（pfm）、分割结果、每帧参数（frames.jsonl）、
   机型 / 相机设备 / 标定参数（recording.json），在电脑上用 bokeh-cli --live 按同一份代码重放。
 
+### 从相册导入（别的 App 拍的图也能调景深）
+
+预览左上角「相册」选一张图，进的是和拍完照一样的编辑器：左右拨下面的光圈刻度改 ƒ 值（1/3 档，每档轻震），点哪儿哪儿就是主体
+（点人留那个人、点物体留那个物体，其余按深度虚化，规则全在 `LiveFrameAnalyzer.stillPlan`，和拍照共用）。
+导入在 `PhotoLibraryImporter`，组装和拍照共用 `StillPhotoBuilder`：
+
+1. PhotosPicker 用 `.current` 编码拿原始文件（默认的 `.automatic` 可能把 HEIC 转成 JPEG，深度和 HDR 增益图会丢）。
+   普通照片不需要相册读权限。**人像照片例外**：`.current` 是带编辑的当前版本，系统的人像虚化已经画进像素里了
+   （背景本来就糊：点人清晰不了，ƒ16 也还是糊，录屏 demo-xiaoguo）。所以照片带深度、或者相册说它是人像照片时，
+   再用 PHImageManager 取没编辑过的原图（`version = .unadjusted`：清晰的原图 + 深度，`PhotoLibraryImporter.unadjustedOriginal`），
+   这一步要相册读权限（第一次会弹窗）。没给权限、或者「有限访问」没选这张，就用当前版本并在编辑器顶上提示。
+   代价：照片在相册里的其他编辑（滤镜、裁剪）也一起没了；
+2. ImageIO 按 EXIF 方向直接解成正向的图、长边 3024（48MP 不整张解码）。之后画面、深度、分割、点按坐标都是正向的；
+3. **深度**：照片自带的深度优先（系统相机人像照、iPhone 15 以后拍到人或宠物时自动存的、部分第三方相机），
+   转正后和画面宽高比差 3% 以上（在相册里被裁过）或者有效像素不到 1/4 就不用。
+   没有就用 AI 单目深度（和 0.5× 同一个 Depth Anything V2）：`MonocularDepthEstimator.estimateStill` 按照片转正后的方向送进去，
+   不再为了凑模型输入的横竖多转 90°；模型接受照片的宽高比就直接用，否则等比缩进去、四周用边缘像素补齐，结果只取画面那块
+   （以前的拉伸对相机的 4:3 几乎没影响，相册里的 16:9、1:1、截图、全景会变形）。模型还没准备好时导入界面会等它下载 / 编译；
+4. 增益图、人像分割、人像实例、物体分割：和拍照同一段代码；
+5. 打开时的对焦点：最大的人脸 → 最大的人 → 最大的前景物体 → EXIF 主体区域 → 画面中心；ƒ4.5。
+
+编辑器顶上显示深度来源（「照片自带深度」「AI 深度」）。光圈刻度 ƒ16 再往后一档是「关闭」（显示不虚化的原图，和系统相册一样）。
+控制台 `[Import]` 打印每一步耗时。
+编辑器按窗口的安全区自己留边：这一页 SwiftUI 报的安全区是 0，以前「关闭 / 保存」压在状态栏上，ƒ 滑块落进底部横条的手势区，
+左右拖就触发系统「切换 App」，整个界面被缩小。现在控件都在底部横条上方，底边的系统手势也推迟（`defersSystemGestures`）。
+
+注意：
+- **AI 深度是每张图归一化的相对值**（最近 ≈ 1、最远 ≈ 0），不是米。人像、静物没问题；风景照这种实际全在远处的画面也会被拉开，
+  虚化得像移轴。所以 AI 深度不按 EXIF 焦距放大虚化（长焦图在归一化深度上会整张糊掉），照片自带深度时才按焦距放大。
+- **已经虚化过的图**（别的 App 导出的人像照、大光圈相机拍的）：背景本来就糊，点背景也变不清晰，只能在原有虚化上再叠一层。
+- **导出过的人像照**（存成 JPG、发微信再存回来的，比如 test-png 里的 IMG_1457 / IMG_1458）：文件里只剩虚化后的画面、没有深度，
+  也没有原图可取，背景本来就糊，只能在上面再叠一层虚化。
+- Vision 认不出的东西（墙上的画、远处的树）只能靠深度 + 颜色补边定边界，AI 深度边缘软，主体边缘会偏糊。
+  以后可以加点提示分割（SAM 2.1 的 Core ML 版），结果当成 `objectLabels` 里的一个物体并进去。
+
 ### 场景矩阵（改算法以后跑一遍）
 
 `Tests/BokehCoreTests/ScenarioMatrixTests.swift`：13 个合成场景（录屏里的办公室 A / B、人站在墙前、斜着延伸的桌面、
@@ -231,5 +267,5 @@ GPU 版在 Mac 上的耗时 `swift test` 会打印（`[性能]` 那一行），�
 - **前景背后的内容是猜出来的**：摄像头没拍到被挡住的部分，只能外推。前景虚化越强，这一点越明显。
 - **GPU 版和 CPU 版要一起改**：改算法时两边都要改，`swift test` 在 Mac 上会逐步对比（低分辨率原图、对齐后的深度、主体遮罩、虚化、虚化程度、输出）。
 - **双摄视差是「相对精度」**（`depthDataAccuracy == .relative`），算出来的绝对虚化量不精确。可以把 `virtualFocalLength` 当成「虚化强度」来调。
-- **单摄机型**：没有硬件深度。可以换成 Core ML 的单目深度模型（比如 Depth Anything、Apple 的 Depth Pro）来输出视差图，后面的流程完全一样。
+- **单摄机型**：没有硬件深度。可以换成 Core ML 的单目深度模型（比如 Depth Anything、Apple 的 Depth Pro）来输出视差图，后面的流程完全一样（相册导入没有自带深度时就是这么做的，见「从相册导入」）。
 - 处理时统一转成 sRGB，HEIC 照片的 P3 广色域会丢失；前置原深感摄像头没有接入（它的方向和镜像需要另外处理）。

@@ -16,8 +16,8 @@ public struct CapturedDepthPhoto: Identifiable {
     public let disparity: FloatMap
     /// 显示方向
     public let orientation: UIImage.Orientation
-    /// 拍照时的对焦点（原图归一化坐标）
-    public let focusPoint: CGPoint
+    /// 拍照时的对焦点（原图归一化坐标）；相册导入的照片是自动挑的主体位置
+    public var focusPoint: CGPoint
     /// 拍照时的光圈
     public let fNumber: Float
     /// 视差只有相对值（双摄视差 / AI 单目深度），不能换算成米
@@ -35,6 +35,10 @@ public struct CapturedDepthPhoto: Identifiable {
     /// 照片里过曝、但 HDR 增益图说不是光源的地方（被灯照亮的白色表面），视差图分辨率，0…1：不做焦外高光提亮
     /// （HDRHighlights.nonLightMask）。照片没带增益图时为 nil，照旧只按亮度判断
     public var highlightExclusion: FloatMap? = nil
+    /// 深度从哪来，编辑器里显示（「照片自带深度」「AI 深度」）；相机拍的为 nil
+    public var depthSourceLabel: String? = nil
+    /// 打开编辑器时提示一下（比如「拿不到原图，用的是已经虚化过的版本」）
+    public var notice: String? = nil
 }
 
 /// 实时景深相机。
@@ -1766,36 +1770,20 @@ extension DepthCameraController: AVCapturePhotoCaptureDelegate {
                 relative = true
             }
             mark("深度")
-            // HDR 增益图：照片里过曝、但不是光源的地方（被灯照亮的白色表面）不做焦外高光提亮（HDRHighlights）。
-            // 16 Pro 超广角会把这些表面直接压到 255，只看照片分不出它和灯（录屏 0.5x-baoguang）
-            var exclusion: FloatMap?
-            var alignedGain: FloatMap?
-            if let disparity, let fileData, let gain = ImageBridge.hdrGainMap(from: fileData) {
-                let g = HDRHighlights.align(gain.centerCropped(by: Float(c)), to: image)
-                alignedGain = g
-                exclusion = HDRHighlights.nonLightMask(image: image, gainMap: g,
-                                                       threshold: RenderQuality.photo.highlightThreshold,
-                                                       width: disparity.width, height: disparity.height)
-            }
-            mark(alignedGain != nil ? "增益图" : "没有增益图")
+            // 增益图、三种分割、组装：和相册导入共用（StillPhotoBuilder）
+            let built = StillPhotoBuilder.build(.init(cgImage: cg, image: image, orientation: photoOrientation,
+                                                      displayOrientation: orientation, disparity: disparity,
+                                                      isRelativeDepth: relative, fileData: fileData,
+                                                      gainCrop: Float(c), focusPoint: focus, fNumber: fNumber,
+                                                      focalLength35mm: Float(frameZoom) * 24,
+                                                      lockedFocusDisparity: lockedFocus,
+                                                      segmentation: segmentationOn, depthSourceLabel: nil),
+                                                mark: mark)
             // 没有深度（光线太暗、AI 模型没准备好）：整张图当作在对焦面上
             let hasDepth = disparity != nil
-            // 人像分割（高质量）：对焦在人身上时整个人保持清晰；物体分割：对焦的物体整个保持清晰。和预览一致
-            // 分割开关关掉时照片也只按深度
-            let person = hasDepth && segmentationOn ? PersonSegmenter.photoMask(cg, orientation: photoOrientation) : nil
-            mark("人像分割")
-            // 人像实例：画面上和对焦的人挨着的别人（后面站着的同事）不跟着保持清晰
-            let people = person != nil ? PersonSegmenter.photoPersonInstances(cg, orientation: photoOrientation) : nil
-            mark("人像实例")
-            let objects = hasDepth && segmentationOn ? PersonSegmenter.photoObjects(cg, orientation: photoOrientation) : nil
-            mark("物体分割")
+            let alignedGain = built.alignedGain
             print("[Photo] " + steps.joined(separator: " · "))
-            let captured = CapturedDepthPhoto(image: image,
-                                              disparity: disparity ?? FloatMap(width: 64, height: 48, repeating: 1),
-                                              orientation: orientation, focusPoint: focus, fNumber: fNumber,
-                                              isRelativeDepth: relative, personMask: person, objectLabels: objects,
-                                              personInstances: people, focalLength35mm: Float(frameZoom) * 24,
-                                              lockedFocusDisparity: lockedFocus, highlightExclusion: exclusion)
+            let captured = built.photo
             DispatchQueue.main.async {
                 self.lastPhoto = captured
                 self.isCapturing = false

@@ -177,6 +177,7 @@
 				INFOPLIST_FILE = TestJS/Info.plist;
 				INFOPLIST_KEY_NSCameraUsageDescription = "拍摄带深度信息的照片";
 				INFOPLIST_KEY_NSPhotoLibraryAddUsageDescription = "保存虚化后的照片";
+				INFOPLIST_KEY_NSPhotoLibraryUsageDescription = "读取人像照片没有虚化过的原图和深度，重新调景深";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchStoryboardName = LaunchScreen;
@@ -212,6 +213,7 @@
 				INFOPLIST_FILE = TestJS/Info.plist;
 				INFOPLIST_KEY_NSCameraUsageDescription = "拍摄带深度信息的照片";
 				INFOPLIST_KEY_NSPhotoLibraryAddUsageDescription = "保存虚化后的照片";
+				INFOPLIST_KEY_NSPhotoLibraryUsageDescription = "读取人像照片没有虚化过的原图和深度，重新调景深";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchStoryboardName = LaunchScreen;
