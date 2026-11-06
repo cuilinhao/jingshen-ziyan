@@ -328,10 +328,12 @@ public final class LiveFrameAnalyzer {
                                                band: Self.edgeBand(map, relative: frame.relativeDepth, matte: matte))
             }
             let allPeople = person
+            var focusedPerson: FloatMap?
+            var excludedPeople: FloatMap?
             // 人像遮罩分不出是谁（画面上挨着的人连成一片），这里只留对焦点上的那一个人；
             // 别的人不管多远、挨不挨着，都从遮罩里去掉，清晰还是虚化交给深度（镜头）决定
-            if let pm = person {
-                var base = pm
+            if person != nil || frame.personInstances != nil {
+                var base = person ?? FloatMap(width: map.width, height: map.height)
                 var focusLabel: Int?
                 if let labels = frame.personInstances {
                     let parts: [(label: Int, mask: FloatMap)]
@@ -345,15 +347,18 @@ public final class LiveFrameAnalyzer {
                         then = frame.personInstanceColors?.centerCropped(by: c)
                         personInstanceCache = (frame.personInstanceRevision, c, map.width, map.height, parts, then)
                     }
-                    focusLabel = Self.focusedInstance(labels, point: p, cropPoint: (fx, fy), parts: parts, depth: map,
-                                                      lens: lens, limit: 2 * matte.sharpLimit)
+                    if person != nil {
+                        focusLabel = Self.focusedInstance(labels, point: p, cropPoint: (fx, fy), parts: parts, depth: map,
+                                                          lens: lens, limit: 2 * matte.sharpLimit)
+                    }
                     if var others = Self.otherInstances(parts, except: focusLabel) {
                         // 实例也是几帧之前算的：和遮罩一样按整体平移挪到这一帧
                         if let then, let colors {
                             others = Self.alignMask(others, maskColors: then, colors: colors,
                                                     colorsSmall: small(for: then, colors)).mask
                         }
-                        base = Self.removing(others, from: pm)
+                        excludedPeople = others
+                        base = Self.removing(others, from: base)
                     }
                     // 只留对焦的那个人附近（外加一圈头发、眼镜）：挨着他、但 Vision 没编上号的第 5 个人不跟着清晰
                     if let fl = focusLabel, let part = parts.first(where: { $0.label == fl }) {
@@ -368,12 +373,17 @@ public final class LiveFrameAnalyzer {
                 }
                 // 对焦的人有编号：遮罩里剩下的就是他。没有（没有人像实例，或者他是 Vision 没编上号的第 5 个人）：
                 // 分不出是谁，只留遮罩里深度对得上的那部分
-                person = focusLabel != nil ? base
-                    : Self.depthRestricted(base, depth: map, lens: lens, limit: 2 * matte.sharpLimit)
+                if focusLabel != nil {
+                    focusedPerson = base
+                    person = nil
+                } else {
+                    person = Self.depthRestricted(base, depth: map, lens: lens, limit: 2 * matte.sharpLimit)
+                }
             }
             // 对焦的那个物体（在整个相机画面上按对焦点选，再裁）。标签图几秒才更新一次：没变就用上次选好的
             var selected: (mask: FloatMap?, colors: PlanarImage?) = (nil, nil)
-            if let labels = frame.objectLabels {
+            // 明确选中了某个人时，以人像实例为准；含糊的前景物体分组不能覆盖人物选择。
+            if focusedPerson == nil, let labels = frame.objectLabels {
                 if let k = objectCache, frame.objectRevision != 0, k.revision == frame.objectRevision,
                    k.point == p, k.crop == c, k.w == map.width, k.h == map.height {
                     selected = (k.mask, k.colors)
@@ -391,6 +401,7 @@ public final class LiveFrameAnalyzer {
                     object = aligned.mask
                     objectStale = aligned.changed >= Self.maskStaleFraction
                 }
+                if let excludedPeople { object = Self.removing(excludedPeople, from: object) }
                 // 细条最宽：整张深度图长边的 1/40（裁切后按原来的像素算，320 宽时 8 像素）
                 let reach = max(2, Int((Float(max(frame.disparity.width, frame.disparity.height)) / 40).rounded()))
                 person = Self.addObject(object, to: person, depth: map, focusDisparity: focusD,
@@ -400,7 +411,8 @@ public final class LiveFrameAnalyzer {
                                        parameters: matte, scale: relativeScale, personMask: person, lens: lens,
                                        sharpPeople: allPeople.flatMap { Self.sharpPeople($0, depth: map, lens: lens,
                                                                                          limit: matte.sharpLimit,
-                                                                                         band: matte.band) })
+                                                                                         band: matte.band) },
+                                       focusedPersonMask: focusedPerson)
             // 所有人（不只对焦的那个）：渲染时人身上不做焦外高光提亮
             seeds?.people = allPeople?.resized(width: map.width, height: map.height)
         }
@@ -741,24 +753,37 @@ public final class LiveFrameAnalyzer {
                                                band: edgeBand(map, relative: relativeDepth, matte: matte))
             }
             let allPeople = person
+            var focusedPerson: FloatMap?
+            var excludedPeople: FloatMap?
             // 只留对焦点上的那一个人，别人交给深度决定（同 analyze）
-            if let pm = person {
-                var base = pm
+            if person != nil || personInstances != nil {
+                var base = person ?? FloatMap(width: map.width, height: map.height)
                 var focusLabel: Int?
                 if let labels = personInstances {
                     let parts = instanceMasks(labels, crop: 1, width: map.width, height: map.height)
-                    focusLabel = focusedInstance(labels, point: focusPoint, cropPoint: focusPoint, parts: parts,
-                                                 depth: map, lens: lens, limit: 2 * matte.sharpLimit)
-                    if let others = otherInstances(parts, except: focusLabel) { base = removing(others, from: pm) }
+                    if person != nil {
+                        focusLabel = focusedInstance(labels, point: focusPoint, cropPoint: focusPoint, parts: parts,
+                                                     depth: map, lens: lens, limit: 2 * matte.sharpLimit)
+                    }
+                    if let others = otherInstances(parts, except: focusLabel) {
+                        excludedPeople = others
+                        base = removing(others, from: base)
+                    }
                     if let fl = focusLabel, let part = parts.first(where: { $0.label == fl }) {
                         base = removing(outsideOf(part.mask), from: base)
                     }
                 }
-                person = focusLabel != nil ? base
-                    : depthRestricted(base, depth: map, lens: lens, limit: 2 * matte.sharpLimit)
+                if focusLabel != nil {
+                    focusedPerson = base
+                    person = nil
+                } else {
+                    person = depthRestricted(base, depth: map, lens: lens, limit: 2 * matte.sharpLimit)
+                }
             }
-            if let labels = objectLabels, let inst = SubjectMatte.instanceAt(labels, point: focusPoint) {
-                person = addObject(inst.resized(width: map.width, height: map.height), to: person, depth: map,
+            if focusedPerson == nil, let labels = objectLabels, let inst = SubjectMatte.instanceAt(labels, point: focusPoint) {
+                var object = inst.resized(width: map.width, height: map.height)
+                if let excludedPeople { object = removing(excludedPeople, from: object) }
+                person = addObject(object, to: person, depth: map,
                                    focusDisparity: focusD, norm: max(relativeScale ?? focusD, 1e-3), matte: matte,
                                    reach: max(2, Int((Float(max(map.width, map.height)) / 40).rounded())))
             }
@@ -766,7 +791,8 @@ public final class LiveFrameAnalyzer {
                                        parameters: matte, scale: relativeScale, personMask: person, lens: lens,
                                        sharpPeople: allPeople.flatMap { sharpPeople($0, depth: map, lens: lens,
                                                                                     limit: matte.sharpLimit,
-                                                                                    band: matte.band) })
+                                                                                    band: matte.band) },
+                                       focusedPersonMask: focusedPerson)
             // 所有人：人身上不做焦外高光提亮（同 analyze）
             seeds?.people = allPeople?.resized(width: map.width, height: map.height)
             // 照片的 HDR 增益图说不是光源的过曝亮区（白色表面，HDRHighlights.nonLightMask）：和人一样不提亮

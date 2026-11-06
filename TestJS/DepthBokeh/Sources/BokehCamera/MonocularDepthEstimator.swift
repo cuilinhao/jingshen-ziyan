@@ -2,8 +2,8 @@
 // 改动：输出直接是 BokehCore 的 FloatMap（传感器方向），并且可以对拍下来的照片（CGImage）估计。
 //
 //  - 模型输入是竖直的画面（深度网络依赖「地面在下、天空在上」），392×518；结果转回传感器方向
-//  - 输出是相对的「逆深度」（越大越近，比例和偏移都未知），每帧按第 2 / 98 百分位归一化到 0.02…1.02，
-//    渲染时用 LensParameters.relativeScale 保护相对距离的分母
+//  - 输出是相对的「逆深度」（越大越近，比例和偏移都未知），默认按第 2 / 98 百分位归一化到 0.02…1.02；
+//    锁焦期间预览和照片固定使用锁焦前的范围，渲染时用 LensParameters.relativeScale 保护相对距离的分母
 //  - 相册照片（estimateStill）：任意宽高比，按照片自己的方向转正后送进去，不拉伸（模型接受这个比例就直接用，
 //    否则等比缩进去、四周补边），结果只取画面那一块
 #if os(iOS)
@@ -16,10 +16,7 @@ import ImageIO
 import BokehCore
 
 /// Normalisation range of the model output (2nd / 98th percentile), smoothed over video frames.
-struct DepthRange {
-    var low: Float
-    var high: Float
-}
+typealias DepthRange = MonocularDepthNormalization.Range
 
 final class MonocularDepthEstimator: @unchecked Sendable {   // all mutable state is guarded by `lock`
 
@@ -97,18 +94,24 @@ final class MonocularDepthEstimator: @unchecked Sendable {   // all mutable stat
     /// Disparity-like depth for a camera buffer in sensor orientation.
     /// Returns a map in the same (sensor) orientation plus the range used.
     /// Pass the previous frame's range to smooth the normalisation over video (nil for photos).
+    /// A fixed range keeps locked focus values in the same coordinate space across frames and photos.
     func estimate(_ pixelBuffer: CVPixelBuffer, previous: DepthRange?,
-                  orientation: CGImagePropertyOrientation = .right) -> (map: FloatMap, range: DepthRange)? {
-        estimate(image: CIImage(cvPixelBuffer: pixelBuffer), previous: previous, orientation: orientation)
+                  orientation: CGImagePropertyOrientation = .right,
+                  fixedRange: DepthRange? = nil) -> (map: FloatMap, range: DepthRange)? {
+        estimate(image: CIImage(cvPixelBuffer: pixelBuffer), previous: previous,
+                 orientation: orientation, fixedRange: fixedRange)
     }
 
     /// Same for a still photo (sensor orientation, EXIF orientation not applied).
-    func estimate(cgImage: CGImage, orientation: CGImagePropertyOrientation = .right) -> FloatMap? {
-        estimate(image: CIImage(cgImage: cgImage), previous: nil, orientation: orientation)?.map
+    func estimate(cgImage: CGImage, orientation: CGImagePropertyOrientation = .right,
+                  fixedRange: DepthRange? = nil) -> FloatMap? {
+        estimate(image: CIImage(cgImage: cgImage), previous: nil,
+                 orientation: orientation, fixedRange: fixedRange)?.map
     }
 
     private func estimate(image source: CIImage, previous: DepthRange?,
-                          orientation: CGImagePropertyOrientation = .right) -> (map: FloatMap, range: DepthRange)? {
+                          orientation: CGImagePropertyOrientation = .right,
+                          fixedRange: DepthRange? = nil) -> (map: FloatMap, range: DepthRange)? {
         lock.lock()
         defer { lock.unlock() }
 
@@ -118,32 +121,12 @@ final class MonocularDepthEstimator: @unchecked Sendable {   // all mutable stat
             output.values = output.values.map { $0 > 1e-6 ? 1 / $0 : 0 }
         }
 
-        // Robust range: 2nd / 98th percentile on a sub-sampled grid.
-        var sample: [Float] = []
-        sample.reserveCapacity(output.values.count / 16 + 1)
-        var i = 0
-        while i < output.values.count {
-            let v = output.values[i]
-            if v.isFinite { sample.append(v) }
-            i += 16
-        }
-        guard sample.count > 16 else { return nil }
-        sample.sort()
-        var low = sample[sample.count * 2 / 100]
-        var high = sample[min(sample.count - 1, sample.count * 98 / 100)]
-        if let previous {
-            low = previous.low + (low - previous.low) * 0.25
-            high = previous.high + (high - previous.high) * 0.25
-        }
-        let span = max(high - low, 1e-6)
-
-        let values = output.values.map { v in
-            v.isFinite ? min(max((v - low) / span, 0), 1.5) + 0.02 : 0.02
-        }
+        guard let normalized = MonocularDepthNormalization.normalize(
+            output.values, previous: previous, fixedRange: fixedRange) else { return nil }
         // Invert the actual input rotation, including a fallback to a landscape model size.
-        let map = CameraImageOrientation.sensorMap(values, width: output.width, height: output.height,
+        let map = CameraImageOrientation.sensorMap(normalized.values, width: output.width, height: output.height,
                                                    orientation: prediction.orientation)
-        return (map, DepthRange(low: low, high: high))
+        return (map, normalized.range)
     }
 
     // MARK: 相册照片（任意宽高比）

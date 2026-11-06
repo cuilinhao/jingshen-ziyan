@@ -88,10 +88,12 @@ public enum SubjectMatte {
     ///     nil = 旧规则（±band）
     ///   - sharpPeople: 别的人身上按深度本来就清晰的像素（和 depth 一样大，0…1，见 LiveFrameAnalyzer.sharpPeople）：
     ///     和对焦的人一样整片锁在对焦面，细的眼镜框、头发渲染时不会再被深度对齐抹糊
+    ///   - focusedPersonMask: 已按实例选中、排除其他人并对齐的单人软遮罩；遮挡后断开的手脚也属于这个人，不再按连通区域删减
     public static func seeds(depth: FloatMap, colors: PlanarImage?, focusDisparity df: Float,
                              focusPoint: (Float, Float)?, parameters p: SubjectMatteParameters,
                              scale: Float? = nil, personMask: FloatMap? = nil,
-                             lens: LensParameters? = nil, sharpPeople: FloatMap? = nil) -> SubjectSeeds {
+                             lens: LensParameters? = nil, sharpPeople: FloatMap? = nil,
+                             focusedPersonMask: FloatMap? = nil) -> SubjectSeeds {
         let w = depth.width, h = depth.height, n = w * h
         var result = SubjectSeeds()
         guard df > 0, n > 0 else { return result }
@@ -129,6 +131,12 @@ public enum SubjectMatte {
             for i in 0..<n where grown[i] > 0.5 { extra[i] = 1; hasExtra = true }
         }
         var person = personMask.flatMap { personRegion($0, width: w, height: h, focusPoint: focusPoint) }
+        if let focused = focusedPersonMask {
+            let selected = focused.resized(width: w, height: h).values
+            var v = person ?? [Float](repeating: 0, count: n)
+            for i in 0..<n { v[i] = max(v[i], selected[i]) }
+            person = v
+        }
         if let also = sharpPeople, also.width == w, also.height == h, also.values.contains(where: { $0 > 0.5 }) {
             var v = person ?? [Float](repeating: 0, count: n)
             for i in 0..<n { v[i] = max(v[i], also.values[i]) }

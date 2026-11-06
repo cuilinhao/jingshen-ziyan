@@ -1312,6 +1312,8 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
         // GPU 上最多 2 帧：再来就丢掉这一帧（延迟不累积，也不白算）
         guard framesInFlight < 2 else { return }
         let t0 = CACurrentMediaTime()
+        // 同一帧的 AI 归一化和对焦分析必须看到同一个锁焦状态。
+        let locked = focusLocked
         if lastFrameStart > 0 {
             let dt = t0 - lastFrameStart
             if dt > 0.005 && dt < 0.2 { frameInterval += (dt - frameInterval) * 0.2 }
@@ -1358,7 +1360,9 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
             monoCounter &+= 1
             var estimated = false
             if lastMonoMap == nil || monoCounter % 2 == 0,
-               let result = estimator.estimate(pixelBuffer, previous: monoRange, orientation: frameOrientation) {
+               let result = estimator.estimate(pixelBuffer, previous: monoRange, orientation: frameOrientation,
+                                               fixedRange: locked ? monoRange : nil) {
+                // 锁焦从上一帧的标尺开始固定；之后重新构图、百分位变化也不挪动焦平面。
                 lastMonoMap = result.map
                 monoRange = result.range
                 estimated = true
@@ -1456,7 +1460,6 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
             // 跑多勤看画面动不动、有没有人、对焦点在哪儿（PersonSegmenter.update）：静止时很少跑，省电。
             // 分割开关关掉时不跑，虚化只按深度（useSegmentation）
             let segmentationOn = keepSubjectSharp && useSegmentation
-            let locked = focusLocked
             if segmentationOn {
                 if tapped || crossfade { segmenter.focusChanged() }
                 segmenter.update(with: pixelBuffer, now: t0, moving: sceneMoving, personChanged: personMaskStale,
@@ -1690,9 +1693,10 @@ extension DepthCameraController: AVCapturePhotoCaptureDelegate {
             return
         }
         // 和预览一样的裁切（两个深度倍率点之间相机停在低的那个点）
-        let (crop, monoRoute, streamOrientation, frameZoom, lockedFocus) = dataQueue.sync {
+        let (crop, monoRoute, streamOrientation, frameZoom, lockedFocus, lockedMonoRange) = dataQueue.sync {
             (self.lastFrameCrop, !self.depthExpected, self.frameOrientation, self.lastPublishedZoom,
-             self.lastFocusWasLocked ? self.lastFocusDisparity : nil)
+             self.lastFocusWasLocked ? self.lastFocusDisparity : nil,
+             self.lastFocusWasLocked && !self.depthExpected ? self.monoRange : nil)
         }
         let syncedAt = CACurrentMediaTime()
         let depth = photo.depthData
@@ -1763,11 +1767,17 @@ extension DepthCameraController: AVCapturePhotoCaptureDelegate {
                 // 洞留着（NaN），编辑器里按照片的颜色补（LiveFrameAnalyzer.stillPlan）；和图像的对齐也在编辑器里按渲染分辨率做
                 disparity = ImageBridge.disparityMap(from: depth).centerCropped(by: Float(c))
                 relative = depth.depthDataAccuracy == .relative
-            } else if monoRoute, let estimator = DepthModelStore.shared.estimator,
-                      let mono = estimator.estimate(cgImage: cg, orientation: photoOrientation) {
-                // 超广角：在裁好的照片上重新估计一次 AI 深度
-                disparity = mono
-                relative = true
+            } else if monoRoute, let estimator = DepthModelStore.shared.estimator {
+                if let lockedMonoRange {
+                    // 锁焦：完整画面和预览采用同一个模型视场、同一个深度标尺，再裁出成片。
+                    // 直接重估裁后图会改变归一化范围，预览锁定值可能落到照片的背景上。
+                    disparity = estimator.estimate(cgImage: cgFull, orientation: photoOrientation,
+                                                   fixedRange: lockedMonoRange)?.centerCropped(by: Float(c))
+                } else {
+                    // 未锁焦照旧在裁好的照片上估深度，由照片自己的对焦点选焦平面。
+                    disparity = estimator.estimate(cgImage: cg, orientation: photoOrientation)
+                }
+                relative = disparity != nil
             }
             mark("深度")
             // 增益图、三种分割、组装：和相册导入共用（StillPhotoBuilder）
