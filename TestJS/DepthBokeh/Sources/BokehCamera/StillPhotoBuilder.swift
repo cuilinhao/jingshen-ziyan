@@ -8,7 +8,7 @@ import BokehCore
 /// 一张静态照片（画面 + 已经拿到的视差图）→ 可以反复调景深的 `CapturedDepthPhoto`。
 ///
 /// 相机拍照（`DepthCameraController` 的拍照回调）和相册导入（`PhotoLibraryImporter`）都走这里，
-/// 「HDR 增益图 → 人像分割 → 人像实例 → 物体分割 → 组装」的规则只在这一处。
+/// 「HDR 增益图 → 人像分割 → 眼镜带 → 人像实例 → 物体分割 → 组装」的规则只在这一处。
 /// 深度从哪来（硬件深度、照片文件自带的深度、AI 单目深度）由调用方决定，这里不管。
 enum StillPhotoBuilder {
     struct Input {
@@ -69,6 +69,9 @@ enum StillPhotoBuilder {
         let segment = input.disparity != nil && input.segmentation
         let person = segment ? PersonSegmenter.photoMask(cg, orientation: o) : nil
         mark("人像分割")
+        // 眼镜带：人脸框里眼睛那一条，伸出脸外的镜片在这里按人像遮罩的软边算人（FaceBand）
+        let faceBand = person != nil ? PersonSegmenter.photoFaceBand(cg, orientation: o) : nil
+        mark("人脸")
         // 人像实例：画面上和对焦的人挨着的别人（后面站着的同事）不跟着保持清晰
         let people = person != nil ? PersonSegmenter.photoPersonInstances(cg, orientation: o) : nil
         mark("人像实例")
@@ -83,6 +86,7 @@ enum StillPhotoBuilder {
                                        lockedFocusDisparity: input.lockedFocusDisparity,
                                        highlightExclusion: exclusion)
         photo.depthSourceLabel = input.depthSourceLabel
+        photo.faceBand = faceBand
         return Output(photo: photo, alignedGain: alignedGain)
     }
 }

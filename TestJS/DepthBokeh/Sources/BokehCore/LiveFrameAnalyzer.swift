@@ -117,6 +117,10 @@ public final class LiveFrameAnalyzer {
         /// 锁定对焦：点按以后对焦动画走完（lockSettleTime），对焦的距离就固定住，不再按对焦点重新测
         /// （主体走开、手机移动、重新构图都不变），直到再点一次或者关掉。false = 一直跟着对焦点测
         public var focusLocked: Bool
+        /// 眼镜带（FaceBand：人脸框里眼睛那一条，0/1，整个相机画面，任意分辨率）。和人像遮罩是同一帧算的
+        /// （对齐、过期都跟着人像遮罩走）：这一条里人像遮罩的软边也算人（SubjectMatte.withAccessories），
+        /// 伸出脸外的镜片、镜框不再被当成背景虚化。nil = 没有人脸或者没算
+        public var faceBand: FloatMap?
 
         public init(disparity: FloatMap, relativeDepth: Bool, crop: Float, fNumber: Float,
                     focusPoint: (x: Float, y: Float), focusTapped: Bool, time: Double,
@@ -124,7 +128,9 @@ public final class LiveFrameAnalyzer {
                     personMaskColors: PlanarImage? = nil, depthAge: Int = 0,
                     objectLabels: FloatMap? = nil, objectColors: PlanarImage? = nil, objectRevision: Int = 0,
                     personInstances: FloatMap? = nil, personInstanceColors: PlanarImage? = nil,
-                    personInstanceRevision: Int = 0, focalLength35mm: Float? = nil, focusLocked: Bool = false) {
+                    personInstanceRevision: Int = 0, focalLength35mm: Float? = nil, focusLocked: Bool = false,
+                    faceBand: FloatMap? = nil) {
+            self.faceBand = faceBand
             self.focusLocked = focusLocked
             self.focalLength35mm = focalLength35mm
             self.personInstances = personInstances
@@ -314,18 +320,29 @@ public final class LiveFrameAnalyzer {
                 return s
             }
             var person = frame.personMask?.centerCropped(by: c)
+            // 眼镜带里人像遮罩的软边也算人（伸出脸外的镜片）：和遮罩同一帧算的，先合进遮罩再一起对齐
+            var accessories: FloatMap?
+            if let pm = person, let band = frame.faceBand?.centerCropped(by: c),
+               let added = SubjectMatte.accessories(pm, faceBand: band, threshold: matte.accessoryThreshold) {
+                person = SubjectMatte.withAccessories(pm, faceBand: band, threshold: matte.accessoryThreshold)
+                accessories = added
+            }
             var maskValid: [Float]?
             if let pm = person, let then = frame.personMaskColors?.centerCropped(by: c), let colors {
                 let aligned = Self.alignMask(pm, maskColors: then, colors: colors, colorsSmall: small(for: then, colors))
                 person = aligned.mask
                 personStale = aligned.changed >= Self.maskStaleFraction
                 maskValid = aligned.stale.map { $0.map { 1 - $0 } }
+                accessories = accessories.map {
+                    Self.alignMask($0, maskColors: then, colors: colors, colorsSmall: small(for: then, colors)).mask
+                }
             }
             // 按人像遮罩（所有人）修深度边缘：头发、眼镜用这个人自己的深度，旁边那圈光晕用背景的深度。
-            // 只修边，糊多少照样看镜头（SegmentEdgeRepair）
+            // 眼镜带新算进人的镜片整片不可信，从脸上填过去。只修边，糊多少照样看镜头（SegmentEdgeRepair）
             if let pm = person {
                 map = SegmentEdgeRepair.repair(depth: map, segments: pm, valid: maskValid,
-                                               band: Self.edgeBand(map, relative: frame.relativeDepth, matte: matte))
+                                               band: Self.edgeBand(map, relative: frame.relativeDepth, matte: matte),
+                                               untrusted: accessories)
             }
             let allPeople = person
             var focusedPerson: FloatMap?
@@ -377,15 +394,22 @@ public final class LiveFrameAnalyzer {
                     focusedPerson = base
                     person = nil
                 } else {
-                    person = Self.depthRestricted(base, depth: map, lens: lens, limit: 2 * matte.sharpLimit)
+                    person = Self.depthRestricted(base, depth: map, lens: lens, limit: 2 * matte.sharpLimit,
+                                                  ring: Self.edgeBand(map, relative: frame.relativeDepth, matte: matte))
                 }
             }
-            // 对焦的是人：人的边界由分割说了算，遮罩外面那一圈颜色说了不算（SubjectMatte.colorBlock）。
-            // 遮罩画面变了的地方（人在动）不限制
-            let colorBlock = Self.personColorBlock(allPeople: allPeople, subject: focusedPerson ?? person,
-                                                   focusedByInstance: focusedPerson != nil, focusPoint: (fx, fy),
-                                                   width: map.width, height: map.height, matte: matte,
-                                                   keep: maskValid.map { $0.map { 1 - $0 } })
+            // 点中的是人：遮罩里其实是后面背景的那几块（Vision 包进来的空隙）不算他，交给镜头（深度先说了算）
+            let onPerson = Self.focusOnPerson(allPeople: allPeople, focusedByInstance: focusedPerson != nil,
+                                              point: (fx, fy))
+            var people = allPeople
+            if onPerson, let all = allPeople, let subject = focusedPerson ?? person,
+               let holes = Self.backgroundHoles(subject: subject, people: all, depth: map, lens: lens, matte: matte) {
+                focusedPerson = focusedPerson.map { Self.removing(holes, from: $0) }
+                person = person.map { Self.removing(holes, from: $0) }
+                people = Self.removing(holes, from: all)
+            }
+            let personSubject = onPerson ? (focusedPerson ?? person) : nil
+            var objectSubject: FloatMap?
             // 对焦的那个物体（在整个相机画面上按对焦点选，再裁）。标签图几秒才更新一次：没变就用上次选好的
             var selected: (mask: FloatMap?, colors: PlanarImage?) = (nil, nil)
             // 明确选中了某个人时，以人像实例为准；含糊的前景物体分组不能覆盖人物选择。
@@ -410,17 +434,25 @@ public final class LiveFrameAnalyzer {
                 if let excludedPeople { object = Self.removing(excludedPeople, from: object) }
                 // 细条最宽：整张深度图长边的 1/40（裁切后按原来的像素算，320 宽时 8 像素）
                 let reach = max(2, Int((Float(max(frame.disparity.width, frame.disparity.height)) / 40).rounded()))
-                person = Self.addObject(object, to: person, depth: map, focusDisparity: focusD,
-                                        norm: max(relativeScale ?? focusD, 1e-3), matte: matte, reach: reach)
+                if let accepted = Self.acceptedObject(object, depth: map, focusDisparity: focusD,
+                                                      norm: max(relativeScale ?? focusD, 1e-3), matte: matte, reach: reach) {
+                    objectSubject = accepted
+                    person = Self.merging(accepted, into: person)
+                }
             }
+            // 点中的人 / 物体：边界由分割说了算，分割外面颜色说了不算（SubjectMatte.colorBlock）。
+            // 遮罩画面变了的地方（人在动）不限制；点中的东西 Vision 认不出来时照旧按颜色补边
+            let colorBlock = Self.subjectColorBlock(people: people, personSubject: personSubject, object: objectSubject,
+                                                    width: map.width, height: map.height, matte: matte,
+                                                    keep: maskValid.map { $0.map { 1 - $0 } })
             seeds = SubjectMatte.seeds(depth: map, colors: colors, focusDisparity: focusD, focusPoint: (fx, fy),
                                        parameters: matte, scale: relativeScale, personMask: person, lens: lens,
-                                       sharpPeople: allPeople.flatMap { Self.sharpPeople($0, depth: map, lens: lens,
-                                                                                         limit: matte.sharpLimit,
-                                                                                         band: matte.band) },
+                                       sharpPeople: people.flatMap { Self.sharpPeople($0, depth: map, lens: lens,
+                                                                                      limit: matte.sharpLimit,
+                                                                                      band: matte.band) },
                                        focusedPersonMask: focusedPerson, colorBlock: colorBlock)
             // 所有人（不只对焦的那个）：渲染时人身上不做焦外高光提亮
-            seeds?.people = allPeople?.resized(width: map.width, height: map.height)
+            seeds?.people = people?.resized(width: map.width, height: map.height)
         }
 
         return FramePlan(lens: lens, focusPoint: (fx, fy), streamFocusPoint: p, focusRecentered: recentered,
@@ -498,27 +530,140 @@ public final class LiveFrameAnalyzer {
         return any ? FloatMap(width: w, height: h, values: v) : nil
     }
 
-    /// 对焦的是人时，颜色说了不算的地方（SubjectMatte.colorBlock）；对焦的不是人返回 nil（物体、盆栽照旧按颜色补边）。
-    /// 「对焦的是人」：按实例选中了这个人，或者对焦点就在人像遮罩上（允许偏一点，同 SubjectMatte.personRegion）
-    /// - Parameters:
-    ///   - subject: 对焦的那个人（按实例选中的，或者没有实例时按深度留下的那部分）
-    ///   - keep: 1 = 这里不限制（遮罩画面变了、不再可信的地方）；和深度图一样大
-    static func personColorBlock(allPeople: FloatMap?, subject: FloatMap?, focusedByInstance: Bool,
-                                 focusPoint: (Float, Float), width w: Int, height h: Int,
-                                 matte: SubjectMatteParameters, keep: [Float]?) -> FloatMap? {
-        guard matte.colorMargin >= 0, let all = allPeople, let subject else { return nil }
-        if !focusedByInstance {
-            let m = all.resized(width: w, height: h)
-            let cx = min(w - 1, max(0, Int(focusPoint.0 * Float(w)))), cy = min(h - 1, max(0, Int(focusPoint.1 * Float(h))))
-            let r = max(1, max(w, h) / 100)
-            var onPerson = false
-            for y in max(0, cy - r)...min(h - 1, cy + r) where !onPerson {
-                for x in max(0, cx - r)...min(w - 1, cx + r) where m[x, y] > 0.5 { onPerson = true; break }
-            }
-            guard onPerson else { return nil }
+    /// 对焦点在不在人身上：按实例选中了这个人，或者对焦点就在人像遮罩上（允许偏一点，同 SubjectMatte.personRegion）
+    static func focusOnPerson(allPeople: FloatMap?, focusedByInstance: Bool, point: (Float, Float)) -> Bool {
+        if focusedByInstance { return true }
+        guard let m = allPeople else { return false }
+        let w = m.width, h = m.height
+        guard w > 0, h > 0 else { return false }
+        let cx = min(w - 1, max(0, Int(point.0 * Float(w)))), cy = min(h - 1, max(0, Int(point.1 * Float(h))))
+        let r = max(1, max(w, h) / 100)
+        for y in max(0, cy - r)...min(h - 1, cy + r) {
+            for x in max(0, cx - r)...min(w - 1, cx + r) where m[x, y] > 0.5 { return true }
         }
-        return SubjectMatte.colorBlock(people: all, subject: subject, width: w, height: h, parameters: matte,
+        return false
+    }
+
+    /// 颜色说了不算的地方（SubjectMatte.colorBlock）：点中的是人或者分割分得出来的物体时，主体的边界由分割说了算，
+    /// 分割外面颜色补边不补、彩色引导滤波不超过深度核心。点中的东西 Vision 认不出来（盆栽）时返回 nil，照旧按颜色补边。
+    /// - Parameters:
+    ///   - people: 人像遮罩（所有人，已经去掉了 backgroundHoles）：分割说「是人」的地方颜色照常补
+    ///   - personSubject: 点中的人；对焦点不在人身上时 nil
+    ///   - object: 点中、并且深度对得上的物体（acceptedObject）；没有为 nil
+    ///   - keep: 1 = 这里不限制（遮罩画面变了、不再可信的地方）；和深度图一样大
+    static func subjectColorBlock(people: FloatMap?, personSubject: FloatMap?, object: FloatMap?, width w: Int,
+                                  height h: Int, matte: SubjectMatteParameters, keep: [Float]?) -> FloatMap? {
+        guard matte.colorMargin >= 0 else { return nil }
+        var allowed = people, subject = personSubject
+        if let object {
+            allowed = HDRHighlights.maxMerge(allowed, object)
+            subject = HDRHighlights.maxMerge(subject, object)
+        }
+        guard let allowed, let subject else { return nil }
+        return SubjectMatte.colorBlock(people: allowed, subject: subject, width: w, height: h, parameters: matte,
                                        keep: keep?.count == w * h ? keep : nil)
+    }
+
+    /// 点中的人的遮罩里，其实是后面背景的那几块（Vision 把空隙包了进去：叉腰时胳膊和身体之间、下巴底下、两腿之间）。
+    ///
+    /// 深度先说了算：遮罩里连成一块、按镜头明显在后面（虚化超过 2 × sharpLimit）、并且和人旁边露出来的背景一样远的，
+    /// 不是这个人，交给镜头。以前点中的人整个遮罩直接拉到对焦面，空隙里 3 m 外的墙也完全清晰。
+    /// 不会误伤的：
+    ///  - 同一个人自己身上的前后差（伸向后面的胳膊、伸向镜头的手）：和旁边露出来的背景不一样远，照旧整体清晰；
+    ///  - 深度测错成背景的手脚（被挡断的手，PersonSegmentationRegressionTests）：空隙是被身体围着的，
+    ///    这一块外面一圈至少一半挨着这个人身上深度正常的地方；伸出去的手外面大半是背景，不动；
+    ///  - 太大的一块（超过这个人的 1/5，比如贴着墙站、躯干和墙差不多远）：不动；
+    ///  - 细条（腐蚀 1 像素就没了）、零星几个像素：深度本来就不准，不动；
+    ///  - 修边那条带子（SegmentEdgeRepair 已经给了人的深度）：本来就不在后面。
+    /// 「和旁边背景一样远」：这一块外面 long/20 以内、人像遮罩外面的像素里，至少 15%（并且不少于 6 个）
+    /// 和这一块的视差中位数差不到 0.5 × band（同 refineObject）。
+    /// - Parameters:
+    ///   - subject: 点中的人（任意分辨率，> 0.5 算）
+    ///   - people: 所有人的遮罩：「旁边露出来的背景」只取遮罩外面的
+    ///   - depth: 修过边的视差（深度图分辨率）
+    /// - Returns: 和 depth 一样大的 0/1 图；一块都没有返回 nil
+    static func backgroundHoles(subject: FloatMap, people: FloatMap, depth: FloatMap, lens: LensParameters,
+                                matte: SubjectMatteParameters) -> FloatMap? {
+        let w = depth.width, h = depth.height, n = w * h
+        guard n > 0, lens.focusDisparity > 0 else { return nil }
+        let d = depth.values
+        let sm = subject.width == w && subject.height == h ? subject.values : subject.resized(width: w, height: h).values
+        let pm = people.width == w && people.height == h ? people.values : people.resized(width: w, height: h).values
+        let behindBelow = lens.sharpDisparityRange(limit: 2 * matte.sharpLimit).low
+        var behind = [Bool](repeating: false, count: n)
+        var subjectArea = 0
+        for i in 0..<n where sm[i] > 0.5 {
+            subjectArea += 1
+            if d[i].isFinite && d[i] < behindBelow { behind[i] = true }
+        }
+        guard subjectArea > 0, behind.contains(true) else { return nil }
+        let df = lens.focusDisparity
+        let tol = 0.5 * matte.band * max(lens.relativeScale ?? df, 1e-3)
+        let R = max(4, max(w, h) / 20)
+        var label = [Int32](repeating: 0, count: n)
+        var out = [Float](repeating: 0, count: n)
+        var any = false
+        var next: Int32 = 0
+        for start in 0..<n where behind[start] && label[start] == 0 {
+            // 4 连通的一块
+            next += 1
+            var members = [start]
+            label[start] = next
+            var k = 0
+            var x0 = w, x1 = 0, y0 = h, y1 = 0
+            while k < members.count {
+                let i = members[k]; k += 1
+                let x = i % w, y = i / w
+                x0 = min(x0, x); x1 = max(x1, x); y0 = min(y0, y); y1 = max(y1, y)
+                for (q, ok) in [(i - 1, x > 0), (i + 1, x < w - 1), (i - w, y > 0), (i + w, y < h - 1)]
+                where ok && behind[q] && label[q] == 0 {
+                    label[q] = next
+                    members.append(q)
+                }
+            }
+            guard members.count >= 6, members.count * 5 <= subjectArea else { continue }
+            // 腐蚀 1 像素以后还有剩下的（不是细条）
+            let thick = members.contains { i in
+                let x = i % w, y = i / w
+                guard x > 0, x < w - 1, y > 0, y < h - 1 else { return false }
+                for yy in (y - 1)...(y + 1) { for xx in (x - 1)...(x + 1) where label[yy * w + xx] != next { return false } }
+                return true
+            }
+            guard thick else { continue }
+            // 空隙是被身体围着的：这一块外面一圈挨着的像素，至少一半是这个人身上深度正常（不在后面）的地方。
+            // 伸出去的手、被挡断的手（深度测成了背景）外面大半是遮罩外的背景：是人自己，不动
+            var body = 0, other = 0
+            for i in members {
+                let x = i % w, y = i / w
+                for (q, ok) in [(i - 1, x > 0), (i + 1, x < w - 1), (i - w, y > 0), (i + w, y < h - 1)]
+                where ok && label[q] != next {
+                    if sm[q] > 0.5 && !behind[q] { body += 1 } else { other += 1 }
+                }
+            }
+            guard body >= other else { continue }
+            var own = members.map { d[$0] }
+            own.sort()
+            let dc = own[own.count / 2]
+            // 这一块外面 R 以内、人像遮罩外面的像素（在包围盒外扩 R 的窗口里膨胀）
+            let wx0 = max(0, x0 - R), wx1 = min(w - 1, x1 + R), wy0 = max(0, y0 - R), wy1 = min(h - 1, y1 + R)
+            let ww = wx1 - wx0 + 1, wh = wy1 - wy0 + 1
+            var local = [Float](repeating: 0, count: ww * wh)
+            for i in members { local[(i / w - wy0) * ww + (i % w - wx0)] = 1 }
+            let near = SubjectMatte.dilateBinary(local, width: ww, height: wh, radius: R)
+            var ring = 0, same = 0
+            for yy in 0..<wh {
+                for xx in 0..<ww where near[yy * ww + xx] > 0 {
+                    let j = (yy + wy0) * w + (xx + wx0)
+                    guard pm[j] <= 0.5, d[j].isFinite else { continue }
+                    ring += 1
+                    if abs(d[j] - dc) < tol { same += 1 }
+                }
+            }
+            guard ring > 0, same >= max(6, Int(0.15 * Float(ring))) else { continue }
+            for i in members { out[i] = 1 }
+            any = true
+        }
+        return any ? FloatMap(width: w, height: h, values: out) : nil
     }
 
     /// 修深度边缘时分界线两边各多少个深度像素不可信
@@ -549,8 +694,11 @@ public final class LiveFrameAnalyzer {
     }
 
     /// 分不出是谁时（没有人像实例）：人像遮罩里只留按镜头算本来就清晰（虚化 ≤ 长边 limit）的像素，再往外留一圈
-    /// （长边的 1/30：头发、眼镜这些深度测不准的边）。挨着的别人深度对不上，不会跟着清晰。返回深度图大小
-    static func depthRestricted(_ person: FloatMap, depth: FloatMap, lens: LensParameters, limit: Float) -> FloatMap {
+    /// ring 个像素（修边那条不可信的带子，edgeBand：深度在这里不准，由分割说了算）。挨着的别人深度对不上，不会跟着清晰。
+    /// 以前往外留长边的 1/30（给头发、眼镜），比修边的带子宽一倍多：身后挨着站的人被拉清晰一条（约画面宽的 3%）。
+    /// 头发、眼镜在遮罩里的话修边已经给了人的深度，本来就算清晰，不需要这一圈。返回深度图大小
+    static func depthRestricted(_ person: FloatMap, depth: FloatMap, lens: LensParameters, limit: Float,
+                                ring: Int) -> FloatMap {
         let w = depth.width, h = depth.height, n = w * h
         let pm = person.resized(width: w, height: h).values
         let r = lens.sharpDisparityRange(limit: limit)
@@ -559,7 +707,8 @@ public final class LiveFrameAnalyzer {
         // 先腐蚀 1 像素：挨着的别人身上被噪声碰巧算成「清晰」的零星像素不当种子
         let notSharp = SubjectMatte.dilateBinary(sharp.map { 1 - $0 }, width: w, height: h, radius: 1)
         let seeds = notSharp.map { 1 - $0 }
-        let near = SubjectMatte.dilateBinary(seeds, width: w, height: h, radius: max(2, max(w, h) / 30) + 1)
+        // + 1：种子先腐蚀了 1 像素
+        let near = SubjectMatte.dilateBinary(seeds, width: w, height: h, radius: max(1, ring) + 1)
         var v = pm
         for i in 0..<n where near[i] == 0 { v[i] = 0 }
         return FloatMap(width: w, height: h, values: v)
@@ -573,13 +722,18 @@ public final class LiveFrameAnalyzer {
         return FloatMap(width: person.width, height: person.height, values: v)
     }
 
-    /// 物体遮罩（和深度图一样大）的深度和对焦面对得上，就并进人像遮罩（两者取大）；对不上原样返回人像遮罩
-    static func addObject(_ object: FloatMap, to person: FloatMap?, depth: FloatMap, focusDisparity df: Float,
-                          norm: Float, matte: SubjectMatteParameters, reach: Int = 8) -> FloatMap? {
+    /// 点中的物体（和深度图一样大）：深度和对焦面对得上（±band 以内的像素占 objectDepthAgreement 以上）就返回
+    /// 修过的物体遮罩（refineObject），对不上返回 nil
+    static func acceptedObject(_ object: FloatMap, depth: FloatMap, focusDisparity df: Float, norm: Float,
+                               matte: SubjectMatteParameters, reach: Int = 8) -> FloatMap? {
         let agree = SubjectMatte.depthAgreement(object.values, depth: depth.values, focusDisparity: df, norm: norm,
                                                 band: matte.band)
-        guard agree >= matte.objectDepthAgreement else { return person }
-        let object = refineObject(object, depth: depth, focusDisparity: df, norm: norm, band: matte.band, reach: reach)
+        guard agree >= matte.objectDepthAgreement else { return nil }
+        return refineObject(object, depth: depth, focusDisparity: df, norm: norm, band: matte.band, reach: reach)
+    }
+
+    /// 物体并进人像遮罩（两者取大，物体的大小）
+    static func merging(_ object: FloatMap, into person: FloatMap?) -> FloatMap {
         guard let person else { return object }
         let pm = person.resized(width: object.width, height: object.height)
         var v = object.values
@@ -749,7 +903,8 @@ public final class LiveFrameAnalyzer {
                                  focusPoint: (x: Float, y: Float), personMask: FloatMap?, outputLongSide: Int,
                                  settings: Settings, objectLabels: FloatMap? = nil,
                                  personInstances: FloatMap? = nil, focalLength35mm: Float? = nil,
-                                 lockedFocusDisparity: Float? = nil, highlightExclusion: FloatMap? = nil) -> FramePlan {
+                                 lockedFocusDisparity: Float? = nil, highlightExclusion: FloatMap? = nil,
+                                 faceBand: FloatMap? = nil) -> FramePlan {
         var map = DepthRefiner.fillInvalid(disparity, guide: colors)
         let lowLongSide = max(320, outputLongSide / max(1, settings.blurDownscale))
         // 拍照时锁定了对焦：用锁定的距离（重新构图以后对焦点上可能已经是别的东西）
@@ -776,10 +931,18 @@ public final class LiveFrameAnalyzer {
             let c = colors.map { $0.width == map.width && $0.height == map.height
                 ? $0 : $0.resized(width: map.width, height: map.height) }
             var person = personMask
+            // 眼镜带里人像遮罩的软边也算人（同 analyze）
+            var accessories: FloatMap?
+            if let pm = person, let band = faceBand,
+               let added = SubjectMatte.accessories(pm, faceBand: band, threshold: matte.accessoryThreshold) {
+                person = SubjectMatte.withAccessories(pm, faceBand: band, threshold: matte.accessoryThreshold)
+                accessories = added
+            }
             // 按人像遮罩修深度边缘（同 analyze）
             if let pm = person {
                 map = SegmentEdgeRepair.repair(depth: map, segments: pm,
-                                               band: edgeBand(map, relative: relativeDepth, matte: matte))
+                                               band: edgeBand(map, relative: relativeDepth, matte: matte),
+                                               untrusted: accessories)
             }
             let allPeople = person
             var focusedPerson: FloatMap?
@@ -806,28 +969,42 @@ public final class LiveFrameAnalyzer {
                     focusedPerson = base
                     person = nil
                 } else {
-                    person = depthRestricted(base, depth: map, lens: lens, limit: 2 * matte.sharpLimit)
+                    person = depthRestricted(base, depth: map, lens: lens, limit: 2 * matte.sharpLimit,
+                                             ring: edgeBand(map, relative: relativeDepth, matte: matte))
                 }
             }
-            // 对焦的是人：遮罩外面那一圈颜色说了不算（同 analyze）
-            let colorBlock = personColorBlock(allPeople: allPeople, subject: focusedPerson ?? person,
-                                              focusedByInstance: focusedPerson != nil, focusPoint: focusPoint,
-                                              width: map.width, height: map.height, matte: matte, keep: nil)
+            // 点中的是人：遮罩里其实是后面背景的那几块不算他（同 analyze）
+            let onPerson = focusOnPerson(allPeople: allPeople, focusedByInstance: focusedPerson != nil, point: focusPoint)
+            var people = allPeople
+            if onPerson, let all = allPeople, let subject = focusedPerson ?? person,
+               let holes = backgroundHoles(subject: subject, people: all, depth: map, lens: lens, matte: matte) {
+                focusedPerson = focusedPerson.map { removing(holes, from: $0) }
+                person = person.map { removing(holes, from: $0) }
+                people = removing(holes, from: all)
+            }
+            let personSubject = onPerson ? (focusedPerson ?? person) : nil
+            var objectSubject: FloatMap?
             if focusedPerson == nil, let labels = objectLabels, let inst = SubjectMatte.instanceAt(labels, point: focusPoint) {
                 var object = inst.resized(width: map.width, height: map.height)
                 if let excludedPeople { object = removing(excludedPeople, from: object) }
-                person = addObject(object, to: person, depth: map,
-                                   focusDisparity: focusD, norm: max(relativeScale ?? focusD, 1e-3), matte: matte,
-                                   reach: max(2, Int((Float(max(map.width, map.height)) / 40).rounded())))
+                if let accepted = acceptedObject(object, depth: map, focusDisparity: focusD,
+                                                 norm: max(relativeScale ?? focusD, 1e-3), matte: matte,
+                                                 reach: max(2, Int((Float(max(map.width, map.height)) / 40).rounded()))) {
+                    objectSubject = accepted
+                    person = merging(accepted, into: person)
+                }
             }
+            // 点中的人 / 物体：分割外面颜色说了不算（同 analyze）
+            let colorBlock = subjectColorBlock(people: people, personSubject: personSubject, object: objectSubject,
+                                               width: map.width, height: map.height, matte: matte, keep: nil)
             seeds = SubjectMatte.seeds(depth: map, colors: c, focusDisparity: focusD, focusPoint: focusPoint,
                                        parameters: matte, scale: relativeScale, personMask: person, lens: lens,
-                                       sharpPeople: allPeople.flatMap { sharpPeople($0, depth: map, lens: lens,
-                                                                                    limit: matte.sharpLimit,
-                                                                                    band: matte.band) },
+                                       sharpPeople: people.flatMap { sharpPeople($0, depth: map, lens: lens,
+                                                                                 limit: matte.sharpLimit,
+                                                                                 band: matte.band) },
                                        focusedPersonMask: focusedPerson, colorBlock: colorBlock)
             // 所有人：人身上不做焦外高光提亮（同 analyze）
-            seeds?.people = allPeople?.resized(width: map.width, height: map.height)
+            seeds?.people = people?.resized(width: map.width, height: map.height)
             // 照片的 HDR 增益图说不是光源的过曝亮区（白色表面，HDRHighlights.nonLightMask）：和人一样不提亮
             if let ex = highlightExclusion, seeds != nil {
                 let people = seeds?.people

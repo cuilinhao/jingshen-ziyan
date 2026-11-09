@@ -107,7 +107,9 @@ func readPPMBytes(_ path: String) throws -> (bytes: [UInt8], width: Int, height:
 //               "maskimg": 算遮罩那一帧的画面.ppm 或 "", "age": 深度是几帧之前的, "mindist": 米,
 //               "objects": 物体分割标签图.pfm 或 "", "objimg": 算物体分割那一帧的画面.ppm 或 "", "long": 1440,
 //               "fl": 画面的 35mm 等效焦距（毫米，含裁切；4× 长焦是 100），不填 = 按 1× 的标定,
-//               "lock": 锁定对焦（点按后 0.4 秒固定对焦距离）}
+//               "lock": 锁定对焦（点按后 0.4 秒固定对焦距离）,
+//               "people": 人像实例标签图.pfm 或 ""（调试录制里的 people_NNNN.pfm，0 = 不是人，1…N = 各个人）,
+//               "faces": 眼镜带.pfm 或 ""（调试录制里的 faces_NNNN.pfm，和人像遮罩同一帧，FaceBand）}
 // 和 App 的 DepthCameraController 走同一个 LivePreviewPipeline。每帧输出一行 JSON（对焦、耗时）
 if args.first == "--live" {
     args.removeFirst()
@@ -158,6 +160,10 @@ if args.first == "--live" {
                                         bytesPerRow: m.width * 3, layout: .rgb, longSide: max(m.width, m.height), crop: 1)
             }
         }
+        let peoplePath = job["people"] as? String ?? ""
+        let people = peoplePath.isEmpty ? nil : try readPFM(peoplePath)
+        let facesPath = job["faces"] as? String ?? ""
+        let faceBand = facesPath.isEmpty ? nil : try readPFM(facesPath)
         let input = LivePreviewPipeline.Frame(
             image: image, disparity: disparity, relativeDepth: job["rel"] as? Bool ?? false, crop: crop,
             fNumber: Float(job["f"] as? Double ?? 2.8),
@@ -165,7 +171,9 @@ if args.first == "--live" {
             focusTapped: job["tap"] as? Bool ?? false, time: job["t"] as? Double ?? 0, personMask: mask,
             personMaskColors: maskColors, depthAge: job["age"] as? Int ?? 0,
             objectLabels: objects, objectColors: objectColors, objectRevision: job["objrev"] as? Int ?? 0,
-            focalLength35mm: (job["fl"] as? Double).map { Float($0) }, focusLocked: job["lock"] as? Bool ?? false)
+            personInstances: people,
+            focalLength35mm: (job["fl"] as? Double).map { Float($0) }, focusLocked: job["lock"] as? Bool ?? false,
+            faceBand: faceBand)
         let dbg = job["dbg"] as? String ?? ""
         pipeline.renderer.captureDebugMaps = !dbg.isEmpty
         let r = pipeline.process(input)

@@ -12,7 +12,8 @@ import BokehCore
 /// 在 Documents/DebugRecordings/photo-日期-时间/ 里（都是传感器方向，和编辑器里的 CapturedDepthPhoto 一样）：
 ///  - original.heic：相机给的原始照片文件（AVCapturePhoto.fileDataRepresentation，EXIF / MakerApple、HDR 增益图都在里面）
 ///  - image.png：交给编辑器的图（已按倍率裁切、长边缩到 photoLongSide，8 位 sRGB）
-///  - disparity.pfm：交给编辑器的视差；person.pfm / people.pfm / objects.pfm：人像遮罩、人像实例、物体分割（有才写）
+///  - disparity.pfm：交给编辑器的视差；person.pfm / people.pfm / objects.pfm：人像遮罩、人像实例、物体分割（有才写）；
+///    faces.pfm：眼镜带（FaceBand，有人脸才写）
 ///  - gainmap.pfm：对齐、裁好的 HDR 增益图；highlightExclusion.pfm：按它算出来的「不做焦外高光提亮」的亮区（有才写）
 ///  - photo.json：机型、系统、拍照那一刻的相机状态（格式、色彩空间、曝光模式 / ISO / 快门 / 曝光偏差、测光点）、
 ///    对焦点 / ƒ / 焦段 / 裁切、编辑器参数、照片元数据（EXIF、MakerApple）、照片里带哪些辅助图、图像亮度统计
@@ -35,6 +36,7 @@ enum PhotoDebugDump {
         if let m = photo.personMask { DebugRecorder.writePFM(m, to: folder.appendingPathComponent("person.pfm")) }
         if let m = photo.personInstances { DebugRecorder.writePFM(m, to: folder.appendingPathComponent("people.pfm")) }
         if let m = photo.objectLabels { DebugRecorder.writePFM(m, to: folder.appendingPathComponent("objects.pfm")) }
+        if let m = photo.faceBand { DebugRecorder.writePFM(m, to: folder.appendingPathComponent("faces.pfm")) }
         // 对齐、裁好的 HDR 增益图，和按它算出来的「不做焦外高光提亮」的亮区（HDRHighlights）
         if let g = gainMap { DebugRecorder.writePFM(g, to: folder.appendingPathComponent("gainmap.pfm")) }
         if let m = photo.highlightExclusion {

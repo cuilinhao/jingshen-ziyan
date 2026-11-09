@@ -57,6 +57,10 @@ public struct SubjectMatteParameters: Equatable {
     /// 遮罩边上的软边不受影响（person 种子本身是软的，α 照样和它取最大）。
     /// 对焦的不是人（物体、Vision 认不出来的盆栽）时不管，照旧按颜色补边。负数 = 关掉这条规则（回到以前的行为）
     public var colorMargin: Float = 0
+    /// 眼镜带（FaceBand）里，人像遮罩的软边到多少就算人（SubjectMatte.withAccessories）。
+    /// 侧脸时远处那片镜片在 Vision 遮罩的 0.1～0.5 之间（调试录制 rec-20261109-152800）；
+    /// 0 = 关掉（眼镜带里也按 0.5）
+    public var accessoryThreshold: Float = 0.1
 
     public init() {}
 }
@@ -532,6 +536,31 @@ public enum SubjectMatte {
     static func maxFilter(_ src: [Float], width w: Int, height h: Int, radius r: Int) -> [Float] {
         let neg = src.map { -$0 }
         return minFilter(neg, width: w, height: h, radius: r).map { -$0 }
+    }
+
+    /// 眼镜带（FaceBand，0/1）里人像遮罩的软边也算人：遮罩值超过 threshold 的地方设成 1，别处原样。
+    /// 返回和 person 一样大的遮罩。伸出脸外的镜片 LiDAR 测不到（透明），Vision 也只给了软边，深度和分割都说它是背景；
+    /// 眼镜带以外照旧按 0.5（软边是整个人都有的，到处放宽会多出一圈清晰的背景）
+    public static func withAccessories(_ person: FloatMap, faceBand: FloatMap, threshold: Float) -> FloatMap {
+        guard let added = accessories(person, faceBand: faceBand, threshold: threshold) else { return person }
+        var v = person.values
+        for i in 0..<v.count where added.values[i] > 0.5 { v[i] = 1 }
+        return FloatMap(width: person.width, height: person.height, values: v)
+    }
+
+    /// withAccessories 新算进人的那些像素（0/1，和 person 一样大）：眼镜带里、遮罩值在 threshold 和 0.5 之间的；没有返回 nil。
+    /// 这些地方的深度一定不可信（透明的镜片后面是背景），修边时要整片从人那一侧填（SegmentEdgeRepair 的 untrusted）
+    public static func accessories(_ person: FloatMap, faceBand: FloatMap, threshold: Float) -> FloatMap? {
+        guard threshold > 0, threshold < 0.5 else { return nil }
+        let band = faceBand.width == person.width && faceBand.height == person.height
+            ? faceBand.values : faceBand.resized(width: person.width, height: person.height).values
+        var out = [Float](repeating: 0, count: person.values.count)
+        var any = false
+        for i in 0..<out.count where band[i] > 0.5 && person.values[i] > threshold && person.values[i] <= 0.5 {
+            out[i] = 1
+            any = true
+        }
+        return any ? FloatMap(width: person.width, height: person.height, values: out) : nil
     }
 
     /// 颜色说了不算的地方（w×h，0/1）：对焦的人（subject）旁边、人像遮罩（people，所有人）外面 colorMargin 以外的一圈。

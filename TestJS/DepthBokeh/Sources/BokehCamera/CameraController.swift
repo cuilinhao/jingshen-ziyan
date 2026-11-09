@@ -35,6 +35,9 @@ public struct CapturedDepthPhoto: Identifiable {
     /// 照片里过曝、但 HDR 增益图说不是光源的地方（被灯照亮的白色表面），视差图分辨率，0…1：不做焦外高光提亮
     /// （HDRHighlights.nonLightMask）。照片没带增益图时为 nil，照旧只按亮度判断
     public var highlightExclusion: FloatMap? = nil
+    /// 眼镜带（FaceBand：人脸框里眼睛那一条，传感器方向，0/1）：这一条里人像遮罩的软边也算人，伸出脸外的镜片不被虚化。
+    /// 没有人脸为 nil
+    public var faceBand: FloatMap? = nil
     /// 深度从哪来，编辑器里显示（「照片自带深度」「AI 深度」）；相机拍的为 nil
     public var depthSourceLabel: String? = nil
     /// 打开编辑器时提示一下（比如「拿不到原图，用的是已经虚化过的版本」）
@@ -1493,7 +1496,7 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
                 personInstanceColors: masks?.personInstanceColors,
                 personInstanceRevision: masks?.personInstanceRevision ?? 0,
                 // 画面的等效焦距（1× = 24mm，同 ZoomScale.focalLength）：长焦虚化更强、全清晰区更窄
-                focalLength35mm: Float(frameZoom) * 24, focusLocked: locked))
+                focalLength35mm: Float(frameZoom) * 24, focusLocked: locked, faceBand: masks?.faceBand))
             lastFocusDisparity = plan.focusDisparity
             lastFocusWasLocked = locked
             // 调试录制：这一帧的原始数据和参数

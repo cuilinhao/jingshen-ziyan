@@ -14,6 +14,7 @@ import BokehCore
 ///  - depth_raw_NNNN.pfm：系统给的原始深度（转成 32 位视差，无效值 NaN / 0 / 负数原样保留），只在有新深度的帧写
 ///  - depth_NNNN.pfm：App 实际交给分析的视差图（ImageBridge.disparityMap 之后：无效值是 NaN，相对视差平移过）
 ///  - person_NNNN.pfm / people_NNNN.pfm / objects_NNNN.pfm 和对应的 *_img.ppm：分割结果和算它那一帧的小图（变了才写）
+///  - faces_NNNN.pfm：眼镜带（FaceBand，和人像遮罩同一帧、一起写；没有人脸时 frames.jsonl 里是 null）
 ///  - frames.jsonl：每帧一行（时间、用的哪张图 / 深度、深度格式、是否系统滤波过、裁切、焦段、对焦点、点按、ƒ、
 ///    锁定对焦、分割开关、这一帧分析出来的对焦视差 / 距离……）
 ///  - recording.json：机型、系统、相机设备和格式、标定参数、录制过程中滤波开关的时间点
@@ -125,7 +126,10 @@ final class DebugRecorder: @unchecked Sendable {   // 可变状态由 lock 保�
         }
         func orNull(_ s: String?) -> Any { if let s { return s } else { return NSNull() } }
         lock.lock()
-        if m.personRevision != last.person { maskFiles["person"] = orNull(save(m.person, m.personColors, "person")) }
+        if m.personRevision != last.person {
+            maskFiles["person"] = orNull(save(m.person, m.personColors, "person"))
+            maskFiles["faces"] = orNull(save(m.faceBand, nil, "faces"))
+        }
         if m.personInstanceRevision != last.people {
             maskFiles["people"] = orNull(save(m.personInstances, m.personInstanceColors, "people"))
         }

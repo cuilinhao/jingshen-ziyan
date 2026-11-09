@@ -40,6 +40,8 @@ final class PersonSegmenter: @unchecked Sendable {   // 可变状态都由 lock 
         var personInstanceRevision = 0
         /// 人像遮罩每更新一次加 1（调试录制按它决定要不要再存一张）
         var personRevision = 0
+        /// 眼镜带（FaceBand：人脸框里眼睛那一条，0/1，传感器方向）：和人像遮罩同一帧、一起更新；没有人脸为 nil
+        var faceBand: FloatMap? = nil
     }
 
     private let queue = DispatchQueue(label: "depthbokeh.segmentation", qos: .userInitiated)
@@ -48,6 +50,8 @@ final class PersonSegmenter: @unchecked Sendable {   // 可变状态都由 lock 
     private var mask: FloatMap?
     /// 算遮罩那一帧的小图（整个相机画面，线性光）
     private var maskColors: PlanarImage?
+    /// 和遮罩同一帧的眼镜带
+    private var faceBand: FloatMap?
     private var objects: FloatMap?
     private var objectColors: PlanarImage?
     private var objectRevision = 0
@@ -76,6 +80,8 @@ final class PersonSegmenter: @unchecked Sendable {   // 可变状态都由 lock 
     /// 人像实例分割的请求（只在 queue 上用）
     private let personInstanceRequest = VNGeneratePersonInstanceMaskRequest()
     private let handler = VNSequenceRequestHandler()
+    /// 人脸框（和人像分割同一次 perform，同一帧、同一个方向）：眼镜带用（FaceBand）。很便宜
+    private let faceRequest = VNDetectFaceRectanglesRequest()
     private let request: VNGeneratePersonSegmentationRequest = {
         let request = VNGeneratePersonSegmentationRequest()
         request.qualityLevel = .balanced
@@ -96,7 +102,7 @@ final class PersonSegmenter: @unchecked Sendable {   // 可变状态都由 lock 
         defer { lock.unlock() }
         return Masks(person: mask, personColors: maskColors, objects: objects, objectColors: objectColors,
                      objectRevision: objectRevision, personInstances: instances, personInstanceColors: instanceColors,
-                     personInstanceRevision: instanceRevision, personRevision: maskRevision)
+                     personInstanceRevision: instanceRevision, personRevision: maskRevision, faceBand: faceBand)
     }
 
     /// 最近一秒跑了几次分割、平均每次多少毫秒（状态栏）
@@ -120,6 +126,7 @@ final class PersonSegmenter: @unchecked Sendable {   // 可变状态都由 lock 
         lock.lock()
         mask = nil
         maskColors = nil
+        faceBand = nil
         objects = nil
         objectColors = nil
         objectRevision &+= 1
@@ -209,7 +216,8 @@ final class PersonSegmenter: @unchecked Sendable {   // 可变状态都由 lock 
         lock.unlock()
         queue.async {
             let t0 = Date().timeIntervalSinceReferenceDate
-            let result = doPerson ? self.segment(pixelBuffer, orientation: orientation) : nil
+            let seg = doPerson ? self.segment(pixelBuffer, orientation: orientation) : nil
+            let result = seg?.mask
             let hasPerson = result.map { m in m.values.contains { $0 > 0.5 } } ?? false
             // 画面里有人时才分实例
             let people = doInstances && hasPerson
@@ -226,6 +234,7 @@ final class PersonSegmenter: @unchecked Sendable {   // 可变状态都由 lock 
                 if doPerson {
                     self.mask = hasPerson ? result : nil
                     self.maskColors = hasPerson ? thumb : nil
+                    self.faceBand = hasPerson ? seg?.faceBand : nil
                     self.maskRevision &+= 1
                 }
                 if runObjects {
@@ -280,15 +289,46 @@ final class PersonSegmenter: @unchecked Sendable {   // 可变状态都由 lock 
         return sensorMask(obs.instanceMask, labels: true, orientation: orientation)
     }
 
-    private func segment(_ pixelBuffer: CVPixelBuffer, orientation: CGImagePropertyOrientation = .right) -> FloatMap? {
+    /// 人像遮罩和眼镜带（同一帧、同一个方向，都转回传感器方向）
+    private func segment(_ pixelBuffer: CVPixelBuffer,
+                         orientation: CGImagePropertyOrientation = .right) -> (mask: FloatMap?, faceBand: FloatMap?) {
         do {
             // 按正立方向交给 Vision；前置传感器的安装方向可能和后置不同
-            try handler.perform([request], on: pixelBuffer, orientation: orientation)
-            guard let out = request.results?.first?.pixelBuffer else { return nil }
-            return Self.sensorMask(out, orientation: orientation)
+            try handler.perform([request, faceRequest], on: pixelBuffer, orientation: orientation)
+            guard let out = request.results?.first?.pixelBuffer else { return (nil, nil) }
+            let mask = Self.sensorMask(out, orientation: orientation)
+            // 眼镜带画在和遮罩一样大的正立画面上，再走同一条方向转换
+            let band = Self.faceBand(faceRequest.results ?? [], width: CVPixelBufferGetWidth(out),
+                                     height: CVPixelBufferGetHeight(out), orientation: orientation)
+            return (mask, band)
         } catch {
-            return nil
+            return (nil, nil)
         }
+    }
+
+    /// 人脸框 → 眼镜带（FaceBand）：画在 Vision 的正立画面上（width × height），再转回传感器方向；没有脸返回 nil
+    static func faceBand(_ faces: [VNFaceObservation], width: Int, height: Int,
+                         orientation: CGImagePropertyOrientation) -> FloatMap? {
+        let boxes = faces.map { f -> FaceBand.Face in
+            // boundingBox：正立画面、左下角为原点的归一化坐标
+            let b = f.boundingBox
+            return FaceBand.Face(x: Float(b.minX), y: Float(1 - b.maxY), width: Float(b.width), height: Float(b.height),
+                                 roll: f.roll?.floatValue ?? 0)
+        }
+        guard let band = FaceBand.map(boxes, width: width, height: height) else { return nil }
+        return CameraImageOrientation.sensorMap(band.values, width: width, height: height, orientation: orientation)
+    }
+
+    /// 拍下来的照片（传感器方向）的眼镜带：在正立方向上按长边 512 画，再转回传感器方向；没有脸返回 nil
+    static func photoFaceBand(_ image: CGImage, orientation: CGImagePropertyOrientation = .right) -> FloatMap? {
+        let request = VNDetectFaceRectanglesRequest()
+        let handler = VNImageRequestHandler(cgImage: image, orientation: orientation, options: [:])
+        guard (try? handler.perform([request])) != nil, let faces = request.results, !faces.isEmpty else { return nil }
+        let turns = CameraImageOrientation.quarterTurns(for: orientation)
+        let uw = turns % 2 == 0 ? image.width : image.height, uh = turns % 2 == 0 ? image.height : image.width
+        let s = 512 / Double(max(uw, uh, 1))
+        return faceBand(faces, width: max(1, Int((Double(uw) * s).rounded())),
+                        height: max(1, Int((Double(uh) * s).rounded())), orientation: orientation)
     }
 
     /// 整个相机画面的小图（传感器方向，线性光，长边 160）
@@ -310,6 +350,7 @@ final class PersonSegmenter: @unchecked Sendable {   // 可变状态都由 lock 
         ctx.fill(CGRect(x: 0, y: 0, width: 256, height: 192))
         guard let image = ctx.makeImage() else { return }
         _ = photoMask(image)
+        _ = photoFaceBand(image)
         _ = photoPersonInstances(image)
         _ = photoObjects(image)
         print(String(format: "[Photo] Vision 模型预热完成，用时 %.1f 秒", Date().timeIntervalSince(t0)))

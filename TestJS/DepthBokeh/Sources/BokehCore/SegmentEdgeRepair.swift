@@ -20,7 +20,11 @@ public enum SegmentEdgeRepair {
     ///   - segments: 人像遮罩（任意分辨率，0…1，> 0.5 算人）
     ///   - valid: 和 depth 一样大，< 0.5 的地方遮罩不可信（画面变了），不修；nil = 都可信
     ///   - band: 分界线两边各多少像素的深度不可信
-    public static func repair(depth: FloatMap, segments: FloatMap, valid: [Float]? = nil, band: Int) -> FloatMap {
+    ///   - untrusted: 人这一侧另外不可信的地方（任意分辨率，> 0.5 算；连同它外扩 band 以内）：眼镜带新算进人的镜片
+    ///     （SubjectMatte.accessories）。镜片可能比 band 宽，原来脸的边（深度被抹开的那一圈）也落在里面，
+    ///     要一起当不可信，从更里面的脸上填过去，不然镜片拿到的是抹开的半路深度
+    public static func repair(depth: FloatMap, segments: FloatMap, valid: [Float]? = nil, band: Int,
+                              untrusted: FloatMap? = nil) -> FloatMap {
         let w = depth.width, h = depth.height, n = w * h
         guard n > 0, band > 0 else { return depth }
         let sm = segments.width == w && segments.height == h ? segments.values
@@ -52,11 +56,17 @@ public enum SegmentEdgeRepair {
         for i in 0..<n where label[i] > 0 { isSeg[i] = 1; isBg[i] = 0 }
         let nearSeg = SubjectMatte.dilateBinary(isSeg, width: w, height: h, radius: band)
         let nearBg = SubjectMatte.dilateBinary(isBg, width: w, height: h, radius: band)
+        var nearUntrusted: [Float]?
+        if let u = untrusted {
+            let um = u.width == w && u.height == h ? u.values : u.resized(width: w, height: h).values
+            let bin = um.map { $0 > 0.5 ? Float(1) : 0 }
+            if bin.contains(1) { nearUntrusted = SubjectMatte.dilateBinary(bin, width: w, height: h, radius: band) }
+        }
         var remaining: [Int32] = []
         var value = depth.values
         var done = [Bool](repeating: true, count: n)
         for i in 0..<n {
-            let edge = label[i] > 0 ? nearBg[i] > 0 : nearSeg[i] > 0
+            let edge = label[i] > 0 ? (nearBg[i] > 0 || (nearUntrusted?[i] ?? 0) > 0) : nearSeg[i] > 0
             if edge && (valid == nil || valid![i] >= 0.5) && value[i].isFinite {
                 done[i] = false
                 remaining.append(Int32(i))
