@@ -553,7 +553,7 @@ struct SubjectParams {
     int hasConnect;
     int hasExtra;
     int hasPerson;
-    int pad;
+    int hasBlock;             // 1 = 有 colorBlock（对焦的人旁边、人像遮罩外面那一圈：颜色说了不算）
 };
 
 // 深度核心 = |相对距离| < band 且（没有连通限制 或 connect ≥ 0.5）；核心 = 深度核心 或 extra ≥ 0.5
@@ -610,12 +610,15 @@ kernel void gfCoeffColorKernel(texture2d<float, access::read> m1 [[texture(0)]],
     outB.write(float4(b, 0.0f), gid);
 }
 
-// α = smoothstep(0.25, 0.75, 三个通道结果的平均)，再和 smoothstep(0.3, 0.7, person) 取最大
+// α = smoothstep(0.25, 0.75, 三个通道结果的平均)；colorBlock ≥ 0.5 的地方不超过深度核心；
+// 再和 smoothstep(0.3, 0.7, person) 取最大
 kernel void gfApplyColorKernel(texture2d<float, access::read> low [[texture(0)]],
                                texture2d<float, access::read> meanA [[texture(1)]],
                                texture2d<float, access::read> meanB [[texture(2)]],
                                texture2d<float, access::read> person [[texture(3)]],
                                texture2d<float, access::write> alphaOut [[texture(4)]],
+                               texture2d<float, access::read> depthCore [[texture(5)]],
+                               texture2d<float, access::read> colorBlock [[texture(6)]],
                                constant SubjectParams& p [[buffer(0)]],
                                uint2 gid [[thread_position_in_grid]]) {
     uint w = alphaOut.get_width(), h = alphaOut.get_height();
@@ -628,6 +631,10 @@ kernel void gfApplyColorKernel(texture2d<float, access::read> low [[texture(0)]]
     avg += q.g / 3.0f;
     avg += q.b / 3.0f;
     float a = smoothstepf(0.25f, 0.75f, avg);
+    // 人像遮罩外面那一圈，颜色说了不算：只认深度核心（SubjectMatte.apply）
+    if (p.hasBlock != 0 && resampleTex(colorBlock, gid, w, h).x >= 0.5f) {
+        a = min(a, depthCore.read(gid).x);
+    }
     if (p.hasPerson != 0) {
         a = max(a, smoothstepf(0.3f, 0.7f, resampleTex(person, gid, w, h).x));
     }

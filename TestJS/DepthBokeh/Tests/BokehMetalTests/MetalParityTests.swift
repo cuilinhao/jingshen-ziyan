@@ -217,6 +217,8 @@ final class MetalParityTests: XCTestCase {
                                                fNumber: 2, focusPoint: (0.5, 0.2), personMask: scene.person,
                                                outputLongSide: scene.image.longSide, settings: LiveFrameAnalyzer.Settings())
         XCTAssertNotNil(plan.seeds?.person, "对焦点在人身上，应该有人像种子")
+        // 对焦的是人：遮罩外面那一圈颜色说了不算（gfApplyColorKernel 里 colorBlock 那条分支也要和 CPU 一致）
+        XCTAssertNotNil(plan.seeds?.colorBlock, "对焦点在人身上，应该有颜色限制区")
         var d = try compareFrame(r, cpu: BokehRenderer(), scene: scene, plan: plan, quality: .preview, refinePasses: 1,
                                  cpuTemporal: nil, gpuTemporal: nil, label: "人像")
         check(d, "人像")

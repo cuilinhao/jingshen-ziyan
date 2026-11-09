@@ -47,6 +47,16 @@ public struct SubjectMatteParameters: Equatable {
     /// 按人像遮罩修深度边缘（SegmentEdgeRepair）：分界线两边各多宽的深度不可信（占深度图长边比例，0 = 不修；
     /// 160 宽时 2 个像素）。LiDAR 的系统滤波一样会在人和远处背景之间抹出几个像素的过渡，用同一个宽度
     public var edgeRepair: Float = 1.0 / 80
+    /// 对焦的是人时，人像遮罩外面还让颜色补多宽（占深度图长边比例；0 = 遮罩外面一个像素都不让颜色补）。
+    ///
+    /// 人的边界由分割说了算：遮罩外面的像素，颜色补边（growByColor）和彩色引导滤波都不能把它拉回对焦面，
+    /// 只有深度（深度核心）能。以前颜色补边对人也照样补 D（LiDAR 长边的 1/40，双摄 1/24）那么宽，
+    /// 而且对后面多远都不设限：黑衣服的人，下巴、脖子和领口围出的空隙里露出后面柜子上的黑白方格，
+    /// 黑格和衣服一个颜色，贴着领口的那几排被整片拉清晰（录屏 xiba-wenti、24-xiaba）。
+    /// 留 1～2 个像素也不行：真实画面里方格一格只有 1～2 个深度像素，贴着领口的第一排照样被拉清晰。
+    /// 遮罩边上的软边不受影响（person 种子本身是软的，α 照样和它取最大）。
+    /// 对焦的不是人（物体、Vision 认不出来的盆栽）时不管，照旧按颜色补边。负数 = 关掉这条规则（回到以前的行为）
+    public var colorMargin: Float = 0
 
     public init() {}
 }
@@ -66,12 +76,18 @@ public struct SubjectSeeds {
     /// 人和白色表面都不会是光源，被顶灯照亮的白衣服、肩膀、白盒子边哪怕过曝了，提亮以后也只会糊成一大片假的过曝光晕。
     /// CPU（DetailPreserving 的 highlightExclusion）和 GPU（boostKernel 的 people 纹理）都只拿它做这一件事
     public var people: FloatMap?
+    /// 颜色说了不算的地方（0/1，深度图分辨率）：对焦的人旁边、人像遮罩外面 colorMargin 以外的一圈。
+    /// 这里颜色补边不补，彩色引导滤波的 α 不能超过深度核心（只有深度能把它拉回对焦面），见 SubjectMatte.colorBlock。
+    /// nil = 不限制（对焦的不是人，或者没有人像遮罩）
+    public var colorBlock: FloatMap?
 
-    public init(connect: FloatMap? = nil, extra: FloatMap? = nil, person: FloatMap? = nil, people: FloatMap? = nil) {
+    public init(connect: FloatMap? = nil, extra: FloatMap? = nil, person: FloatMap? = nil, people: FloatMap? = nil,
+                colorBlock: FloatMap? = nil) {
         self.connect = connect
         self.extra = extra
         self.person = person
         self.people = people
+        self.colorBlock = colorBlock
     }
 }
 
@@ -89,14 +105,20 @@ public enum SubjectMatte {
     ///   - sharpPeople: 别的人身上按深度本来就清晰的像素（和 depth 一样大，0…1，见 LiveFrameAnalyzer.sharpPeople）：
     ///     和对焦的人一样整片锁在对焦面，细的眼镜框、头发渲染时不会再被深度对齐抹糊
     ///   - focusedPersonMask: 已按实例选中、排除其他人并对齐的单人软遮罩；遮挡后断开的手脚也属于这个人，不再按连通区域删减
+    ///   - colorBlock: 颜色说了不算的地方（和 depth 一样大，0/1，见 colorBlock(people:subject:…)）：颜色补边不补这里，
+    ///     原样放进 SubjectSeeds.colorBlock 交给渲染（彩色引导滤波的 α 在这里不超过深度核心）
     public static func seeds(depth: FloatMap, colors: PlanarImage?, focusDisparity df: Float,
                              focusPoint: (Float, Float)?, parameters p: SubjectMatteParameters,
                              scale: Float? = nil, personMask: FloatMap? = nil,
                              lens: LensParameters? = nil, sharpPeople: FloatMap? = nil,
-                             focusedPersonMask: FloatMap? = nil) -> SubjectSeeds {
+                             focusedPersonMask: FloatMap? = nil, colorBlock: FloatMap? = nil) -> SubjectSeeds {
         let w = depth.width, h = depth.height, n = w * h
         var result = SubjectSeeds()
         guard df > 0, n > 0 else { return result }
+        let block = colorBlock.map { $0.width == w && $0.height == h ? $0.values : $0.resized(width: w, height: h).values }
+        if let block, block.contains(where: { $0 >= 0.5 }) {
+            result.colorBlock = FloatMap(width: w, height: h, values: block)
+        }
         let d = depth.values
         let norm = max(scale ?? df, 1e-3)
         // 深度核心：±band 以内，并且按镜头算本来就清晰（渲染那边的深度核心 = ±band 以内 且 connect ≥ 0.5，
@@ -128,7 +150,7 @@ public enum SubjectMatte {
         if p.colorGrowth > 0, let colors, colors.width == w, colors.height == h {
             let grown = growByColor(core: connected, disparity: d, focusDisparity: df, norm: norm, band: p.band,
                                     image: colors, width: w, height: h, fraction: p.colorGrowth)
-            for i in 0..<n where grown[i] > 0.5 { extra[i] = 1; hasExtra = true }
+            for i in 0..<n where grown[i] > 0.5 && (block == nil || block![i] < 0.5) { extra[i] = 1; hasExtra = true }
         }
         var person = personMask.flatMap { personRegion($0, width: w, height: h, focusPoint: focusPoint) }
         if let focused = focusedPersonMask {
@@ -171,7 +193,8 @@ public enum SubjectMatte {
     /// 规则（GPU 版一模一样）：
     ///   深度核心 = |相对距离| < band 且（没有连通限制 或 connect ≥ 0.5）
     ///   核心 = 深度核心 或 extra ≥ 0.5
-    ///   α = smoothstep(0.25, 0.75, 彩色引导滤波(核心))，再和 smoothstep(0.3, 0.7, person) 取最大
+    ///   α = smoothstep(0.25, 0.75, 彩色引导滤波(核心))；colorBlock ≥ 0.5 的地方不超过深度核心；
+    ///   再和 smoothstep(0.3, 0.7, person) 取最大
     ///   视差 = d + α(d_f − d)；深度核心里但 α 低的（深度渗出来的），推向附近更远的视差
     /// - Returns: (修正后的视差, 遮罩 α)
     public static func apply(disparity: FloatMap, image: PlanarImage, focusDisparity df: Float,
@@ -185,6 +208,7 @@ public enum SubjectMatte {
         let connect = seeds.connect.map { sampleAt($0, width: w, height: h) }
         let extra = seeds.extra.map { sampleAt($0, width: w, height: h) }
         let person = seeds.person.map { sampleAt($0, width: w, height: h) }
+        let block = seeds.colorBlock.map { sampleAt($0, width: w, height: h) }
 
         var depthCore = [Float](repeating: 0, count: n)
         var core = [Float](repeating: 0, count: n)
@@ -199,6 +223,10 @@ public enum SubjectMatte {
         let r = radius(width: w, height: h, parameters: p)
         var alpha = colorGuidedAverage(image: image, input: core, width: w, height: h, radius: r, epsilon: p.epsilon)
         for i in 0..<n { alpha[i] = smoothstep(0.25, 0.75, alpha[i]) }
+        // 人像遮罩外面那一圈，颜色说了不算：引导滤波会顺着颜色把核心带出去（和黑衣服同色的黑格），这里只认深度核心
+        if let block {
+            for i in 0..<n where block[i] >= 0.5 { alpha[i] = min(alpha[i], depthCore[i]) }
+        }
         if let person {
             for i in 0..<n { alpha[i] = max(alpha[i], smoothstep(0.3, 0.7, person[i])) }
         }
@@ -504,6 +532,34 @@ public enum SubjectMatte {
     static func maxFilter(_ src: [Float], width w: Int, height h: Int, radius r: Int) -> [Float] {
         let neg = src.map { -$0 }
         return minFilter(neg, width: w, height: h, radius: r).map { -$0 }
+    }
+
+    /// 颜色说了不算的地方（w×h，0/1）：对焦的人（subject）旁边、人像遮罩（people，所有人）外面 colorMargin 以外的一圈。
+    /// 一圈多宽：颜色能把主体带出去多远就多宽，即颜色补边的 D 加上彩色引导滤波的半径（都按深度图像素算）。
+    /// 更远的地方颜色本来就够不着，不用管。
+    ///  - keep：这些地方不限制（遮罩画面变了、不再可信的地方）。1 = 不限制
+    /// 一个都没有返回 nil
+    public static func colorBlock(people: FloatMap, subject: FloatMap, width w: Int, height h: Int,
+                                  parameters p: SubjectMatteParameters, keep: [Float]? = nil) -> FloatMap? {
+        let n = w * h
+        guard n > 0 else { return nil }
+        let long = Float(max(w, h))
+        let pm = people.width == w && people.height == h ? people.values : people.resized(width: w, height: h).values
+        let sm = subject.width == w && subject.height == h ? subject.values : subject.resized(width: w, height: h).values
+        let isPerson = pm.map { $0 > 0.5 ? Float(1) : 0 }
+        let isSubject = sm.map { $0 > 0.5 ? Float(1) : 0 }
+        guard isSubject.contains(1) else { return nil }
+        let margin = max(0, Int((long * p.colorMargin).rounded()))
+        let reach = max(3, Int(long * p.colorGrowth)) + Int((long * p.radiusFraction).rounded(.up)) + 2
+        let allowed = margin > 0 ? dilateBinary(isPerson, width: w, height: h, radius: margin) : isPerson
+        let near = dilateBinary(isSubject, width: w, height: h, radius: reach)
+        var out = [Float](repeating: 0, count: n)
+        var any = false
+        for i in 0..<n where near[i] > 0 && allowed[i] == 0 && (keep == nil || keep![i] < 0.5) {
+            out[i] = 1
+            any = true
+        }
+        return any ? FloatMap(width: w, height: h, values: out) : nil
     }
 
     /// 人像遮罩里和对焦点连着的那个人（缩放到 w×h）。对焦点不在人身上（附近没有遮罩值 > 0.5 的像素）返回 nil

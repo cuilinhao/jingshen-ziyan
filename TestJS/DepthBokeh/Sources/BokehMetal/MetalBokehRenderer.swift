@@ -177,6 +177,8 @@ public final class MetalBokehRenderer {
         let connectTex = seeds?.connect.map { slot.upload($0, into: \.connect, device: device) }
         let extraTex = seeds?.extra.map { slot.upload($0, into: \.extra, device: device) }
         let personTex = seeds?.person.map { slot.upload($0, into: \.person, device: device) }
+        // 对焦的人旁边、人像遮罩外面那一圈：颜色说了不算（SubjectSeeds.colorBlock）
+        let blockTex = seeds?.colorBlock.map { slot.upload($0, into: \.colorBlock, device: device) }
         // 所有人的遮罩：人身上不做焦外高光提亮（CPU 版 render 的 highlightExclusion）
         let peopleTex = seeds?.people.map { slot.upload($0, into: \.people, device: device) }
 
@@ -285,7 +287,7 @@ public final class MetalBokehRenderer {
             var sp = GPUSubject(focusDisparity: df, normScale: max(lens.relativeScale ?? df, 1e-3),
                                 band: plan.matte.band, eps: plan.matte.epsilon,
                                 hasConnect: seeds.connect != nil ? 1 : 0, hasExtra: seeds.extra != nil ? 1 : 0,
-                                hasPerson: seeds.person != nil ? 1 : 0, pad: 0)
+                                hasPerson: seeds.person != nil ? 1 : 0, hasBlock: seeds.colorBlock != nil ? 1 : 0)
             let r = SubjectMatte.radius(width: lw, height: lh, parameters: plan.matte)
             run(enc, "subjectCoreKernel", lw, lh) { e in
                 e.setTexture(depthCur, index: 0)
@@ -311,6 +313,7 @@ public final class MetalBokehRenderer {
             run(enc, "gfApplyColorKernel", lw, lh) { e in
                 e.setTexture(low, index: 0); e.setTexture(ws.f4b, index: 1); e.setTexture(ws.f4c, index: 2)
                 e.setTexture(personTex ?? self.dummy, index: 3); e.setTexture(ws.alpha, index: 4)
+                e.setTexture(ws.depthCore, index: 5); e.setTexture(blockTex ?? self.dummy, index: 6)
                 self.setValue(e, &sp, 0)
             }
             var rr = Int32(r)
@@ -771,6 +774,7 @@ final class UploadSlot {
     var extra: MTLTexture?
     var person: MTLTexture?
     var people: MTLTexture?
+    var colorBlock: MTLTexture?
 
     func upload(_ map: FloatMap, into key: ReferenceWritableKeyPath<UploadSlot, MTLTexture?>, device: MTLDevice) -> MTLTexture {
         var t = self[keyPath: key]
@@ -861,7 +865,7 @@ struct GPUSubject {
     var hasConnect: Int32
     var hasExtra: Int32
     var hasPerson: Int32
-    var pad: Int32
+    var hasBlock: Int32
 }
 
 struct GPULayerParams {

@@ -380,6 +380,12 @@ public final class LiveFrameAnalyzer {
                     person = Self.depthRestricted(base, depth: map, lens: lens, limit: 2 * matte.sharpLimit)
                 }
             }
+            // 对焦的是人：人的边界由分割说了算，遮罩外面那一圈颜色说了不算（SubjectMatte.colorBlock）。
+            // 遮罩画面变了的地方（人在动）不限制
+            let colorBlock = Self.personColorBlock(allPeople: allPeople, subject: focusedPerson ?? person,
+                                                   focusedByInstance: focusedPerson != nil, focusPoint: (fx, fy),
+                                                   width: map.width, height: map.height, matte: matte,
+                                                   keep: maskValid.map { $0.map { 1 - $0 } })
             // 对焦的那个物体（在整个相机画面上按对焦点选，再裁）。标签图几秒才更新一次：没变就用上次选好的
             var selected: (mask: FloatMap?, colors: PlanarImage?) = (nil, nil)
             // 明确选中了某个人时，以人像实例为准；含糊的前景物体分组不能覆盖人物选择。
@@ -412,7 +418,7 @@ public final class LiveFrameAnalyzer {
                                        sharpPeople: allPeople.flatMap { Self.sharpPeople($0, depth: map, lens: lens,
                                                                                          limit: matte.sharpLimit,
                                                                                          band: matte.band) },
-                                       focusedPersonMask: focusedPerson)
+                                       focusedPersonMask: focusedPerson, colorBlock: colorBlock)
             // 所有人（不只对焦的那个）：渲染时人身上不做焦外高光提亮
             seeds?.people = allPeople?.resized(width: map.width, height: map.height)
         }
@@ -490,6 +496,29 @@ public final class LiveFrameAnalyzer {
             if pm[i] > 0.5 { any = true }
         }
         return any ? FloatMap(width: w, height: h, values: v) : nil
+    }
+
+    /// 对焦的是人时，颜色说了不算的地方（SubjectMatte.colorBlock）；对焦的不是人返回 nil（物体、盆栽照旧按颜色补边）。
+    /// 「对焦的是人」：按实例选中了这个人，或者对焦点就在人像遮罩上（允许偏一点，同 SubjectMatte.personRegion）
+    /// - Parameters:
+    ///   - subject: 对焦的那个人（按实例选中的，或者没有实例时按深度留下的那部分）
+    ///   - keep: 1 = 这里不限制（遮罩画面变了、不再可信的地方）；和深度图一样大
+    static func personColorBlock(allPeople: FloatMap?, subject: FloatMap?, focusedByInstance: Bool,
+                                 focusPoint: (Float, Float), width w: Int, height h: Int,
+                                 matte: SubjectMatteParameters, keep: [Float]?) -> FloatMap? {
+        guard matte.colorMargin >= 0, let all = allPeople, let subject else { return nil }
+        if !focusedByInstance {
+            let m = all.resized(width: w, height: h)
+            let cx = min(w - 1, max(0, Int(focusPoint.0 * Float(w)))), cy = min(h - 1, max(0, Int(focusPoint.1 * Float(h))))
+            let r = max(1, max(w, h) / 100)
+            var onPerson = false
+            for y in max(0, cy - r)...min(h - 1, cy + r) where !onPerson {
+                for x in max(0, cx - r)...min(w - 1, cx + r) where m[x, y] > 0.5 { onPerson = true; break }
+            }
+            guard onPerson else { return nil }
+        }
+        return SubjectMatte.colorBlock(people: all, subject: subject, width: w, height: h, parameters: matte,
+                                       keep: keep?.count == w * h ? keep : nil)
     }
 
     /// 修深度边缘时分界线两边各多少个深度像素不可信
@@ -780,6 +809,10 @@ public final class LiveFrameAnalyzer {
                     person = depthRestricted(base, depth: map, lens: lens, limit: 2 * matte.sharpLimit)
                 }
             }
+            // 对焦的是人：遮罩外面那一圈颜色说了不算（同 analyze）
+            let colorBlock = personColorBlock(allPeople: allPeople, subject: focusedPerson ?? person,
+                                              focusedByInstance: focusedPerson != nil, focusPoint: focusPoint,
+                                              width: map.width, height: map.height, matte: matte, keep: nil)
             if focusedPerson == nil, let labels = objectLabels, let inst = SubjectMatte.instanceAt(labels, point: focusPoint) {
                 var object = inst.resized(width: map.width, height: map.height)
                 if let excludedPeople { object = removing(excludedPeople, from: object) }
@@ -792,7 +825,7 @@ public final class LiveFrameAnalyzer {
                                        sharpPeople: allPeople.flatMap { sharpPeople($0, depth: map, lens: lens,
                                                                                     limit: matte.sharpLimit,
                                                                                     band: matte.band) },
-                                       focusedPersonMask: focusedPerson)
+                                       focusedPersonMask: focusedPerson, colorBlock: colorBlock)
             // 所有人：人身上不做焦外高光提亮（同 analyze）
             seeds?.people = allPeople?.resized(width: map.width, height: map.height)
             // 照片的 HDR 增益图说不是光源的过曝亮区（白色表面，HDRHighlights.nonLightMask）：和人一样不提亮
