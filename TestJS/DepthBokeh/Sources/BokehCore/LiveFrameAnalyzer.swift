@@ -902,12 +902,15 @@ public final class LiveFrameAnalyzer {
 
     /// 拍下来的照片：没有时间历史，对焦点直接取中位数。
     ///  - glassesMatte：Apple 拍照时给的眼镜遮罩（和照片对齐、裁好，任意分辨率）。有它就不用 faceBand 去猜伸出脸外的眼镜
+    ///  - glassesFollowDepth：这张深度测得出镜框（双摄）。眼镜遮罩也先看深度：遮罩里深度在后面、又连着遮罩外面背景的
+    ///    不算眼镜（眼镜遮罩会漏到贴着镜框的背景上）。LiDAR 穿过镜片测到后面的墙，分不出来，关着（只信眼镜遮罩）
     public static func stillPlan(disparity: FloatMap, relativeDepth: Bool, colors: PlanarImage?, fNumber: Float,
                                  focusPoint: (x: Float, y: Float), personMask: FloatMap?, outputLongSide: Int,
                                  settings: Settings, objectLabels: FloatMap? = nil,
                                  personInstances: FloatMap? = nil, focalLength35mm: Float? = nil,
                                  lockedFocusDisparity: Float? = nil, highlightExclusion: FloatMap? = nil,
-                                 faceBand: FloatMap? = nil, glassesMatte: FloatMap? = nil) -> FramePlan {
+                                 faceBand: FloatMap? = nil, glassesMatte: FloatMap? = nil,
+                                 glassesFollowDepth: Bool = false) -> FramePlan {
         var map = DepthRefiner.fillInvalid(disparity, guide: colors)
         let lowLongSide = max(320, outputLongSide / max(1, settings.blurDownscale))
         // 拍照时锁定了对焦：用锁定的距离（重新构图以后对焦点上可能已经是别的东西）
@@ -942,7 +945,8 @@ public final class LiveFrameAnalyzer {
                 let added: FloatMap?
                 if let gm = glassesMatte {
                     added = SubjectMatte.glassesAccessories(gm, person: pm, width: map.width, height: map.height,
-                                                            parameters: matte, band: band)
+                                                            parameters: matte, band: band,
+                                                            depth: glassesFollowDepth ? map : nil, lens: lens)
                 } else if let fb = faceBand {
                     added = SubjectMatte.accessories(pm, faceBand: fb, depth: map, lens: lens, parameters: matte, band: band)
                 } else {

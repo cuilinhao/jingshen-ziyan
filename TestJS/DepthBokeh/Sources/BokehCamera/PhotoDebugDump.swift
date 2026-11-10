@@ -59,6 +59,8 @@ enum PhotoDebugDump {
         meta["appleMattes"] = appleMattes.mapValues { [$0.width, $0.height] }
         // 编辑器用的是眼镜遮罩（apple-glasses.pfm）还是眼镜带（faces.pfm）
         meta["glassesMatteUsed"] = photo.glassesMatte != nil
+        // 眼镜遮罩有没有先看深度（双摄才看）
+        meta["glassesFollowDepth"] = photo.glassesFollowDepth
         meta["photoMetadata"] = jsonSafe(metadata)
         let safe = jsonSafe(meta)
         if JSONSerialization.isValidJSONObject(safe),

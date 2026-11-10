@@ -656,12 +656,20 @@ public enum SubjectMatte {
     /// 只有眼镜是例外（深度测不准透明的镜片，这里信眼镜遮罩），别的照旧先看深度：不在眼镜遮罩里的软边交给深度和修边。
     ///  - 到 glassesThreshold 才算眼镜（去掉毛边）；
     ///  - 只要戴在人身上的：连通块要碰到离人（遮罩 > 0.5）band 以内（画面里别人的眼镜随那个人一起交给实例和深度）
+    ///  - 给了 depth（深度测得出镜框：双摄）还要先看深度。眼镜遮罩自己也会漏到贴着镜框的背景上
+    ///    （拍照调试包 photo-20261110-103706，2× 双摄：镜框铰链外面那块背景上遮罩值 0.25～0.9，比镜片上的还高，
+    ///    阈值分不开；视差 0.02～0.13，脸 1.05）。遮罩里深度明显在后面（虚化 > 2 × sharpLimit）的像素，
+    ///    顺着同样在后面的像素能连到离眼镜 band 以外的：是背景，不收。镜片中间测远了的洞被近处的镜框围着，
+    ///    连不出去，照收。LiDAR 穿过镜片测到后面的墙，伸出脸外的镜片整片都连着背景，分不出来：不给 depth，只信遮罩
     /// - Parameters:
     ///   - glasses: Apple 的眼镜遮罩（任意分辨率，和照片对齐、裁好）
     ///   - person: 人像遮罩（软边，任意分辨率）
     ///   - band: 修边的带子宽度（w×h 上的像素）
+    ///   - depth: 这一帧的视差（补过洞、还没修边）；nil = 不看深度
+    ///   - lens: 镜头（算「深度明显在后面」的线），和 depth 一起给
     public static func glassesAccessories(_ glasses: FloatMap, person: FloatMap, width w: Int, height h: Int,
-                                          parameters p: SubjectMatteParameters, band: Int) -> FloatMap? {
+                                          parameters p: SubjectMatteParameters, band: Int,
+                                          depth: FloatMap? = nil, lens: LensParameters? = nil) -> FloatMap? {
         let n = w * h
         guard p.glassesThreshold > 0, n > 0 else { return nil }
         let g = glasses.width == w && glasses.height == h ? glasses.values : glasses.resized(width: w, height: h).values
@@ -696,7 +704,62 @@ public enum SubjectMatte {
                 any = true
             }
         }
-        return any ? FloatMap(width: w, height: h, values: out) : nil
+        guard any else { return nil }
+        // 先看深度（深度来源是双摄时才给 depth）：眼镜遮罩里深度在后面的像素，只有「深度看得出它和人之间隔着近处的镜框」
+        // 才当成漏进遮罩的背景去掉。
+        //  - 挨着人的不动：镜片本身也可能测成后面的背景（透明，侧得厉害时双摄也测不出，成片 IMG_2354），
+        //    它是从脸边上伸出去的。遮罩里连成一片、深度在后面、又挨着人（遮罩 > 0.5、深度不在后面、不是眼镜的地方）的，
+        //    照旧信眼镜遮罩；
+        //  - 不挨着人的：顺着「深度在后面」的像素能连到离眼镜 band 以外的，是背景，不收；
+        //    连不出去的（被近处的镜框围住的洞）照收
+        if let depth, let lens {
+            let d = depth.width == w && depth.height == h ? depth.values : depth.resized(width: w, height: h).values
+            let behindBelow = lens.sharpDisparityRange(limit: 2 * p.sharpLimit).low
+            var behind = [Bool](repeating: false, count: n)
+            for i in 0..<n where d[i].isFinite && d[i] < behindBelow { behind[i] = true }
+            // 人身上（不算眼镜）、深度不在后面的地方，外扩 1 个像素：挨着它的就是从脸边上伸出去的
+            var body = [Float](repeating: 0, count: n)
+            for i in 0..<n where inside[i] > 0 && !behind[i] && !isGlasses[i] { body[i] = 1 }
+            let nearBody = dilateBinary(body, width: w, height: h, radius: 1)
+            var protected = [Bool](repeating: false, count: n)
+            var grouped = [Bool](repeating: false, count: n)
+            for start in 0..<n where out[start] > 0 && behind[start] && !grouped[start] {
+                var members = [start]
+                grouped[start] = true
+                var k = 0, touches = false
+                while k < members.count {
+                    let i = members[k]; k += 1
+                    if nearBody[i] > 0 { touches = true }
+                    let x = i % w, y = i / w
+                    for (q, ok) in [(i - 1, x > 0), (i + 1, x < w - 1), (i - w, y > 0), (i + w, y < h - 1)]
+                    where ok && out[q] > 0 && behind[q] && !grouped[q] {
+                        grouped[q] = true
+                        members.append(q)
+                    }
+                }
+                if touches { for i in members { protected[i] = true } }
+            }
+            let nearGlasses = dilateBinary(out, width: w, height: h, radius: max(1, band))
+            var visited = [Bool](repeating: false, count: n)
+            for start in 0..<n where out[start] > 0 && behind[start] && !protected[start] && !visited[start] {
+                var members = [start]
+                visited[start] = true
+                var k = 0, open = false
+                while k < members.count {
+                    let i = members[k]; k += 1
+                    if nearGlasses[i] == 0 { open = true }
+                    let x = i % w, y = i / w
+                    for (q, ok) in [(i - 1, x > 0), (i + 1, x < w - 1), (i - w, y > 0), (i + w, y < h - 1)]
+                    where ok && behind[q] && !visited[q] {
+                        visited[q] = true
+                        members.append(q)
+                    }
+                }
+                if open { for i in members where !protected[i] { out[i] = 0 } }
+            }
+            guard out.contains(1) else { return nil }
+        }
+        return FloatMap(width: w, height: h, values: out)
     }
 
     /// 颜色说了不算的地方（w×h，0/1）：对焦的人（subject）旁边、人像遮罩（people，所有人）外面 colorMargin 以外的一圈。

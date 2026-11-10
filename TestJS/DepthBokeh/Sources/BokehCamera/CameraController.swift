@@ -42,6 +42,9 @@ public struct CapturedDepthPhoto: Identifiable {
     /// 有它就用它代替眼镜带（SubjectMatte.glassesAccessories）：镜片、镜框算人，贴着镜片的背景照旧按深度。
     /// 相机没给（不支持、没开深度、相册导入）为 nil
     public var glassesMatte: FloatMap? = nil
+    /// 这张的深度测得出镜框（双摄视差）：眼镜遮罩也先看深度，遮罩里深度在后面、又连着遮罩外面背景的不算眼镜
+    /// （眼镜遮罩会漏到贴着镜框的背景上，拍照调试包 photo-20261110-103706）。LiDAR 穿过镜片测到后面的墙，为 false
+    public var glassesFollowDepth = false
     /// 深度从哪来，编辑器里显示（「照片自带深度」「AI 深度」）；相机拍的为 nil
     public var depthSourceLabel: String? = nil
     /// 打开编辑器时提示一下（比如「拿不到原图，用的是已经虚化过的版本」）
@@ -1723,13 +1726,16 @@ extension DepthCameraController: AVCapturePhotoCaptureDelegate {
             return
         }
         // 和预览一样的裁切（两个深度倍率点之间相机停在低的那个点）
-        let (crop, monoRoute, streamOrientation, frameZoom, lockedFocus, lockedMonoRange) = dataQueue.sync {
+        let (crop, monoRoute, streamOrientation, frameZoom, lockedFocus, lockedMonoRange, depthSource) = dataQueue.sync {
             (self.lastFrameCrop, !self.depthExpected, self.frameOrientation, self.lastPublishedZoom,
              self.lastFocusWasLocked ? self.lastFocusDisparity : nil,
-             self.lastFocusWasLocked && !self.depthExpected ? self.monoRange : nil)
+             self.lastFocusWasLocked && !self.depthExpected ? self.monoRange : nil,
+             self.hardwareSource)
         }
         let syncedAt = CACurrentMediaTime()
         let depth = photo.depthData
+        // 双摄视差测得出镜框：眼镜遮罩先看深度。LiDAR 穿过镜片测到后面的墙，照旧只信眼镜遮罩
+        let glassesFollowDepth = depth != nil && depthSource == .dualCamera
         let orientationRaw = (photo.metadata[kCGImagePropertyOrientation as String] as? NSNumber)?.uint32Value ?? 1
         let photoOrientation = CGImagePropertyOrientation(rawValue: orientationRaw) ?? .up
         let orientation = ImageBridge.uiOrientation(photoOrientation)
@@ -1766,6 +1772,8 @@ extension DepthCameraController: AVCapturePhotoCaptureDelegate {
             debugInfo["frameZoom"] = Double(frameZoom)
             debugInfo["focalLength35mm"] = Double(frameZoom) * 24
             debugInfo["monoRoute"] = monoRoute
+            debugInfo["depthSource"] = depthSource.label
+            debugInfo["depthAccuracyRelative"] = depth.map { ($0.depthDataAccuracy == .relative) as Any } ?? NSNull()
             debugInfo["lockedFocusDisparity"] = lockedFocus.map { Double($0) as Any } ?? NSNull()
             debugInfo["segmentation"] = segmentationOn
             debugInfo["photoLongSide"] = longSide
@@ -1839,7 +1847,8 @@ extension DepthCameraController: AVCapturePhotoCaptureDelegate {
                                                       focalLength35mm: Float(frameZoom) * 24,
                                                       lockedFocusDisparity: lockedFocus,
                                                       segmentation: segmentationOn, depthSourceLabel: nil,
-                                                      glassesMatte: glassesRaw?.centerCropped(by: Float(c))),
+                                                      glassesMatte: glassesRaw?.centerCropped(by: Float(c)),
+                                                      glassesFollowDepth: glassesFollowDepth),
                                                 mark: mark)
             // 没有深度（光线太暗、AI 模型没准备好）：整张图当作在对焦面上
             let hasDepth = disparity != nil

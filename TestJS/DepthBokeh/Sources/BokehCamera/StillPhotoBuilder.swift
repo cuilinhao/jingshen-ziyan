@@ -40,6 +40,8 @@ enum StillPhotoBuilder {
         var depthSourceLabel: String?
         /// Apple 拍照时给的眼镜遮罩（和 image 同方向、同一块画面）；没有为 nil
         var glassesMatte: FloatMap? = nil
+        /// 深度测得出镜框（双摄视差）：眼镜遮罩也先看深度（CapturedDepthPhoto.glassesFollowDepth）
+        var glassesFollowDepth = false
     }
 
     struct Output {
@@ -91,6 +93,7 @@ enum StillPhotoBuilder {
         photo.depthSourceLabel = input.depthSourceLabel
         photo.faceBand = faceBand
         photo.glassesMatte = person != nil ? input.glassesMatte : nil
+        photo.glassesFollowDepth = input.glassesFollowDepth
         return Output(photo: photo, alignedGain: alignedGain)
     }
 }

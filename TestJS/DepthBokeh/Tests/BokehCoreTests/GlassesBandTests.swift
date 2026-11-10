@@ -77,7 +77,8 @@ final class GlassesBandTests: XCTestCase {
 
     /// Apple 拍照时给的眼镜遮罩（AVSemanticSegmentationMatte .glasses，照片一半分辨率），照拍照调试包
     /// photo-20261110-095906 的样子：镜片上 0.45～0.6，周围一圈 0.1～0.2 的毛边，贴着镜片的背景里的东西 ≤ 0.2
-    static func glassesMatte() -> FloatMap {
+    /// leak：眼镜遮罩漏到背景上的地方（拍照调试包 photo-20261110-103706：镜框铰链外面那块背景上有 0.25～0.9）
+    static func glassesMatte(leak: ((Float, Float) -> Bool)? = nil) -> FloatMap {
         let w = 480, h = 360
         var v = [Float](repeating: 0, count: w * h)
         let x0 = Int(0.385 * Float(w)), x1 = Int(0.40 * Float(w)), y0 = Int(0.30 * Float(h)), y1 = Int(0.335 * Float(h))
@@ -86,6 +87,9 @@ final class GlassesBandTests: XCTestCase {
                 let dx = max(x0 - x, 0, x - (x1 - 1)), dy = max(y0 - y, 0, y - (y1 - 1))
                 let d = max(dx, dy)
                 v[y * w + x] = d == 0 ? 0.55 : (d <= 3 ? 0.18 : 0)
+                if let leak, leak((Float(x) + 0.5) / Float(w), (Float(y) + 0.5) / Float(h)) {
+                    v[y * w + x] = max(v[y * w + x], 0.7)
+                }
             }
         }
         return FloatMap(width: w, height: h, values: v)
@@ -93,7 +97,8 @@ final class GlassesBandTests: XCTestCase {
 
     /// lensZ：镜片里测到的深度。3 = LiDAR 穿过镜片测到后面的墙；1.2 = 双摄在镜框上测得出镜片（rec-20261109-182630）
     static func scene(focusOnPerson: Bool, band: Bool, strap withStrap: ((Float, Float) -> Bool)? = nil,
-                      glasses: Bool = false, lensZ: Float = 3, lensInMask: Bool = false) -> T.Scene {
+                      glasses: Bool = false, lensZ: Float = 3, lensInMask: Bool = false,
+                      glassesLeak: ((Float, Float) -> Bool)? = nil, glassesFollowDepth: Bool = false) -> T.Scene {
         T.Scene(layers: [
             T.Layer(name: "墙", z: 3, color: T.flat(0.82, 0.82, 0.80), inside: { _, _ in true }),
             T.Layer(name: "椅子", z: 1.2, color: T.flat(0.2, 0.2, 0.22), inside: T.rect(0.68, 0.85, 0.4, 0.95)),
@@ -104,7 +109,7 @@ final class GlassesBandTests: XCTestCase {
         ], focus: focusOnPerson ? (0.47, 0.4) : (0.76, 0.6),
            personMaskOverride: softMask(wrapStrap: withStrap, lensInMask: lensInMask),
            faceBand: band ? FaceBand.map([face], width: 480, height: 360) : nil,
-           glassesMatte: glasses ? glassesMatte() : nil)
+           glassesMatte: glasses ? glassesMatte(leak: glassesLeak) : nil, glassesFollowDepth: glassesFollowDepth)
     }
 
     /// 镜框（深色那一圈）的虚化中位数
@@ -190,6 +195,78 @@ final class GlassesBandTests: XCTestCase {
             (T.rect(0.38, 0.40, 0.15, 0.24)(x, y) || T.rect(0.40, 0.55, 0.13, 0.15)(x, y)) && !Self.isBody(x, y)
         })
         XCTAssertLessThan(halo.sharp, 0.05)
+    }
+
+    /// Apple 的眼镜遮罩自己也会漏到贴着镜框的背景上（拍照调试包 photo-20261110-103706，2× 双摄：镜框铰链外面
+    /// 那块背景上遮罩值 0.25～0.9，深度明明测出它在后面）。双摄测得出镜框，眼镜遮罩也要先看深度：
+    /// 遮罩里深度在后面、又顺着「深度在后面」连到遮罩外面背景的不算眼镜；镜框照样清晰。
+    /// LiDAR 测不出镜片（glassesFollowDepth 关着）：照旧信眼镜遮罩，结果和以前一样
+    func testPhotoGlassesMatteLeakFollowsDepth() {
+        let e: Float = 1.0 / 240
+        for onPerson in [true, false] {
+            let name = "双摄" + (onPerson ? "，对焦在人身上" : "，对焦在旁边一样远的椅子上")
+            func measure(follow: Bool) -> (strap: (actual: Float, ideal: Float, sharp: Float, n: Int), rim: Float) {
+                let r = T.render(Self.scene(focusOnPerson: onPerson, band: true, strap: Self.strapShort, glasses: true,
+                                            lensZ: 1.2, lensInMask: true, glassesLeak: Self.strapShort,
+                                            glassesFollowDepth: follow), live: false)
+                return (r.stats({ x, y in Self.strapShort(x, y) && x < 0.385 - e }), Self.rimBlur(r))
+            }
+            let trusted = measure(follow: false), gated = measure(follow: true)
+            print(String(format: "眼镜遮罩漏到肩带上 %@：只信遮罩 肩带被拉清晰 %.0f%%、镜框 %.2f%%；先看深度 肩带 %.2f%%（应 %.2f%%，被拉清晰 %.0f%%）、镜框 %.2f%%",
+                         name, trusted.strap.sharp * 100, trusted.rim, gated.strap.actual, gated.strap.ideal,
+                         gated.strap.sharp * 100, gated.rim))
+            XCTAssertGreaterThan(trusted.strap.n, 10)
+            XCTAssertGreaterThan(trusted.strap.sharp, 0.3, "\(name)：场景要能复现问题（只信眼镜遮罩时漏出去的那块被拉清晰）")
+            XCTAssertLessThan(gated.strap.sharp, 0.05, "\(name)：眼镜遮罩漏到的背景深度在后面，要按深度虚化")
+            XCTAssertLessThan(gated.rim, 0.15, "\(name)：镜框照样清晰")
+            // 双摄也测不出镜片的时候（侧得厉害，镜片测成后面的墙，成片 IMG_2354）：镜片是从脸边上伸出去的，
+            // 先看深度也不能把它去掉。这时候分不出漏出去的那块，照旧信眼镜遮罩（和不看深度一样）
+            let blind = T.render(Self.scene(focusOnPerson: onPerson, band: true, strap: Self.strapShort, glasses: true,
+                                            lensZ: 3, lensInMask: false, glassesLeak: Self.strapShort,
+                                            glassesFollowDepth: true), live: false)
+            let blindRim = Self.rimBlur(blind)
+            print(String(format: "  双摄测不出镜片：镜框 %.2f%%", blindRim))
+            XCTAssertLessThan(blindRim, 0.15, "\(name)：深度测不出镜片时，先看深度也不能把镜片虚化")
+        }
+    }
+
+    /// 眼镜遮罩先看深度的规则本身（SubjectMatte.glassesAccessories）：
+    ///  - 漏到背景上的那块（深度在后面，连着遮罩外面的背景）不收；
+    ///  - 镜片中间测远了的洞（四周是近处的镜框，连不到外面）照收；
+    ///  - 不给深度（LiDAR）：和以前一样全收
+    func testGlassesMatteDepthGateKeepsEnclosedLensHole() throws {
+        let w = 60, h = 40
+        var g = [Float](repeating: 0, count: w * h), m = g
+        var d = [Float](repeating: 1.0 / 3, count: w * h)
+        func fill(_ a: inout [Float], _ xs: Range<Int>, _ ys: Range<Int>, _ v: Float) {
+            for y in ys { for x in xs { a[y * w + x] = v } }
+        }
+        fill(&m, 30..<60, 0..<40, 1); fill(&d, 30..<60, 0..<40, 1 / 1.2)      // 人
+        fill(&g, 20..<32, 10..<26, 0.6); fill(&d, 20..<30, 10..<26, 1 / 1.2)   // 伸出脸外的镜片（双摄测得出）
+        fill(&d, 23..<27, 14..<21, 1.0 / 3)                                    // 镜片中间测远了的洞
+        fill(&g, 12..<20, 10..<17, 0.8)                                        // 遮罩漏到背景上的一块
+        let glasses = FloatMap(width: w, height: h, values: g), person = FloatMap(width: w, height: h, values: m)
+        let depth = FloatMap(width: w, height: h, values: d)
+        let lens = LensParameters(fNumber: 1.4, focusDisparity: 1 / 1.2)
+        let p = SubjectMatteParameters()
+        let trusted = try XCTUnwrap(SubjectMatte.glassesAccessories(glasses, person: person, width: w, height: h,
+                                                                    parameters: p, band: 2))
+        let gated = try XCTUnwrap(SubjectMatte.glassesAccessories(glasses, person: person, width: w, height: h,
+                                                                  parameters: p, band: 2, depth: depth, lens: lens))
+        XCTAssertEqual(trusted[15, 13], 1, "不给深度：照旧信眼镜遮罩")
+        XCTAssertEqual(gated[15, 13], 0, "漏到背景上的那块：深度在后面、连着外面的背景，不算眼镜")
+        XCTAssertEqual(gated[18, 11], 0)
+        XCTAssertEqual(gated[25, 17], 1, "镜片中间测远了的洞：被镜框围住，照样算眼镜")
+        XCTAssertEqual(gated[21, 12], 1, "镜框")
+        XCTAssertEqual(gated[21, 24], 1)
+        // 深度测不出镜片（整片镜片都测成后面的墙）：镜片挨着脸，不能去掉；连着它的那块也分不出来，照旧信遮罩
+        fill(&d, 20..<30, 10..<26, 1.0 / 3)
+        let blind = try XCTUnwrap(SubjectMatte.glassesAccessories(
+            glasses, person: person, width: w, height: h, parameters: p, band: 2,
+            depth: FloatMap(width: w, height: h, values: d), lens: lens))
+        XCTAssertEqual(blind[21, 12], 1, "镜片测成了背景，但它是从脸边上伸出去的：照样算眼镜")
+        XCTAssertEqual(blind[25, 17], 1)
+        XCTAssertEqual(zip(blind.values, trusted.values).filter { $0 != $1 }.count, 0, "深度测不出镜片时和不看深度一样")
     }
 
     func testFaceBandGeometry() throws {
