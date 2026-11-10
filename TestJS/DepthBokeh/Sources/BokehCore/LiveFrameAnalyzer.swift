@@ -320,28 +320,30 @@ public final class LiveFrameAnalyzer {
                 return s
             }
             var person = frame.personMask?.centerCropped(by: c)
-            // 眼镜带里人像遮罩的软边也算人（伸出脸外的镜片）：和遮罩同一帧算的，先合进遮罩再一起对齐
-            var accessories: FloatMap?
-            if let pm = person, let band = frame.faceBand?.centerCropped(by: c),
-               let added = SubjectMatte.accessories(pm, faceBand: band, threshold: matte.accessoryThreshold) {
-                person = SubjectMatte.withAccessories(pm, faceBand: band, threshold: matte.accessoryThreshold)
-                accessories = added
-            }
+            // 眼镜带和遮罩是同一帧算的：一起对齐到这一帧
+            var faceBand = frame.faceBand?.centerCropped(by: c)
             var maskValid: [Float]?
             if let pm = person, let then = frame.personMaskColors?.centerCropped(by: c), let colors {
                 let aligned = Self.alignMask(pm, maskColors: then, colors: colors, colorsSmall: small(for: then, colors))
                 person = aligned.mask
                 personStale = aligned.changed >= Self.maskStaleFraction
                 maskValid = aligned.stale.map { $0.map { 1 - $0 } }
-                accessories = accessories.map {
+                faceBand = faceBand.map {
                     Self.alignMask($0, maskColors: then, colors: colors, colorsSmall: small(for: then, colors)).mask
                 }
+            }
+            let band = Self.edgeBand(map, relative: frame.relativeDepth, matte: matte)
+            // 眼镜带里离脸不远的软边也算人（伸出脸外的镜片），深度测得出是后面东西的不算（SubjectMatte.accessories）
+            var accessories: FloatMap?
+            if let pm = person, let fb = faceBand,
+               let added = SubjectMatte.accessories(pm, faceBand: fb, depth: map, lens: lens, parameters: matte, band: band) {
+                person = SubjectMatte.withAccessories(pm, adding: added)
+                accessories = added
             }
             // 按人像遮罩（所有人）修深度边缘：头发、眼镜用这个人自己的深度，旁边那圈光晕用背景的深度。
             // 眼镜带新算进人的镜片整片不可信，从脸上填过去。只修边，糊多少照样看镜头（SegmentEdgeRepair）
             if let pm = person {
-                map = SegmentEdgeRepair.repair(depth: map, segments: pm, valid: maskValid,
-                                               band: Self.edgeBand(map, relative: frame.relativeDepth, matte: matte),
+                map = SegmentEdgeRepair.repair(depth: map, segments: pm, valid: maskValid, band: band,
                                                untrusted: accessories)
             }
             let allPeople = person
@@ -932,17 +934,16 @@ public final class LiveFrameAnalyzer {
                 ? $0 : $0.resized(width: map.width, height: map.height) }
             var person = personMask
             // 眼镜带里人像遮罩的软边也算人（同 analyze）
+            let band = edgeBand(map, relative: relativeDepth, matte: matte)
             var accessories: FloatMap?
-            if let pm = person, let band = faceBand,
-               let added = SubjectMatte.accessories(pm, faceBand: band, threshold: matte.accessoryThreshold) {
-                person = SubjectMatte.withAccessories(pm, faceBand: band, threshold: matte.accessoryThreshold)
+            if let pm = person, let fb = faceBand,
+               let added = SubjectMatte.accessories(pm, faceBand: fb, depth: map, lens: lens, parameters: matte, band: band) {
+                person = SubjectMatte.withAccessories(pm, adding: added)
                 accessories = added
             }
             // 按人像遮罩修深度边缘（同 analyze）
             if let pm = person {
-                map = SegmentEdgeRepair.repair(depth: map, segments: pm,
-                                               band: edgeBand(map, relative: relativeDepth, matte: matte),
-                                               untrusted: accessories)
+                map = SegmentEdgeRepair.repair(depth: map, segments: pm, band: band, untrusted: accessories)
             }
             let allPeople = person
             var focusedPerson: FloatMap?

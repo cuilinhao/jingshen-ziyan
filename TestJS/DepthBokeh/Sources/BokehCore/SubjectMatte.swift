@@ -61,6 +61,9 @@ public struct SubjectMatteParameters: Equatable {
     /// 侧脸时远处那片镜片在 Vision 遮罩的 0.1～0.5 之间（调试录制 rec-20261109-152800）；
     /// 0 = 关掉（眼镜带里也按 0.5）
     public var accessoryThreshold: Float = 0.1
+    /// 眼镜带里的软边最多收到离人多远（眼镜带宽的比例，约脸宽的 10%；不小于修边的带子）：镜片伸出脸外不会太远，
+    /// 再往外的软边交给深度（SubjectMatte.accessories）
+    public var accessoryReach: Float = 0.06
 
     public init() {}
 }
@@ -538,29 +541,107 @@ public enum SubjectMatte {
         return minFilter(neg, width: w, height: h, radius: r).map { -$0 }
     }
 
-    /// 眼镜带（FaceBand，0/1）里人像遮罩的软边也算人：遮罩值超过 threshold 的地方设成 1，别处原样。
-    /// 返回和 person 一样大的遮罩。伸出脸外的镜片 LiDAR 测不到（透明），Vision 也只给了软边，深度和分割都说它是背景；
-    /// 眼镜带以外照旧按 0.5（软边是整个人都有的，到处放宽会多出一圈清晰的背景）
-    public static func withAccessories(_ person: FloatMap, faceBand: FloatMap, threshold: Float) -> FloatMap {
-        guard let added = accessories(person, faceBand: faceBand, threshold: threshold) else { return person }
+    /// 人像遮罩里加上眼镜带新算进人的像素（accessories 的结果，任意分辨率）：两者取大，返回 person 的大小
+    public static func withAccessories(_ person: FloatMap, adding added: FloatMap) -> FloatMap {
+        let a = added.width == person.width && added.height == person.height
+            ? added.values : added.resized(width: person.width, height: person.height).values
         var v = person.values
-        for i in 0..<v.count where added.values[i] > 0.5 { v[i] = 1 }
+        for i in 0..<v.count { v[i] = max(v[i], a[i]) }
         return FloatMap(width: person.width, height: person.height, values: v)
     }
 
-    /// withAccessories 新算进人的那些像素（0/1，和 person 一样大）：眼镜带里、遮罩值在 threshold 和 0.5 之间的；没有返回 nil。
-    /// 这些地方的深度一定不可信（透明的镜片后面是背景），修边时要整片从人那一侧填（SegmentEdgeRepair 的 untrusted）
-    public static func accessories(_ person: FloatMap, faceBand: FloatMap, threshold: Float) -> FloatMap? {
-        guard threshold > 0, threshold < 0.5 else { return nil }
-        let band = faceBand.width == person.width && faceBand.height == person.height
-            ? faceBand.values : faceBand.resized(width: person.width, height: person.height).values
-        var out = [Float](repeating: 0, count: person.values.count)
+    /// 眼镜带（FaceBand）里新算进人的像素：伸出脸外的镜片、镜框（深度图分辨率，0/1）；没有返回 nil。
+    ///
+    /// 侧脸时远处那片镜片 LiDAR 测不到（透明），Vision 也只给了软边（0.1～0.5），深度和分割都说它是背景
+    /// （调试录制 rec-20261109-152800）。可软边不只裹着眼镜：贴着头、颜色深的背景也会被裹进去
+    /// （rec-20261109-160836：人身后约 2 m 的相机肩带，双摄在上面测得很准）。所以还是先看深度：
+    ///  1. 候选：眼镜带里、遮罩值在 accessoryThreshold 和 0.5 之间（软边）；
+    ///  2. 只收离人（遮罩 > 0.5）cap 以内的：镜片伸出脸外不会太远。cap = max(修边的带子 band，眼镜带宽 × accessoryReach)；
+    ///     再往外的软边照旧交给深度（修边时归背景那边）；
+    ///  3. cap 外面的软边里有成块的（腐蚀 1 像素还在、不少于 6 个像素）、深度明显在后面的（虚化 > 2 × sharpLimit）：
+    ///     是贴着头的背景里的东西，不是眼镜。它伸进 cap 以内的那一截一起不收：从它出发、顺着软边里深度也在后面的像素
+    ///     连过去的（离它 cap + 1 以内）。镜片外面那圈软边很窄（腐蚀 1 像素就没了），不会被当成这种东西。
+    ///     分不开的情况：LiDAR 下镜片也测成后面的背景，而这东西在软边里一路连到镜片上（直接挨着），镜片也跟着不收，
+    ///     按深度虚化。先深度：宁可镜框软一点，也不把后面的东西拉清晰
+    /// - Parameters:
+    ///   - person: 人像遮罩（软边，任意分辨率）
+    ///   - faceBand: 眼镜带（任意分辨率，> 0.5 算）
+    ///   - depth: 这一帧的视差（补过洞、还没修边，深度图分辨率）
+    ///   - band: 修边的带子宽度（深度图像素，SegmentEdgeRepair 用的同一个）
+    public static func accessories(_ person: FloatMap, faceBand: FloatMap, depth: FloatMap, lens: LensParameters,
+                                   parameters p: SubjectMatteParameters, band: Int) -> FloatMap? {
+        let w = depth.width, h = depth.height, n = w * h
+        guard p.accessoryThreshold > 0, p.accessoryThreshold < 0.5, n > 0 else { return nil }
+        let m = person.width == w && person.height == h ? person.values : person.resized(width: w, height: h).values
+        let fb = faceBand.width == w && faceBand.height == h ? faceBand.values : faceBand.resized(width: w, height: h).values
+        var inside = [Float](repeating: 0, count: n), soft = [Bool](repeating: false, count: n)
+        var bx0 = w, bx1 = -1
+        for i in 0..<n {
+            if m[i] > 0.5 { inside[i] = 1 }
+            if fb[i] > 0.5 {
+                bx0 = min(bx0, i % w); bx1 = max(bx1, i % w)
+                if m[i] > p.accessoryThreshold && m[i] <= 0.5 { soft[i] = true }
+            }
+        }
+        guard soft.contains(true) else { return nil }
+        let cap = max(1, band, Int((Float(bx1 - bx0 + 1) * p.accessoryReach).rounded()))
+        let nearPerson = SubjectMatte.dilateBinary(inside, width: w, height: h, radius: cap)
+        let behindBelow = lens.sharpDisparityRange(limit: 2 * p.sharpLimit).low
+        var behind = [Bool](repeating: false, count: n)
+        for i in 0..<n where depth.values[i].isFinite && depth.values[i] < behindBelow { behind[i] = true }
+        // 3. cap 外面、深度在后面的软边，只留成块的（开运算：腐蚀 1 像素再膨胀回来）
+        var farBehind = [Float](repeating: 0, count: n)
+        for i in 0..<n where soft[i] && nearPerson[i] == 0 && behind[i] { farBehind[i] = 1 }
+        var dropZone: [Float]?
+        if farBehind.contains(1) {
+            let notFar = farBehind.map { 1 - $0 }
+            let eroded = SubjectMatte.dilateBinary(notFar, width: w, height: h, radius: 1).map { 1 - $0 }
+            var thick = SubjectMatte.dilateBinary(eroded, width: w, height: h, radius: 1)
+            for i in 0..<n { thick[i] *= farBehind[i] }
+            // 不少于 6 个像素的块
+            var label = [Int32](repeating: 0, count: n), next: Int32 = 0
+            var objects = [Float](repeating: 0, count: n)
+            for start in 0..<n where thick[start] > 0 && label[start] == 0 {
+                next += 1
+                var members = [start]
+                label[start] = next
+                var k = 0
+                while k < members.count {
+                    let i = members[k]; k += 1
+                    let x = i % w, y = i / w
+                    for (q, ok) in [(i - 1, x > 0), (i + 1, x < w - 1), (i - w, y > 0), (i + w, y < h - 1)]
+                    where ok && thick[q] > 0 && label[q] == 0 {
+                        label[q] = next
+                        members.append(q)
+                    }
+                }
+                if members.count >= 6 { for i in members { objects[i] = 1 } }
+            }
+            if objects.contains(1) {
+                // 它伸进 cap 以内的那一截：从它出发，顺着「软边里、深度在后面」的像素连过去（离它 cap + 1 以内）
+                let reach = SubjectMatte.dilateBinary(objects, width: w, height: h, radius: cap + 1)
+                var zone = objects
+                var stack: [Int] = []
+                for i in 0..<n where objects[i] > 0 { stack.append(i) }
+                while let i = stack.popLast() {
+                    let x = i % w, y = i / w
+                    for (q, ok) in [(i - 1, x > 0), (i + 1, x < w - 1), (i - w, y > 0), (i + w, y < h - 1)]
+                    where ok && zone[q] == 0 && reach[q] > 0 && soft[q] && behind[q] {
+                        zone[q] = 1
+                        stack.append(q)
+                    }
+                }
+                dropZone = zone
+            }
+        }
+        var out = [Float](repeating: 0, count: n)
         var any = false
-        for i in 0..<out.count where band[i] > 0.5 && person.values[i] > threshold && person.values[i] <= 0.5 {
+        for i in 0..<n where soft[i] && nearPerson[i] > 0 {
+            if let z = dropZone, z[i] > 0 { continue }
             out[i] = 1
             any = true
         }
-        return any ? FloatMap(width: person.width, height: person.height, values: out) : nil
+        return any ? FloatMap(width: w, height: h, values: out) : nil
     }
 
     /// 颜色说了不算的地方（w×h，0/1）：对焦的人（subject）旁边、人像遮罩（people，所有人）外面 colorMargin 以外的一圈。

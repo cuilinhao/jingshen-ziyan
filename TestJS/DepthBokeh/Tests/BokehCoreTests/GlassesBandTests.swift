@@ -23,8 +23,19 @@ final class GlassesBandTests: XCTestCase {
         T.rect(0.40, 0.55, 0.15, 0.55)(x, y) || T.rect(0.35, 0.60, 0.55, 1)(x, y)
     }
 
-    /// Vision 那样的软边遮罩（480×360）：人里面 1；外面按离人的距离 d（遮罩像素）是 0.5 − d / 20，镜片外半截在 0.5 外面
-    static func softMask() -> FloatMap {
+    /// 相机肩带（调试录制 rec-20261109-160836）：人身后约 2 m（3.2 m）的一条深色带子，从镜片外侧往前伸出去，
+    /// 在眼睛那一条里。颜色深，Vision 的软边把它也裹了进去
+    /// 带子末端离镜片还有一点（中间是遮罩软边以外的墙），录屏里也是这样（镜框外侧和带子之间露着背景）
+    static let strap = T.rect(0.30, 0.37, 0.285, 0.315)
+    /// 直接挨着镜片：LiDAR 下镜片也测成后面的墙，分不开，按深度来（镜框可能软一点，带子一定要糊）
+    static let strapTouching = T.rect(0.30, 0.385, 0.285, 0.315)
+    static func strapColor(_ ix: Int, _ iy: Int) -> (Float, Float, Float) {
+        (ix / 6 + iy / 6) % 3 == 0 ? (0.55, 0.25, 0.08) : (0.04, 0.04, 0.045)
+    }
+
+    /// Vision 那样的软边遮罩（480×360）：人里面 1；外面按离人的距离 d（遮罩像素）是 0.5 − d / 20，镜片外半截在 0.5 外面。
+    /// wrapStrap：肩带也在软边里（0.3），和 Vision 在录制里给的一样
+    static func softMask(wrapStrap: ((Float, Float) -> Bool)? = nil) -> FloatMap {
         let w = 480, h = 360
         var inside = [Bool](repeating: false, count: w * h)
         for y in 0..<h { for x in 0..<w where isBody((Float(x) + 0.5) / Float(w), (Float(y) + 0.5) / Float(h)) { inside[y * w + x] = true } }
@@ -41,6 +52,9 @@ final class GlassesBandTests: XCTestCase {
                     }
                 }
                 if best.isFinite { v[y * w + x] = max(0, 0.5 - best / 20) }
+                if let wrapStrap, wrapStrap((Float(x) + 0.5) / Float(w), (Float(y) + 0.5) / Float(h)) {
+                    v[y * w + x] = max(v[y * w + x], 0.3)
+                }
             }
         }
         return FloatMap(width: w, height: h, values: v)
@@ -49,15 +63,17 @@ final class GlassesBandTests: XCTestCase {
     /// 人脸框（正立方向，左上角为原点）：脸前沿 0.40，眉毛到下巴
     static let face = FaceBand.Face(x: 0.40, y: 0.20, width: 0.15, height: 0.35)
 
-    static func scene(focusOnPerson: Bool, band: Bool) -> T.Scene {
+    static func scene(focusOnPerson: Bool, band: Bool, strap withStrap: ((Float, Float) -> Bool)? = nil) -> T.Scene {
         T.Scene(layers: [
             T.Layer(name: "墙", z: 3, color: T.flat(0.82, 0.82, 0.80), inside: { _, _ in true }),
             T.Layer(name: "椅子", z: 1.2, color: T.flat(0.2, 0.2, 0.22), inside: T.rect(0.68, 0.85, 0.4, 0.95)),
+            T.Layer(name: "肩带", z: 3.2, color: strapColor, inside: withStrap ?? { _, _ in false }),
             T.Layer(name: "镜片", z: 3, color: lensColor, inside: lens),
             T.Layer(name: "人", z: 1.2, color: { _, iy in Float(iy) / 720 < 0.22 ? (0.03, 0.03, 0.035) : (0.62, 0.45, 0.36) },
                     inside: { x, y in isBody(x, y) }, person: true),
         ], focus: focusOnPerson ? (0.47, 0.4) : (0.76, 0.6),
-           personMaskOverride: softMask(), faceBand: band ? FaceBand.map([face], width: 480, height: 360) : nil)
+           personMaskOverride: softMask(wrapStrap: withStrap),
+           faceBand: band ? FaceBand.map([face], width: 480, height: 360) : nil)
     }
 
     /// 镜框（深色那一圈）的虚化中位数
@@ -81,6 +97,29 @@ final class GlassesBandTests: XCTestCase {
                 XCTAssertGreaterThan(a, 0.15, "\(name)：场景要能复现问题（没有眼镜带时镜框被当成背景虚化）")
                 XCTAssertLessThan(b, 0.15, "\(name)：眼镜带里伸出脸外的镜框要清晰")
                 XCTAssertLessThan(halo.sharp, 0.05, "\(name)：眼镜带以外，人像遮罩的软边不能算人（不多出光晕）")
+            }
+        }
+    }
+
+    /// 肩带在眼镜带里、也被 Vision 的软边裹着，但深度测得出它在人身后 2 m：照常虚化；镜框照样清晰
+    func testBackgroundObjectInFaceBandFollowsDepth() {
+        for live in [false, true] {
+            for onPerson in [true, false] {
+                let name = (live ? "预览" : "拍照") + (onPerson ? "，对焦在人身上" : "，对焦在旁边一样远的椅子上")
+                for touching in [false, true] {
+                    let region = touching ? Self.strapTouching : Self.strap
+                    let r = T.render(Self.scene(focusOnPerson: onPerson, band: true, strap: region), live: live)
+                    // 肩带：紧挨着镜片的一个深度像素不算（种子本身的软边）
+                    let e: Float = 1.0 / 240
+                    let strapStats = r.stats({ x, y in region(x, y) && x < 0.385 - e })
+                    let rim = Self.rimBlur(r)
+                    print(String(format: "肩带%@ %@：肩带 %.2f%%（应 %.2f%%，被拉清晰 %.0f%%），镜框 %.2f%%",
+                                 touching ? "（挨着镜片）" : "", name, strapStats.actual, strapStats.ideal,
+                                 strapStats.sharp * 100, rim))
+                    XCTAssertGreaterThan(strapStats.n, 20)
+                    XCTAssertLessThan(strapStats.sharp, 0.05, "\(name)：眼镜带里、深度在后面的东西（肩带）要按深度虚化")
+                    if !touching { XCTAssertLessThan(rim, 0.15, "\(name)：镜框照样清晰") }
+                }
             }
         }
     }
