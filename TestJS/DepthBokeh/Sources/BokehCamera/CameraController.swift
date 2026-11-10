@@ -7,6 +7,20 @@ import UIKit
 import BokehCore
 import BokehMetal
 
+
+
+/*
+ 修复透明眼镜不全的问题
+ 
+ 改法（Focos 的思路）
+
+ 拍照时在眼镜周围裁一块，单独跑一次工程里已有的 AI 深度模型（0.5× 用的那个）。AI 深度把眼镜看成脸的一部分，所以这一块里和脸一样近、又挨着眼镜遮罩的地方算镜片，补进去。
+
+ 只加不减：和眼镜遮罩的结果取并集，原来已经清晰的不会因为它变糊。
+ 用不上时照旧：模型还没加载好，或 AI 深度没把人和背景分开，结果和改之前一样。
+ 
+ */
+
 /// 拍下来的一张带深度的照片（已降采样、深度已对齐），可以反复改光圈、改对焦点
 public struct CapturedDepthPhoto: Identifiable {
     public let id = UUID()
