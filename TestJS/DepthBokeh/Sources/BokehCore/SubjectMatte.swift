@@ -67,8 +67,26 @@ public struct SubjectMatteParameters: Equatable {
     /// 拍照时 Apple 给的眼镜遮罩（AVSemanticSegmentationMatte .glasses）到多少算眼镜（SubjectMatte.glassesAccessories）。
     /// 拍照调试包 photo-20261110-095906：镜片上 0.45～0.6，镜框四周的毛边和贴着镜片的背景里的东西 ≤ 0.2
     public var glassesThreshold: Float = 0.3
+    /// 眼镜那一块的 AI 深度（SubjectMatte.glassesByLocalDepth）里，离「人」多近算和脸一样近：
+    /// 0 = 这一块里背景的深度，1 = 这一块里人的深度。五张拍照调试包回放：0.35～0.55 结果一样，
+    /// 0.7 时 photo-20261110-170521 远侧的镜片就补不上了（那片镜片比脸稍远一点）。取平的那一段的中间
+    public var localDepthNear: Float = 0.45
 
     public init() {}
+}
+
+/// 画面里一块区域上的相对深度（AI 单目深度，越大越近）。只在这一块里和它自己比，不和硬件深度比数值。
+/// 拍照时在眼镜那一块单独跑一次深度模型：整张图跑分辨率不够，伸出脸外的镜片认不出来
+public struct LocalDepth {
+    /// 这一块的深度（任意分辨率，越大越近）
+    public var map: FloatMap
+    /// 这一块在整张画面里的位置（归一化，左上角原点，和照片同一个方向）
+    public var x0: Float, y0: Float, x1: Float, y1: Float
+
+    public init(map: FloatMap, x0: Float, y0: Float, x1: Float, y1: Float) {
+        self.map = map
+        self.x0 = x0; self.y0 = y0; self.x1 = x1; self.y1 = y1
+    }
 }
 
 /// 主体的「种子」：在深度图分辨率（≤ 320×240）上、用 CPU 算好的几张小遮罩。
@@ -760,6 +778,161 @@ public enum SubjectMatte {
             guard out.contains(1) else { return nil }
         }
         return FloatMap(width: w, height: h, values: out)
+    }
+
+    /// 拍照时在哪一块上单独跑 AI 深度（glassesByLocalDepth 用）：眼镜周围一块，转正以后是 3:4（深度模型的输入比例）。
+    /// 返回归一化的框（左上角原点，和照片同一个方向）；画面里没有眼镜返回 nil。
+    ///  - 中心：伸出人像遮罩外面的那部分眼镜（要补的就是它；正侧脸时镜腿很长，按整副眼镜取中心镜片会偏到框外）；
+    ///    没有伸出去的就按整副眼镜；
+    ///  - 大小：转正以后的高取画面长边的 32%（镜片在模型输入里有几十个像素宽），眼镜伸出去的部分特别大时跟着放大
+    /// - Parameters:
+    ///   - glasses: Apple 的眼镜遮罩（和照片对齐、裁好）
+    ///   - person: 人像遮罩
+    ///   - imageWidth / imageHeight: 照片的像素大小（和遮罩同一个方向）
+    ///   - quarterTurned: 照片转正要转 90°（竖着拿手机拍的：传感器方向是横的）
+    public static func glassesDepthRegion(glasses: FloatMap, person: FloatMap, imageWidth: Int, imageHeight: Int,
+                                          quarterTurned: Bool, parameters p: SubjectMatteParameters = .init())
+        -> (x0: Float, y0: Float, x1: Float, y1: Float)? {
+        let gw = glasses.width, gh = glasses.height
+        guard gw > 0, gh > 0, imageWidth > 0, imageHeight > 0, p.glassesThreshold > 0 else { return nil }
+        let m = person.width == gw && person.height == gh ? person.values : person.resized(width: gw, height: gh).values
+        var strong = 0, outside = 0
+        for i in 0..<(gw * gh) where glasses.values[i] >= p.glassesThreshold {
+            strong += 1
+            if m[i] <= 0.5 { outside += 1 }
+        }
+        guard strong > 0 else { return nil }
+        let useOutside = outside >= max(16, strong / 50)
+        var sx = 0.0, sy = 0.0, count = 0.0
+        var bx0 = gw, bx1 = -1, by0 = gh, by1 = -1
+        for y in 0..<gh {
+            for x in 0..<gw {
+                let i = y * gw + x
+                guard glasses.values[i] >= p.glassesThreshold, !useOutside || m[i] <= 0.5 else { continue }
+                sx += Double(x) + 0.5; sy += Double(y) + 0.5; count += 1
+                bx0 = min(bx0, x); bx1 = max(bx1, x); by0 = min(by0, y); by1 = max(by1, y)
+            }
+        }
+        let W = Float(imageWidth), H = Float(imageHeight)
+        let cx = Float(sx / count) / Float(gw) * W, cy = Float(sy / count) / Float(gh) * H
+        let extent = max(Float(bx1 - bx0 + 1) / Float(gw) * W, Float(by1 - by0 + 1) / Float(gh) * H)
+        let long = max(W, H)
+        let uprightHeight = min(max(0.32 * long, 1.6 * extent), min(W, H) / 0.75, long)
+        let cw = min(quarterTurned ? uprightHeight : 0.75 * uprightHeight, W)
+        let ch = min(quarterTurned ? 0.75 * uprightHeight : uprightHeight, H)
+        let x0 = min(max(cx - cw / 2, 0), W - cw), y0 = min(max(cy - ch / 2, 0), H - ch)
+        return (x0 / W, y0 / H, (x0 + cw) / W, (y0 + ch) / H)
+    }
+
+    /// 眼镜遮罩没收全的镜片（w×h，0/1）；没有返回 nil。只加不减：和 glassesAccessories 的结果取并集用。
+    ///
+    /// Apple 的眼镜遮罩在镜片上的值不稳：远侧伸出脸外的那片镜片上低到 0.06（拍照调试包 photo-20261110-170521，1× LiDAR，
+    /// 镜片大半被虚化），正侧脸的镜片中间也有一块低于 glassesThreshold（photo-20261110-133043，镜片中间糊了一块）。
+    /// 把阈值降下去，镜框四周的毛边和贴着镜片的背景会一起进来。
+    /// AI 单目深度把眼镜看成脸的一部分：在眼镜那一块单独跑一次，镜片是完整的一片、和脸一样近，背景是远的。所以：
+    ///  1. 这一块里，人身上（遮罩 > 0.95）和背景（遮罩 < 0.02）的 AI 深度各取中位数，中间按比例算「离人多近」；
+    ///     人不比背景近（模型没分出来）就不用它；
+    ///  2. 候选：离人够近（> localDepthNear）、人像遮罩没收进去（≤ 0.5）、离眼镜（眼镜遮罩 ≥ glassesThreshold）不远的地方；
+    ///  3. 人的轮廓外面一圈也会被 AI 深度算近（它的边缘比人像遮罩软）：开运算去掉这种细边，只留成块的；
+    ///  4. 只要挨着眼镜（眼镜遮罩 ≥ glassesThreshold）的块：是镜片没收全的那部分。
+    /// - Parameters:
+    ///   - local: 眼镜那一块的 AI 深度
+    ///   - glasses: Apple 的眼镜遮罩（任意分辨率，和照片对齐、裁好）
+    ///   - person: 人像遮罩（软边，任意分辨率）
+    public static func glassesByLocalDepth(_ local: LocalDepth, glasses: FloatMap, person: FloatMap,
+                                           width w: Int, height h: Int,
+                                           parameters p: SubjectMatteParameters) -> FloatMap? {
+        let n = w * h
+        guard n > 0, p.localDepthNear > 0, p.glassesThreshold > 0,
+              local.x1 > local.x0, local.y1 > local.y0, local.map.width > 1, local.map.height > 1 else { return nil }
+        let g = glasses.width == w && glasses.height == h ? glasses.values : glasses.resized(width: w, height: h).values
+        let m = person.width == w && person.height == h ? person.values : person.resized(width: w, height: h).values
+        // 这一块在 w×h 上占的像素（像素中心落在里面的）
+        let bx0 = max(0, Int((local.x0 * Float(w)).rounded(.up))), bx1 = min(w, Int((local.x1 * Float(w)).rounded(.down)))
+        let by0 = max(0, Int((local.y0 * Float(h)).rounded(.up))), by1 = min(h, Int((local.y1 * Float(h)).rounded(.down)))
+        guard bx1 - bx0 >= 8, by1 - by0 >= 8 else { return nil }
+        var a = [Float](repeating: .nan, count: n)
+        let sx = Float(local.map.width) / ((local.x1 - local.x0) * Float(w))
+        let sy = Float(local.map.height) / ((local.y1 - local.y0) * Float(h))
+        for y in by0..<by1 {
+            let fy = (Float(y) + 0.5 - local.y0 * Float(h)) * sy
+            for x in bx0..<bx1 {
+                a[y * w + x] = local.map.sampleBilinear(x: (Float(x) + 0.5 - local.x0 * Float(w)) * sx, y: fy)
+            }
+        }
+        // 1. 人和背景各自的深度：离人像遮罩的边远一点的地方才取（边上两边都不准）
+        var solid = [Float](repeating: 0, count: n), clear = [Float](repeating: 0, count: n)
+        var isGlasses = [Float](repeating: 0, count: n)
+        var gx0 = w, gx1 = -1, gy0 = h, gy1 = -1
+        for i in 0..<n {
+            if g[i] >= p.glassesThreshold {
+                isGlasses[i] = 1
+                gx0 = min(gx0, i % w); gx1 = max(gx1, i % w); gy0 = min(gy0, i / w); gy1 = max(gy1, i / w)
+            }
+            guard a[i].isFinite else { continue }
+            if m[i] > 0.95 { solid[i] = 1 } else if m[i] < 0.02 && g[i] < 0.02 { clear[i] = 1 }
+        }
+        guard gx1 >= gx0 else { return nil }
+        let margin = max(2, max(w, h) / 200)
+        let notSolid = solid.map { 1 - $0 }, notClear = clear.map { 1 - $0 }
+        let solidCore = dilateBinary(notSolid, width: w, height: h, radius: margin)
+        let clearCore = dilateBinary(notClear, width: w, height: h, radius: margin)
+        var onPerson: [Float] = [], onBackground: [Float] = []
+        for i in 0..<n where a[i].isFinite {
+            if solidCore[i] == 0 { onPerson.append(a[i]) } else if clearCore[i] == 0 { onBackground.append(a[i]) }
+        }
+        guard onPerson.count >= 32, onBackground.count >= 32 else { return nil }
+        onPerson.sort(); onBackground.sort()
+        let dPerson = onPerson[onPerson.count / 2], dBackground = onBackground[onBackground.count / 2]
+        var lo = Float.infinity, hi = -Float.infinity
+        for v in a where v.isFinite { lo = min(lo, v); hi = max(hi, v) }
+        // 人要明显比背景近，否则这块深度没分出人来
+        guard dPerson - dBackground > 0.15 * max(hi - lo, 1e-6) else { return nil }
+        let nearAbove = dBackground + p.localDepthNear * (dPerson - dBackground)
+        // 2. 候选：只看眼镜周围（眼镜的外接框往外放它自己长边的一半）
+        let reach = max(4, max(gx1 - gx0, gy1 - gy0) / 2)
+        let rx0 = max(bx0, gx0 - reach), rx1 = min(bx1 - 1, gx1 + reach)
+        let ry0 = max(by0, gy0 - reach), ry1 = min(by1 - 1, gy1 + reach)
+        guard rx1 >= rx0, ry1 >= ry0 else { return nil }
+        var candidate = [Float](repeating: 0, count: n)
+        var any = false
+        for y in ry0...ry1 {
+            for x in rx0...rx1 {
+                let i = y * w + x
+                if a[i] > nearAbove && m[i] <= 0.5 { candidate[i] = 1; any = true }
+            }
+        }
+        guard any else { return nil }
+        // 3. 开运算：去掉人轮廓外面那圈细边
+        let r = max(1, max(w, h) / 400)
+        let eroded = dilateBinary(candidate.map { 1 - $0 }, width: w, height: h, radius: r).map { 1 - $0 }
+        var opened = dilateBinary(eroded, width: w, height: h, radius: r)
+        for i in 0..<n { opened[i] *= candidate[i] }
+        // 4. 只留挨着眼镜的块
+        let nearGlasses = dilateBinary(isGlasses, width: w, height: h, radius: 1)
+        var out = [Float](repeating: 0, count: n)
+        var seen = [Bool](repeating: false, count: n)
+        any = false
+        for start in 0..<n where opened[start] > 0 && !seen[start] {
+            var members = [start]
+            seen[start] = true
+            var k = 0, touches = false
+            while k < members.count {
+                let i = members[k]; k += 1
+                if nearGlasses[i] > 0 { touches = true }
+                let x = i % w, y = i / w
+                for (q, ok) in [(i - 1, x > 0), (i + 1, x < w - 1), (i - w, y > 0), (i + w, y < h - 1)]
+                where ok && opened[q] > 0 && !seen[q] {
+                    seen[q] = true
+                    members.append(q)
+                }
+            }
+            if touches {
+                for i in members { out[i] = 1 }
+                any = true
+            }
+        }
+        return any ? FloatMap(width: w, height: h, values: out) : nil
     }
 
     /// 颜色说了不算的地方（w×h，0/1）：对焦的人（subject）旁边、人像遮罩（people，所有人）外面 colorMargin 以外的一圈。

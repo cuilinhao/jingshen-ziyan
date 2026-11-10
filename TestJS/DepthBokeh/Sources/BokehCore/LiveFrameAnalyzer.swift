@@ -902,6 +902,7 @@ public final class LiveFrameAnalyzer {
 
     /// 拍下来的照片：没有时间历史，对焦点直接取中位数。
     ///  - glassesMatte：Apple 拍照时给的眼镜遮罩（和照片对齐、裁好，任意分辨率）。有它就不用 faceBand 去猜伸出脸外的眼镜
+    ///  - glassesDepth：眼镜那一块单独跑的 AI 深度。眼镜遮罩没收全的镜片按它补上（SubjectMatte.glassesByLocalDepth）
     ///  - glassesFollowDepth：这张深度测得出镜框（双摄）。眼镜遮罩也先看深度：遮罩里深度在后面、又连着遮罩外面背景的
     ///    不算眼镜（眼镜遮罩会漏到贴着镜框的背景上）。LiDAR 穿过镜片测到后面的墙，分不出来，关着（只信眼镜遮罩）
     public static func stillPlan(disparity: FloatMap, relativeDepth: Bool, colors: PlanarImage?, fNumber: Float,
@@ -910,7 +911,7 @@ public final class LiveFrameAnalyzer {
                                  personInstances: FloatMap? = nil, focalLength35mm: Float? = nil,
                                  lockedFocusDisparity: Float? = nil, highlightExclusion: FloatMap? = nil,
                                  faceBand: FloatMap? = nil, glassesMatte: FloatMap? = nil,
-                                 glassesFollowDepth: Bool = false) -> FramePlan {
+                                 glassesFollowDepth: Bool = false, glassesDepth: LocalDepth? = nil) -> FramePlan {
         var map = DepthRefiner.fillInvalid(disparity, guide: colors)
         let lowLongSide = max(320, outputLongSide / max(1, settings.blurDownscale))
         // 拍照时锁定了对焦：用锁定的距离（重新构图以后对焦点上可能已经是别的东西）
@@ -944,9 +945,16 @@ public final class LiveFrameAnalyzer {
                 // 没有才用眼镜带里离脸不远的软边去猜（同 analyze）
                 let added: FloatMap?
                 if let gm = glassesMatte {
-                    added = SubjectMatte.glassesAccessories(gm, person: pm, width: map.width, height: map.height,
-                                                            parameters: matte, band: band,
-                                                            depth: glassesFollowDepth ? map : nil, lens: lens)
+                    var fromMatte = SubjectMatte.glassesAccessories(gm, person: pm, width: map.width, height: map.height,
+                                                                    parameters: matte, band: band,
+                                                                    depth: glassesFollowDepth ? map : nil, lens: lens)
+                    // 眼镜遮罩没收全的镜片：按眼镜那一块的 AI 深度补上（只加不减）
+                    if let local = glassesDepth,
+                       let more = SubjectMatte.glassesByLocalDepth(local, glasses: gm, person: pm, width: map.width,
+                                                                   height: map.height, parameters: matte) {
+                        fromMatte = fromMatte.map { SubjectMatte.withAccessories($0, adding: more) } ?? more
+                    }
+                    added = fromMatte
                 } else if let fb = faceBand {
                     added = SubjectMatte.accessories(pm, faceBand: fb, depth: map, lens: lens, parameters: matte, band: band)
                 } else {

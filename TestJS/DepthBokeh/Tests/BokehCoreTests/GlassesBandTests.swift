@@ -269,6 +269,114 @@ final class GlassesBandTests: XCTestCase {
         XCTAssertEqual(zip(blind.values, trusted.values).filter { $0 != $1 }.count, 0, "深度测不出镜片时和不看深度一样")
     }
 
+    /// 眼镜遮罩没收全的镜片按眼镜那一块的 AI 深度补上（SubjectMatte.glassesByLocalDepth）。
+    /// 拍照调试包 photo-20261110-170521（1× LiDAR，远侧镜片上眼镜遮罩低到 0.06，镜片大半被虚化）、
+    /// photo-20261110-133043（2× 双摄，镜片中间一块低于阈值，糊了一块）。
+    ///  - 镜片（AI 深度和脸一样近、眼镜遮罩只有 0.1、挨着镜框）：补上；
+    ///  - 贴着镜片的背景（AI 深度是远的）：不补；
+    ///  - 人轮廓外面那圈被 AI 深度算近的细边：不补；
+    ///  - 离眼镜远的、AI 深度也近的东西（旁边一样远的椅子）：不补；
+    ///  - AI 深度没把人和背景分开：不用它
+    func testGlassesLensCompletedByLocalDepth() throws {
+        let w = 160, h = 120
+        var g = [Float](repeating: 0, count: w * h), m = g
+        var a = [Float](repeating: 0.1, count: w * h)
+        func fill(_ v: inout [Float], _ xs: Range<Int>, _ ys: Range<Int>, _ value: Float) {
+            for y in ys { for x in xs { v[y * w + x] = value } }
+        }
+        fill(&m, 80..<160, 0..<120, 1); fill(&a, 78..<160, 0..<120, 0.9)   // 人；AI 深度的边比遮罩宽 2 像素（细边）
+        fill(&g, 52..<82, 40..<43, 0.9)                                    // 镜框上沿（眼镜遮罩认得出）
+        fill(&g, 52..<55, 40..<70, 0.9)                                    // 镜框前沿
+        fill(&g, 55..<80, 43..<70, 0.1)                                    // 镜片：眼镜遮罩只有 0.1
+        fill(&a, 52..<80, 40..<70, 0.8)                                    // AI 深度：整副眼镜和脸差不多近
+        fill(&g, 40..<52, 40..<50, 0.5)                                    // 眼镜遮罩漏到背景上的一块（AI 深度是远的）
+        fill(&a, 10..<30, 80..<110, 0.9)                                   // 旁边一样远的椅子
+        let glasses = FloatMap(width: w, height: h, values: g), person = FloatMap(width: w, height: h, values: m)
+        let p = SubjectMatteParameters()
+        func run(_ depth: [Float]) -> FloatMap? {
+            let local = LocalDepth(map: FloatMap(width: w, height: h, values: depth), x0: 0, y0: 0, x1: 1, y1: 1)
+            return SubjectMatte.glassesByLocalDepth(local, glasses: glasses, person: person, width: w, height: h,
+                                                    parameters: p)
+        }
+        let added = try XCTUnwrap(run(a))
+        XCTAssertEqual(added[65, 55], 1, "镜片中间：眼镜遮罩没到阈值，AI 深度和脸一样近，补上")
+        XCTAssertEqual(added[58, 66], 1, "镜片下沿")
+        XCTAssertEqual(added[45, 45], 0, "眼镜遮罩漏到的背景：AI 深度是远的，不补")
+        XCTAssertEqual(added[45, 60], 0, "镜片前面的背景")
+        XCTAssertEqual(added[79, 20], 0, "人轮廓外面的细边：不补")
+        XCTAssertEqual(added[79, 100], 0)
+        XCTAssertEqual(added[20, 95], 0, "离眼镜远的东西：不补")
+        // 和眼镜遮罩的结果取并集：只加不减
+        let fromMatte = try XCTUnwrap(SubjectMatte.glassesAccessories(glasses, person: person, width: w, height: h,
+                                                                      parameters: p, band: 2))
+        let both = SubjectMatte.withAccessories(fromMatte, adding: added)
+        for i in 0..<(w * h) { XCTAssertGreaterThanOrEqual(both.values[i], fromMatte.values[i]) }
+        XCTAssertEqual(fromMatte[65, 55], 0, "场景要能复现问题：只有眼镜遮罩时镜片中间没收进来")
+        XCTAssertEqual(both[65, 55], 1)
+        // AI 深度没把人和背景分开（整块差不多一样）：不用它
+        XCTAssertNil(run([Float](repeating: 0.5, count: w * h)))
+        // 人比背景还远（深度反了）：不用它
+        XCTAssertNil(run(a.map { 1 - $0 }))
+        // 只给了一小块、里面没有背景可比：不用它
+        let small = LocalDepth(map: FloatMap(width: 20, height: 20, repeating: 0.9), x0: 0.6, y0: 0.2, x1: 0.9, y1: 0.6)
+        XCTAssertNil(SubjectMatte.glassesByLocalDepth(small, glasses: glasses, person: person, width: w, height: h,
+                                                      parameters: p))
+    }
+
+    /// 只给了画面的一块（拍照时就是这样：眼镜周围一块）：结果只在这一块里，位置要对得上
+    func testGlassesLocalDepthCropPlacement() throws {
+        let w = 160, h = 120
+        var g = [Float](repeating: 0, count: w * h), m = g
+        func fill(_ v: inout [Float], _ xs: Range<Int>, _ ys: Range<Int>, _ value: Float) {
+            for y in ys { for x in xs { v[y * w + x] = value } }
+        }
+        fill(&m, 80..<160, 0..<120, 1)
+        fill(&g, 52..<82, 40..<43, 0.9); fill(&g, 52..<55, 40..<70, 0.9); fill(&g, 55..<80, 43..<70, 0.1)
+        // 这一块：x 32…112、y 20…100（一半分辨率 40×40），里面人在右半、镜片在 x 52…80、y 40…70
+        let cw = 40, ch = 40
+        var c = [Float](repeating: 0.1, count: cw * ch)
+        for y in 0..<ch { for x in 0..<cw {
+            let fx = 32 + (Float(x) + 0.5) * 2, fy = 20 + (Float(y) + 0.5) * 2
+            if fx >= 80 || (fx >= 52 && fx < 80 && fy >= 40 && fy < 70) { c[y * cw + x] = 0.9 }
+        } }
+        let local = LocalDepth(map: FloatMap(width: cw, height: ch, values: c),
+                               x0: 32.0 / 160, y0: 20.0 / 120, x1: 112.0 / 160, y1: 100.0 / 120)
+        let added = try XCTUnwrap(SubjectMatte.glassesByLocalDepth(
+            local, glasses: FloatMap(width: w, height: h, values: g), person: FloatMap(width: w, height: h, values: m),
+            width: w, height: h, parameters: SubjectMatteParameters()))
+        XCTAssertEqual(added[66, 56], 1, "镜片中间")
+        XCTAssertEqual(added[44, 56], 0, "镜片前面的背景")
+        XCTAssertEqual(added[66, 80], 0, "镜片下面的背景")
+        XCTAssertEqual(added[20, 56], 0, "这一块以外")
+    }
+
+    /// 在哪一块上跑眼镜的 AI 深度：转正以后 3:4，不出画面，中心在伸出人像遮罩外面的那部分眼镜上
+    func testGlassesDepthRegion() throws {
+        let w = 200, h = 150
+        var g = [Float](repeating: 0, count: w * h), m = g
+        for y in 0..<h { for x in 100..<w { m[y * w + x] = 1 } }                 // 人在右半
+        for y in 60..<64 { for x in 80..<180 { g[y * w + x] = 0.9 } }            // 镜腿很长，大部分在人身上
+        for y in 60..<80 { for x in 80..<100 { g[y * w + x] = 0.9 } }            // 伸出脸外的镜片
+        let glasses = FloatMap(width: w, height: h, values: g), person = FloatMap(width: w, height: h, values: m)
+        let r = try XCTUnwrap(SubjectMatte.glassesDepthRegion(glasses: glasses, person: person, imageWidth: 4000,
+                                                              imageHeight: 3000, quarterTurned: true))
+        XCTAssertEqual((r.x1 - r.x0) * 4000, 0.32 * 4000, accuracy: 1, "转正以后的高：画面长边的 32%")
+        XCTAssertEqual((r.y1 - r.y0) * 3000, 0.75 * 0.32 * 4000, accuracy: 1, "3:4")
+        XCTAssertEqual((r.x0 + r.x1) / 2, 90.0 / 200, accuracy: 0.01, "中心在伸出脸外的镜片上，不是整副眼镜的中间")
+        XCTAssertEqual((r.y0 + r.y1) / 2, 70.0 / 150, accuracy: 0.01)
+        // 眼镜贴着画面边：框整个挪进画面里
+        var edge = [Float](repeating: 0, count: w * h)
+        for y in 0..<6 { for x in 0..<10 { edge[y * w + x] = 0.9 } }
+        let e = try XCTUnwrap(SubjectMatte.glassesDepthRegion(glasses: FloatMap(width: w, height: h, values: edge),
+                                                              person: FloatMap(width: w, height: h),
+                                                              imageWidth: 4000, imageHeight: 3000, quarterTurned: true))
+        XCTAssertEqual(e.x0, 0, accuracy: 1e-4); XCTAssertEqual(e.y0, 0, accuracy: 1e-4)
+        XCTAssertEqual((e.x1 - e.x0) * 4000, 0.32 * 4000, accuracy: 1)
+        // 没有眼镜
+        XCTAssertNil(SubjectMatte.glassesDepthRegion(glasses: FloatMap(width: w, height: h), person: person,
+                                                     imageWidth: 4000, imageHeight: 3000, quarterTurned: true))
+    }
+
     func testFaceBandGeometry() throws {
         // 正脸、不歪头：眉毛到颧骨那一条，左右各伸出脸宽的 30%
         let m = try XCTUnwrap(FaceBand.map([Self.face], width: 480, height: 360))

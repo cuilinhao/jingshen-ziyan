@@ -45,6 +45,9 @@ public struct CapturedDepthPhoto: Identifiable {
     /// 这张的深度测得出镜框（双摄视差）：眼镜遮罩也先看深度，遮罩里深度在后面、又连着遮罩外面背景的不算眼镜
     /// （眼镜遮罩会漏到贴着镜框的背景上，拍照调试包 photo-20261110-103706）。LiDAR 穿过镜片测到后面的墙，为 false
     public var glassesFollowDepth = false
+    /// 眼镜那一块单独跑的 AI 深度（StillPhotoBuilder）：眼镜遮罩没收全的镜片按它补上（SubjectMatte.glassesByLocalDepth）。
+    /// 没有眼镜、深度模型还没准备好时为 nil（照旧只用眼镜遮罩）
+    public var glassesDepth: LocalDepth? = nil
     /// 深度从哪来，编辑器里显示（「照片自带深度」「AI 深度」）；相机拍的为 nil
     public var depthSourceLabel: String? = nil
     /// 打开编辑器时提示一下（比如「拿不到原图，用的是已经虚化过的版本」）

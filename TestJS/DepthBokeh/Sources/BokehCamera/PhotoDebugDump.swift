@@ -61,6 +61,12 @@ enum PhotoDebugDump {
         meta["glassesMatteUsed"] = photo.glassesMatte != nil
         // 眼镜遮罩有没有先看深度（双摄才看）
         meta["glassesFollowDepth"] = photo.glassesFollowDepth
+        // 眼镜那一块的 AI 深度（有才写）和它在画面里的位置（归一化，x0 y0 x1 y1）
+        if let local = photo.glassesDepth {
+            DebugRecorder.writePFM(local.map, to: folder.appendingPathComponent("glasses-depth.pfm"))
+            meta["glassesDepthRect"] = [Double(local.x0), Double(local.y0), Double(local.x1), Double(local.y1)]
+        }
+        meta["glassesDepthUsed"] = photo.glassesDepth != nil
         meta["photoMetadata"] = jsonSafe(metadata)
         let safe = jsonSafe(meta)
         if JSONSerialization.isValidJSONObject(safe),

@@ -94,7 +94,34 @@ enum StillPhotoBuilder {
         photo.faceBand = faceBand
         photo.glassesMatte = person != nil ? input.glassesMatte : nil
         photo.glassesFollowDepth = input.glassesFollowDepth
+        // 眼镜遮罩在镜片上的值不稳（远侧伸出脸外的镜片、正侧脸的镜片中间会低于阈值，被虚化）：
+        // 在眼镜那一块单独跑一次 AI 深度，编辑器里按它把没收全的镜片补上（SubjectMatte.glassesByLocalDepth）
+        if let person, let glasses = photo.glassesMatte {
+            photo.glassesDepth = glassesDepth(cg, orientation: o, glasses: glasses, person: person)
+            mark(photo.glassesDepth != nil ? "眼镜深度" : "没有眼镜深度")
+        }
         return Output(photo: photo, alignedGain: alignedGain)
+    }
+
+    /// 眼镜周围一块（SubjectMatte.glassesDepthRegion）上的 AI 深度；画面里没有眼镜、深度模型还没准备好时返回 nil
+    private static func glassesDepth(_ cg: CGImage, orientation: CGImagePropertyOrientation,
+                                     glasses: FloatMap, person: FloatMap) -> LocalDepth? {
+        let turned = CameraImageOrientation.quarterTurns(for: orientation) % 2 == 1
+        guard let r = SubjectMatte.glassesDepthRegion(glasses: glasses, person: person, imageWidth: cg.width,
+                                                      imageHeight: cg.height, quarterTurned: turned) else { return nil }
+        guard let estimator = DepthModelStore.shared.estimator else {
+            // 模型还没加载：这张照旧。手机上已经有模型（不用下载）就开始加载，下一张用得上
+            if DepthModelStore.shared.isAvailableOffline { DepthModelStore.shared.prepare() }
+            return nil
+        }
+        let W = CGFloat(cg.width), H = CGFloat(cg.height)
+        let rect = CGRect(x: (CGFloat(r.x0) * W).rounded(), y: (CGFloat(r.y0) * H).rounded(),
+                          width: (CGFloat(r.x1 - r.x0) * W).rounded(), height: (CGFloat(r.y1 - r.y0) * H).rounded())
+            .intersection(CGRect(x: 0, y: 0, width: W, height: H))
+        guard rect.width >= 64, rect.height >= 64, let crop = cg.cropping(to: rect),
+              let map = estimator.estimateStill(cgImage: crop, orientation: orientation) else { return nil }
+        return LocalDepth(map: map, x0: Float(rect.minX / W), y0: Float(rect.minY / H),
+                          x1: Float(rect.maxX / W), y1: Float(rect.maxY / H))
     }
 }
 #endif
