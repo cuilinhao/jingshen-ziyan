@@ -38,6 +38,10 @@ public struct CapturedDepthPhoto: Identifiable {
     /// 眼镜带（FaceBand：人脸框里眼睛那一条，传感器方向，0/1）：这一条里人像遮罩的软边也算人，伸出脸外的镜片不被虚化。
     /// 没有人脸为 nil
     public var faceBand: FloatMap? = nil
+    /// Apple 拍照时给的眼镜遮罩（AVSemanticSegmentationMatte .glasses，传感器方向，0…1，照片一半左右的分辨率）。
+    /// 有它就用它代替眼镜带（SubjectMatte.glassesAccessories）：镜片、镜框算人，贴着镜片的背景照旧按深度。
+    /// 相机没给（不支持、没开深度、相册导入）为 nil
+    public var glassesMatte: FloatMap? = nil
     /// 深度从哪来，编辑器里显示（「照片自带深度」「AI 深度」）；相机拍的为 nil
     public var depthSourceLabel: String? = nil
     /// 打开编辑器时提示一下（比如「拿不到原图，用的是已经虚化过的版本」）
@@ -114,8 +118,10 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
     /// 拍照后给编辑器的图像长边
     public var photoLongSide = 3024
     /// 每拍一张都存一份拍照调试包（PhotoDebugDump：原始照片文件、交给编辑器的图和深度、按快门那一刻的相机曝光参数），
-    /// 相机界面右上角「发送数据」AirDrop 到 Mac。排查成片过曝（录屏 0.5x-baoguang）用；每张约 20–40 MB，查完关掉
-    public var savePhotoDebug = false
+    /// 相机界面右上角「发送数据」AirDrop 到 Mac。排查成片过曝（录屏 0.5x-baoguang）用；每张约 20–40 MB，查完关掉。
+    /// 打开时还会向相机要 Apple 的人像遮罩和语义遮罩（眼镜、头发……）一起存进包里（不参与渲染）；
+    /// 要在相机配置（启动、换镜头）之前打开才生效
+    public var savePhotoDebug = true
     /// 换相机时新相机已经出画面、深度还没到：先显示没虚化的新画面（画面不停住），深度到了 0.2 秒淡入虚化。
     /// false = 以前的做法：一直停在上一帧，等新相机出帧并且深度到了（最多 0.8 秒）再淡入
     public var previewBeforeDepth = true
@@ -772,6 +778,13 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
                 settings.isDepthDataDeliveryEnabled = true
                 // 和预览一样：大多数线路让系统先补洞、平滑；长焦双摄不用（usesSystemDepthFilter），照片和预览才一致
                 settings.isDepthDataFiltered = self.depthFiltering
+                // Apple 的遮罩（configure）：眼镜遮罩每张都要，人像遮罩只在拍照调试包打开时要
+                if self.savePhotoDebug && self.photoOutput.isPortraitEffectsMatteDeliveryEnabled {
+                    settings.isPortraitEffectsMatteDeliveryEnabled = true
+                }
+                if !self.photoOutput.enabledSemanticSegmentationMatteTypes.isEmpty {
+                    settings.enabledSemanticSegmentationMatteTypes = self.photoOutput.enabledSemanticSegmentationMatteTypes
+                }
             }
             if let conn = self.photoOutput.connection(with: .video) {
                 if conn.isVideoRotationAngleSupported(self.captureRotationAngle) {
@@ -789,6 +802,12 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
                 state["photoQualityPrioritization"] = settings.photoQualityPrioritization.rawValue
                 state["maxPhotoQualityPrioritization"] = self.photoOutput.maxPhotoQualityPrioritization.rawValue
                 state["maxPhotoDimensions"] = [Int(settings.maxPhotoDimensions.width), Int(settings.maxPhotoDimensions.height)]
+                state["portraitEffectsMatteSupported"] = self.photoOutput.isPortraitEffectsMatteDeliverySupported
+                state["portraitEffectsMatteRequested"] = settings.isPortraitEffectsMatteDeliveryEnabled
+                state["availableSemanticMattes"] = self.photoOutput.availableSemanticSegmentationMatteTypes
+                    .map { PhotoDebugDump.matteName($0) }
+                state["requestedSemanticMattes"] = settings.enabledSemanticSegmentationMatteTypes
+                    .map { PhotoDebugDump.matteName($0) }
             }
             self.paramLock.lock()
             self.captureRequestedAt = CACurrentMediaTime()
@@ -1033,6 +1052,14 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
                 photoOutput.maxPhotoDimensions = dims
             }
             photoOutput.isDepthDataDeliveryEnabled = useDepth && photoOutput.isDepthDataDeliverySupported
+            // Apple 拍照时算的遮罩。顺序和 AVCam 一样：先深度，再人像遮罩，再语义遮罩。
+            //  - 眼镜遮罩：平时也要，拍照时代替眼镜带（CapturedDepthPhoto.glassesMatte）
+            //  - 其余的（人像遮罩，头发 / 皮肤 / 牙齿）：只有拍照调试包打开时才要，存进包里和我们自己的分割对比，不参与渲染
+            // 输出上的人像遮罩只要支持就开着（不按张要就不算；语义遮罩能不能给可能和它有关），按张只在调试包打开时要
+            let depthOn = photoOutput.isDepthDataDeliveryEnabled
+            photoOutput.isPortraitEffectsMatteDeliveryEnabled = depthOn && photoOutput.isPortraitEffectsMatteDeliverySupported
+            let semantic = depthOn ? photoOutput.availableSemanticSegmentationMatteTypes : []
+            photoOutput.enabledSemanticSegmentationMatteTypes = savePhotoDebug ? semantic : semantic.filter { $0 == .glasses }
         }
 
         if useDepth {
@@ -1750,6 +1777,27 @@ extension DepthCameraController: AVCapturePhotoCaptureDelegate {
                                    "highlightGain": Double(RenderQuality.photo.highlightGain)] as [String: Any]
         }
         let dumpInfo = debugInfo
+        // Apple 拍照时算的遮罩（见 configure）。和照片、深度一样是原始像素方向，分辨率一般是照片的一半；
+        // 后面和照片一样按倍率裁切。眼镜遮罩交给编辑器，其余的只进拍照调试包
+        let glassesRaw = photo.semanticSegmentationMatte(for: .glasses)
+            .flatMap { PersonSegmenter.sensorMask($0.mattingImage, orientation: .up) }
+        print("[Photo] Apple 眼镜遮罩：" + (glassesRaw.map { "\($0.width)×\($0.height)" } ?? "没有（编辑器用眼镜带）"))
+        var rawMattes: [String: FloatMap] = [:]
+        if dumpDebug {
+            if let m = photo.portraitEffectsMatte,
+               let map = PersonSegmenter.sensorMask(m.mattingImage, orientation: .up) {
+                rawMattes["portrait"] = map
+            }
+            for type in output.enabledSemanticSegmentationMatteTypes {
+                if let m = photo.semanticSegmentationMatte(for: type),
+                   let map = PersonSegmenter.sensorMask(m.mattingImage, orientation: .up) {
+                    rawMattes[PhotoDebugDump.matteName(type)] = map
+                }
+            }
+            let sizes = rawMattes.keys.sorted().map { "\($0) \(rawMattes[$0]!.width)×\(rawMattes[$0]!.height)" }
+            print("[PhotoDebug] Apple 遮罩：" + (sizes.isEmpty ? "没有" : sizes.joined(separator: "、")))
+        }
+        let appleMattes = rawMattes
 
         photoQueue.async {
             // 拍照计时日志：每一步用了多久（排查「第一张照片要等很久」）
@@ -1790,7 +1838,8 @@ extension DepthCameraController: AVCapturePhotoCaptureDelegate {
                                                       gainCrop: Float(c), focusPoint: focus, fNumber: fNumber,
                                                       focalLength35mm: Float(frameZoom) * 24,
                                                       lockedFocusDisparity: lockedFocus,
-                                                      segmentation: segmentationOn, depthSourceLabel: nil),
+                                                      segmentation: segmentationOn, depthSourceLabel: nil,
+                                                      glassesMatte: glassesRaw?.centerCropped(by: Float(c))),
                                                 mark: mark)
             // 没有深度（光线太暗、AI 模型没准备好）：整张图当作在对焦面上
             let hasDepth = disparity != nil
@@ -1804,9 +1853,11 @@ extension DepthCameraController: AVCapturePhotoCaptureDelegate {
             }
             if dumpDebug {
                 let gainForDump = alignedGain
+                // 和交给编辑器的图、视差一样按倍率从中间裁
+                let mattesForDump = appleMattes.mapValues { $0.centerCropped(by: Float(c)) }
                 DispatchQueue.global(qos: .utility).async {
                     let zip = PhotoDebugDump.save(photo: captured, fileData: fileData, metadata: photoMetadata,
-                                                  info: dumpInfo, gainMap: gainForDump)
+                                                  info: dumpInfo, gainMap: gainForDump, appleMattes: mattesForDump)
                     DispatchQueue.main.async {
                         guard let zip, !self.isDebugRecording else { return }
                         self.debugRecordingZip = zip

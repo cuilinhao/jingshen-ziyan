@@ -35,15 +35,23 @@ final class GlassesBandTests: XCTestCase {
 
     /// Vision 那样的软边遮罩（480×360）：人里面 1；外面按离人的距离 d（遮罩像素）是 0.5 − d / 20，镜片外半截在 0.5 外面。
     /// wrapStrap：肩带也在软边里（0.3），和 Vision 在录制里给的一样
-    static func softMask(wrapStrap: ((Float, Float) -> Bool)? = nil) -> FloatMap {
+    /// lensInMask：镜片在 0.5 那条线里面（0.6），离人近的软边从镜片边上量起（rec-20261109-182630 里 Vision 的样子）
+    static func softMask(wrapStrap: ((Float, Float) -> Bool)? = nil, lensInMask: Bool = false) -> FloatMap {
         let w = 480, h = 360
         var inside = [Bool](repeating: false, count: w * h)
-        for y in 0..<h { for x in 0..<w where isBody((Float(x) + 0.5) / Float(w), (Float(y) + 0.5) / Float(h)) { inside[y * w + x] = true } }
+        for y in 0..<h { for x in 0..<w {
+            let nx = (Float(x) + 0.5) / Float(w), ny = (Float(y) + 0.5) / Float(h)
+            if isBody(nx, ny) || (lensInMask && lens(nx, ny)) { inside[y * w + x] = true }
+        } }
         var v = [Float](repeating: 0, count: w * h)
         let R = 10
         for y in 0..<h {
             for x in 0..<w {
-                if inside[y * w + x] { v[y * w + x] = 1; continue }
+                if inside[y * w + x] {
+                    let nx = (Float(x) + 0.5) / Float(w), ny = (Float(y) + 0.5) / Float(h)
+                    v[y * w + x] = isBody(nx, ny) ? 1 : 0.6
+                    continue
+                }
                 var best = Float.infinity
                 for yy in max(0, y - R)...min(h - 1, y + R) {
                     for xx in max(0, x - R)...min(w - 1, x + R) where inside[yy * w + xx] {
@@ -63,17 +71,40 @@ final class GlassesBandTests: XCTestCase {
     /// 人脸框（正立方向，左上角为原点）：脸前沿 0.40，眉毛到下巴
     static let face = FaceBand.Face(x: 0.40, y: 0.20, width: 0.15, height: 0.35)
 
-    static func scene(focusOnPerson: Bool, band: Bool, strap withStrap: ((Float, Float) -> Bool)? = nil) -> T.Scene {
+    /// 整截都在离脸不远处、直接挨着镜片的肩带（调试录制 rec-20261109-182630，2× 双摄）：眼镜带分不开，
+    /// 软边里离脸 cap 以内的都收，它就被拉清晰了。拍照时有 Apple 的眼镜遮罩就分得开
+    static let strapShort = T.rect(0.372, 0.385, 0.285, 0.315)
+
+    /// Apple 拍照时给的眼镜遮罩（AVSemanticSegmentationMatte .glasses，照片一半分辨率），照拍照调试包
+    /// photo-20261110-095906 的样子：镜片上 0.45～0.6，周围一圈 0.1～0.2 的毛边，贴着镜片的背景里的东西 ≤ 0.2
+    static func glassesMatte() -> FloatMap {
+        let w = 480, h = 360
+        var v = [Float](repeating: 0, count: w * h)
+        let x0 = Int(0.385 * Float(w)), x1 = Int(0.40 * Float(w)), y0 = Int(0.30 * Float(h)), y1 = Int(0.335 * Float(h))
+        for y in 0..<h {
+            for x in 0..<w {
+                let dx = max(x0 - x, 0, x - (x1 - 1)), dy = max(y0 - y, 0, y - (y1 - 1))
+                let d = max(dx, dy)
+                v[y * w + x] = d == 0 ? 0.55 : (d <= 3 ? 0.18 : 0)
+            }
+        }
+        return FloatMap(width: w, height: h, values: v)
+    }
+
+    /// lensZ：镜片里测到的深度。3 = LiDAR 穿过镜片测到后面的墙；1.2 = 双摄在镜框上测得出镜片（rec-20261109-182630）
+    static func scene(focusOnPerson: Bool, band: Bool, strap withStrap: ((Float, Float) -> Bool)? = nil,
+                      glasses: Bool = false, lensZ: Float = 3, lensInMask: Bool = false) -> T.Scene {
         T.Scene(layers: [
             T.Layer(name: "墙", z: 3, color: T.flat(0.82, 0.82, 0.80), inside: { _, _ in true }),
             T.Layer(name: "椅子", z: 1.2, color: T.flat(0.2, 0.2, 0.22), inside: T.rect(0.68, 0.85, 0.4, 0.95)),
             T.Layer(name: "肩带", z: 3.2, color: strapColor, inside: withStrap ?? { _, _ in false }),
-            T.Layer(name: "镜片", z: 3, color: lensColor, inside: lens),
+            T.Layer(name: "镜片", z: lensZ, color: lensColor, inside: lens),
             T.Layer(name: "人", z: 1.2, color: { _, iy in Float(iy) / 720 < 0.22 ? (0.03, 0.03, 0.035) : (0.62, 0.45, 0.36) },
                     inside: { x, y in isBody(x, y) }, person: true),
         ], focus: focusOnPerson ? (0.47, 0.4) : (0.76, 0.6),
-           personMaskOverride: softMask(wrapStrap: withStrap),
-           faceBand: band ? FaceBand.map([face], width: 480, height: 360) : nil)
+           personMaskOverride: softMask(wrapStrap: withStrap, lensInMask: lensInMask),
+           faceBand: band ? FaceBand.map([face], width: 480, height: 360) : nil,
+           glassesMatte: glasses ? glassesMatte() : nil)
     }
 
     /// 镜框（深色那一圈）的虚化中位数
@@ -122,6 +153,43 @@ final class GlassesBandTests: XCTestCase {
                 }
             }
         }
+    }
+
+    /// 拍照有 Apple 的眼镜遮罩时用它代替眼镜带：镜片（在眼镜遮罩里）清晰，挨着镜片的肩带（不在里面，深度在后面）照常虚化。
+    /// 只有眼镜带时两种测法各有一个分不开（场景要能复现问题）：
+    ///  - 双摄测得出镜片（镜片 ≈ 脸的深度，Vision 也把镜片算进 0.5 里）：整截肩带都在离人 cap 以内，软边里的都收，
+    ///    肩带被拉清晰（rec-20261109-182630）
+    ///  - LiDAR 把镜片测成后面的墙：肩带顺着软边连到镜片上，镜片跟着不收，镜框被虚化（已知问题）
+    func testPhotoGlassesMatteSeparatesLensFromStrap() {
+        let e: Float = 1.0 / 240
+        for lensZ: Float in [1.2, 3] {
+            for onPerson in [true, false] {
+                let name = (lensZ < 2 ? "双摄" : "LiDAR") + (onPerson ? "，对焦在人身上" : "，对焦在旁边一样远的椅子上")
+                func measure(_ s: T.Scene) -> (strap: (actual: Float, ideal: Float, sharp: Float, n: Int), rim: Float) {
+                    let r = T.render(s, live: false)
+                    return (r.stats({ x, y in Self.strapShort(x, y) && x < 0.385 - e }), Self.rimBlur(r))
+                }
+                let inMask = lensZ < 2
+                let band = measure(Self.scene(focusOnPerson: onPerson, band: true, strap: Self.strapShort,
+                                              lensZ: lensZ, lensInMask: inMask))
+                let glasses = measure(Self.scene(focusOnPerson: onPerson, band: true, strap: Self.strapShort,
+                                                 glasses: true, lensZ: lensZ, lensInMask: inMask))
+                print(String(format: "拍照 %@：只有眼镜带 肩带被拉清晰 %.0f%%、镜框 %.2f%%；有眼镜遮罩 肩带 %.2f%%（应 %.2f%%，被拉清晰 %.0f%%）、镜框 %.2f%%",
+                             name, band.strap.sharp * 100, band.rim, glasses.strap.actual, glasses.strap.ideal,
+                             glasses.strap.sharp * 100, glasses.rim))
+                XCTAssertGreaterThan(band.strap.n, 10)
+                XCTAssertTrue(band.strap.sharp > 0.3 || band.rim > 0.15,
+                              "\(name)：场景要能复现问题（只有眼镜带时肩带被拉清晰，或者镜框被虚化）")
+                XCTAssertLessThan(glasses.strap.sharp, 0.05, "\(name)：不在眼镜遮罩里、深度在后面的肩带要按深度虚化")
+                XCTAssertLessThan(glasses.rim, 0.15, "\(name)：眼镜遮罩里的镜框要清晰")
+            }
+        }
+        // 眼镜遮罩以外的软边不算人（眼镜遮罩的毛边也不算）：头顶、额头外面那圈墙照旧糊
+        let r = T.render(Self.scene(focusOnPerson: true, band: true, glasses: true), live: false)
+        let halo = r.stats({ x, y in
+            (T.rect(0.38, 0.40, 0.15, 0.24)(x, y) || T.rect(0.40, 0.55, 0.13, 0.15)(x, y)) && !Self.isBody(x, y)
+        })
+        XCTAssertLessThan(halo.sharp, 0.05)
     }
 
     func testFaceBandGeometry() throws {

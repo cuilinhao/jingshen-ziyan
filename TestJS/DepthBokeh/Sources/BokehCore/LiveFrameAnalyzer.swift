@@ -900,13 +900,14 @@ public final class LiveFrameAnalyzer {
         return FloatMap(width: w, height: h, values: out)
     }
 
-    /// 拍下来的照片：没有时间历史，对焦点直接取中位数
+    /// 拍下来的照片：没有时间历史，对焦点直接取中位数。
+    ///  - glassesMatte：Apple 拍照时给的眼镜遮罩（和照片对齐、裁好，任意分辨率）。有它就不用 faceBand 去猜伸出脸外的眼镜
     public static func stillPlan(disparity: FloatMap, relativeDepth: Bool, colors: PlanarImage?, fNumber: Float,
                                  focusPoint: (x: Float, y: Float), personMask: FloatMap?, outputLongSide: Int,
                                  settings: Settings, objectLabels: FloatMap? = nil,
                                  personInstances: FloatMap? = nil, focalLength35mm: Float? = nil,
                                  lockedFocusDisparity: Float? = nil, highlightExclusion: FloatMap? = nil,
-                                 faceBand: FloatMap? = nil) -> FramePlan {
+                                 faceBand: FloatMap? = nil, glassesMatte: FloatMap? = nil) -> FramePlan {
         var map = DepthRefiner.fillInvalid(disparity, guide: colors)
         let lowLongSide = max(320, outputLongSide / max(1, settings.blurDownscale))
         // 拍照时锁定了对焦：用锁定的距离（重新构图以后对焦点上可能已经是别的东西）
@@ -933,13 +934,24 @@ public final class LiveFrameAnalyzer {
             let c = colors.map { $0.width == map.width && $0.height == map.height
                 ? $0 : $0.resized(width: map.width, height: map.height) }
             var person = personMask
-            // 眼镜带里人像遮罩的软边也算人（同 analyze）
             let band = edgeBand(map, relative: relativeDepth, matte: matte)
             var accessories: FloatMap?
-            if let pm = person, let fb = faceBand,
-               let added = SubjectMatte.accessories(pm, faceBand: fb, depth: map, lens: lens, parameters: matte, band: band) {
-                person = SubjectMatte.withAccessories(pm, adding: added)
-                accessories = added
+            if let pm = person {
+                // 伸出脸外的眼镜算人：有 Apple 的眼镜遮罩就用它（SubjectMatte.glassesAccessories），
+                // 没有才用眼镜带里离脸不远的软边去猜（同 analyze）
+                let added: FloatMap?
+                if let gm = glassesMatte {
+                    added = SubjectMatte.glassesAccessories(gm, person: pm, width: map.width, height: map.height,
+                                                            parameters: matte, band: band)
+                } else if let fb = faceBand {
+                    added = SubjectMatte.accessories(pm, faceBand: fb, depth: map, lens: lens, parameters: matte, band: band)
+                } else {
+                    added = nil
+                }
+                if let added {
+                    person = SubjectMatte.withAccessories(pm, adding: added)
+                    accessories = added
+                }
             }
             // 按人像遮罩修深度边缘（同 analyze）
             if let pm = person {

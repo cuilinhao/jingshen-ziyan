@@ -15,13 +15,16 @@ import BokehCore
 ///  - disparity.pfm：交给编辑器的视差；person.pfm / people.pfm / objects.pfm：人像遮罩、人像实例、物体分割（有才写）；
 ///    faces.pfm：眼镜带（FaceBand，有人脸才写）
 ///  - gainmap.pfm：对齐、裁好的 HDR 增益图；highlightExclusion.pfm：按它算出来的「不做焦外高光提亮」的亮区（有才写）
+///  - apple-portrait.pfm、apple-glasses.pfm、apple-hair.pfm……：Apple 拍照时算的人像遮罩和语义遮罩（相机给了才写，
+///    一般是照片一半的分辨率，已按倍率裁好）。只用来和我们自己的分割对比，不参与渲染
 ///  - photo.json：机型、系统、拍照那一刻的相机状态（格式、色彩空间、曝光模式 / ISO / 快门 / 曝光偏差、测光点）、
 ///    对焦点 / ƒ / 焦段 / 裁切、编辑器参数、照片元数据（EXIF、MakerApple）、照片里带哪些辅助图、图像亮度统计
 enum PhotoDebugDump {
 
     /// 写调试包并打成 zip。返回 zip 的位置；写不了返回 nil。在后台队列上调用（整张照片的统计要几十毫秒）
     static func save(photo: CapturedDepthPhoto, fileData: Data?, metadata: [String: Any],
-                     info: [String: Any], gainMap: FloatMap? = nil) -> URL? {
+                     info: [String: Any], gainMap: FloatMap? = nil,
+                     appleMattes: [String: FloatMap] = [:]) -> URL? {
         let f = DateFormatter()
         f.dateFormat = "yyyyMMdd-HHmmss"
         let folder = DebugRecorder.root.appendingPathComponent("photo-" + f.string(from: Date()), isDirectory: true)
@@ -42,6 +45,10 @@ enum PhotoDebugDump {
         if let m = photo.highlightExclusion {
             DebugRecorder.writePFM(m, to: folder.appendingPathComponent("highlightExclusion.pfm"))
         }
+        // Apple 拍照时算的遮罩（人像遮罩、眼镜 / 头发 / 皮肤……），已按倍率裁好，只用来和我们的分割对比
+        for (name, m) in appleMattes {
+            DebugRecorder.writePFM(m, to: folder.appendingPathComponent("apple-\(name).pfm"))
+        }
 
         var meta = info
         meta["image"] = ["width": photo.image.width, "height": photo.image.height]
@@ -49,6 +56,9 @@ enum PhotoDebugDump {
         meta["stats"] = stats(photo.image)
         meta["auxiliaryImages"] = auxiliaryTypes(fileData)
         if let g = gainMap { meta["gainMapSize"] = [g.width, g.height] }
+        meta["appleMattes"] = appleMattes.mapValues { [$0.width, $0.height] }
+        // 编辑器用的是眼镜遮罩（apple-glasses.pfm）还是眼镜带（faces.pfm）
+        meta["glassesMatteUsed"] = photo.glassesMatte != nil
         meta["photoMetadata"] = jsonSafe(metadata)
         let safe = jsonSafe(meta)
         if JSONSerialization.isValidJSONObject(safe),
@@ -119,9 +129,24 @@ enum PhotoDebugDump {
         var types: [(String, CFString)] = [("hdrGainMap", kCGImageAuxiliaryDataTypeHDRGainMap),
                                            ("disparity", kCGImageAuxiliaryDataTypeDisparity),
                                            ("depth", kCGImageAuxiliaryDataTypeDepth),
-                                           ("portraitMatte", kCGImageAuxiliaryDataTypePortraitEffectsMatte)]
+                                           ("portraitMatte", kCGImageAuxiliaryDataTypePortraitEffectsMatte),
+                                           ("hairMatte", kCGImageAuxiliaryDataTypeSemanticSegmentationHairMatte),
+                                           ("skinMatte", kCGImageAuxiliaryDataTypeSemanticSegmentationSkinMatte),
+                                           ("teethMatte", kCGImageAuxiliaryDataTypeSemanticSegmentationTeethMatte),
+                                           ("glassesMatte", kCGImageAuxiliaryDataTypeSemanticSegmentationGlassesMatte)]
         if #available(iOS 18.0, *) { types.append(("isoGainMap", kCGImageAuxiliaryDataTypeISOGainMap)) }
         return types.compactMap { CGImageSourceCopyAuxiliaryDataInfoAtIndex(src, 0, $0.1) != nil ? $0.0 : nil }
+    }
+
+    /// 语义遮罩类型的短名字（文件名、photo.json 用）
+    static func matteName(_ type: AVSemanticSegmentationMatte.MatteType) -> String {
+        switch type {
+        case .hair: return "hair"
+        case .skin: return "skin"
+        case .teeth: return "teeth"
+        case .glasses: return "glasses"
+        default: return type.rawValue.replacingOccurrences(of: "AVSemanticSegmentationMatteType", with: "").lowercased()
+        }
     }
 
     static func writePNG(_ cg: CGImage, to url: URL) {

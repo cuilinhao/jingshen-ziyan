@@ -38,6 +38,8 @@ enum StillPhotoBuilder {
         var segmentation: Bool
         /// 编辑器里显示的深度来源（「照片自带深度」「AI 深度」）；相机拍的为 nil
         var depthSourceLabel: String?
+        /// Apple 拍照时给的眼镜遮罩（和 image 同方向、同一块画面）；没有为 nil
+        var glassesMatte: FloatMap? = nil
     }
 
     struct Output {
@@ -69,7 +71,8 @@ enum StillPhotoBuilder {
         let segment = input.disparity != nil && input.segmentation
         let person = segment ? PersonSegmenter.photoMask(cg, orientation: o) : nil
         mark("人像分割")
-        // 眼镜带：人脸框里眼睛那一条，伸出脸外的镜片在这里按人像遮罩的软边算人（FaceBand）
+        // 眼镜带：人脸框里眼睛那一条，伸出脸外的镜片在这里按人像遮罩的软边算人（FaceBand）。
+        // 相机给了眼镜遮罩时编辑器用眼镜遮罩，眼镜带照样算（拍照调试包里对比用）
         let faceBand = person != nil ? PersonSegmenter.photoFaceBand(cg, orientation: o) : nil
         mark("人脸")
         // 人像实例：画面上和对焦的人挨着的别人（后面站着的同事）不跟着保持清晰
@@ -87,6 +90,7 @@ enum StillPhotoBuilder {
                                        highlightExclusion: exclusion)
         photo.depthSourceLabel = input.depthSourceLabel
         photo.faceBand = faceBand
+        photo.glassesMatte = person != nil ? input.glassesMatte : nil
         return Output(photo: photo, alignedGain: alignedGain)
     }
 }

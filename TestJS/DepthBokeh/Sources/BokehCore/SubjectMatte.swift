@@ -64,6 +64,9 @@ public struct SubjectMatteParameters: Equatable {
     /// 眼镜带里的软边最多收到离人多远（眼镜带宽的比例，约脸宽的 10%；不小于修边的带子）：镜片伸出脸外不会太远，
     /// 再往外的软边交给深度（SubjectMatte.accessories）
     public var accessoryReach: Float = 0.06
+    /// 拍照时 Apple 给的眼镜遮罩（AVSemanticSegmentationMatte .glasses）到多少算眼镜（SubjectMatte.glassesAccessories）。
+    /// 拍照调试包 photo-20261110-095906：镜片上 0.45～0.6，镜框四周的毛边和贴着镜片的背景里的东西 ≤ 0.2
+    public var glassesThreshold: Float = 0.3
 
     public init() {}
 }
@@ -640,6 +643,58 @@ public enum SubjectMatte {
             if let z = dropZone, z[i] > 0 { continue }
             out[i] = 1
             any = true
+        }
+        return any ? FloatMap(width: w, height: h, values: out) : nil
+    }
+
+    /// 拍照时 Apple 的眼镜遮罩里的眼镜：伸出脸外的镜片、镜框（w×h，0/1，交给 withAccessories 和修边）；没有返回 nil。
+    ///
+    /// 有它就不用眼镜带（accessories）去猜：眼镜带只知道「眼睛那一条、离脸不远的软边」，软边里分不出是镜片还是
+    /// 贴着镜片的背景里的东西。双摄测得出镜片时，整截都在离脸不远处的肩带被拉清晰（调试录制 rec-20261109-182630）；
+    /// LiDAR 把镜片测成后面的墙时，肩带顺着软边连到镜片上，镜片跟着被虚化。眼镜遮罩是 Apple 拍照时专门认眼镜的，
+    /// 镜片、镜框在里面，肩带不在里面。
+    /// 只有眼镜是例外（深度测不准透明的镜片，这里信眼镜遮罩），别的照旧先看深度：不在眼镜遮罩里的软边交给深度和修边。
+    ///  - 到 glassesThreshold 才算眼镜（去掉毛边）；
+    ///  - 只要戴在人身上的：连通块要碰到离人（遮罩 > 0.5）band 以内（画面里别人的眼镜随那个人一起交给实例和深度）
+    /// - Parameters:
+    ///   - glasses: Apple 的眼镜遮罩（任意分辨率，和照片对齐、裁好）
+    ///   - person: 人像遮罩（软边，任意分辨率）
+    ///   - band: 修边的带子宽度（w×h 上的像素）
+    public static func glassesAccessories(_ glasses: FloatMap, person: FloatMap, width w: Int, height h: Int,
+                                          parameters p: SubjectMatteParameters, band: Int) -> FloatMap? {
+        let n = w * h
+        guard p.glassesThreshold > 0, n > 0 else { return nil }
+        let g = glasses.width == w && glasses.height == h ? glasses.values : glasses.resized(width: w, height: h).values
+        let m = person.width == w && person.height == h ? person.values : person.resized(width: w, height: h).values
+        var isGlasses = [Bool](repeating: false, count: n)
+        var inside = [Float](repeating: 0, count: n)
+        for i in 0..<n {
+            if g[i] >= p.glassesThreshold { isGlasses[i] = true }
+            if m[i] > 0.5 { inside[i] = 1 }
+        }
+        guard isGlasses.contains(true) else { return nil }
+        let near = dilateBinary(inside, width: w, height: h, radius: max(1, band))
+        var out = [Float](repeating: 0, count: n)
+        var seen = [Bool](repeating: false, count: n)
+        var any = false
+        for start in 0..<n where isGlasses[start] && !seen[start] {
+            var members = [start]
+            seen[start] = true
+            var k = 0, worn = false
+            while k < members.count {
+                let i = members[k]; k += 1
+                if near[i] > 0 { worn = true }
+                let x = i % w, y = i / w
+                for (q, ok) in [(i - 1, x > 0), (i + 1, x < w - 1), (i - w, y > 0), (i + w, y < h - 1)]
+                where ok && isGlasses[q] && !seen[q] {
+                    seen[q] = true
+                    members.append(q)
+                }
+            }
+            if worn {
+                for i in members { out[i] = 1 }
+                any = true
+            }
         }
         return any ? FloatMap(width: w, height: h, values: out) : nil
     }

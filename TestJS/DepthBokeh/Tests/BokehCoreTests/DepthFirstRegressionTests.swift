@@ -45,6 +45,8 @@ final class DepthFirstRegressionTests: XCTestCase {
         var personMaskOverride: FloatMap? = nil
         /// 眼镜带（FaceBand，0/1）
         var faceBand: FloatMap? = nil
+        /// Apple 拍照时给的眼镜遮罩（只有拍照才有）
+        var glassesMatte: FloatMap? = nil
 
         static let iw = 960, ih = 720, dw = 240, dh = 180
 
@@ -150,7 +152,7 @@ final class DepthFirstRegressionTests: XCTestCase {
         let plan = LiveFrameAnalyzer.stillPlan(
             disparity: disparity, relativeDepth: false, colors: image.resized(width: dw, height: dh), fNumber: 1.4,
             focusPoint: s.focus, personMask: person, outputLongSide: iw, settings: settings, objectLabels: objects,
-            personInstances: instances, focalLength35mm: 24, faceBand: s.faceBand)
+            personInstances: instances, focalLength35mm: 24, faceBand: s.faceBand, glassesMatte: s.glassesMatte)
         let renderer = BokehRenderer()
         renderer.captureDebugMaps = true
         let hint = plan.seeds.map { SubjectHint(point: plan.focusPoint, parameters: plan.matte, seeds: $0) }
