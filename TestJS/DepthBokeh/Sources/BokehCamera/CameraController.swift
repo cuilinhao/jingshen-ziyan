@@ -141,7 +141,7 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
     /// 相机界面右上角「发送数据」AirDrop 到 Mac。排查成片过曝（录屏 0.5x-baoguang）用；每张约 20–40 MB，查完关掉。
     /// 打开时还会向相机要 Apple 的人像遮罩和语义遮罩（眼镜、头发……）一起存进包里（不参与渲染）；
     /// 要在相机配置（启动、换镜头）之前打开才生效
-    public var savePhotoDebug = true
+    public var savePhotoDebug = false
     /// 换相机时新相机已经出画面、深度还没到：先显示没虚化的新画面（画面不停住），深度到了 0.2 秒淡入虚化。
     /// false = 以前的做法：一直停在上一帧，等新相机出帧并且深度到了（最多 0.8 秒）再淡入
     public var previewBeforeDepth = true
