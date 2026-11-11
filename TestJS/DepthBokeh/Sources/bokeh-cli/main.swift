@@ -185,6 +185,13 @@ if args.first == "--live" {
             if let m = pipeline.temporal.debugUnreliable { try writePFM(m, dbg + "_u.pfm") }
             if let m = pipeline.renderer.debugMatte { try writePFM(m, dbg + "_matte.pfm") }
             if let m = pipeline.renderer.debugWeights { try writePFM(m, dbg + "_w.pfm") }
+            // 分析这一步的结果（深度图分辨率）：修过边的深度和三张主体种子
+            if let plan = pipeline.lastPlan {
+                try writePFM(plan.depth, dbg + "_plan.pfm")
+                if let m = plan.seeds?.connect { try writePFM(m, dbg + "_connect.pfm") }
+                if let m = plan.seeds?.extra { try writePFM(m, dbg + "_extra.pfm") }
+                if let m = plan.seeds?.person { try writePFM(m, dbg + "_person.pfm") }
+            }
         }
         if let out = job["out"] as? String, !out.isEmpty { try writePPM(r.image, out) }
         var info: [String: Any] = ["out": job["out"] as? String ?? "", "w": r.image.width, "h": r.image.height,
