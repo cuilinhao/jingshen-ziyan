@@ -174,6 +174,8 @@ public final class LiveFrameAnalyzer {
     private var previousLumaSize = (0, 0)
     /// 上一帧的裁切比例：裁得不一样，上一帧的深度就没法直接和这一帧对齐
     private var lastCrop: Float?
+    /// 没经过系统滤波的深度在补洞之前的跨帧稳定（只在洞多的时候起作用）
+    public let depthHistory = DepthHistory()
     /// 上一次选出来的物体（已裁切、缩放到深度图大小）和那一帧的小图（已裁切）。标签图没更新、对焦点和裁切没变时直接用
     private var objectCache: (revision: Int, point: (Float, Float), crop: Float, w: Int, h: Int,
                               mask: FloatMap?, colors: PlanarImage?)?
@@ -197,6 +199,7 @@ public final class LiveFrameAnalyzer {
         previousLuma = []
         previousLumaSize = (0, 0)
         lastCrop = nil
+        depthHistory.reset()
         objectCache = nil
         personInstanceCache = nil
     }
@@ -204,7 +207,7 @@ public final class LiveFrameAnalyzer {
     public func analyze(_ frame: Frame) -> FramePlan {
         let c = max(frame.crop, 1)
         var depthAge = max(0, frame.depthAge)
-        if let lc = lastCrop, abs(lc - c) > 0.002 * c { depthAge = 0 }
+        if let lc = lastCrop, abs(lc - c) > 0.002 * c { depthAge = 0; depthHistory.reset() }
         if lastCrop == nil { depthAge = 0 }
         lastCrop = c
         var p = frame.focusPoint
@@ -215,8 +218,11 @@ public final class LiveFrameAnalyzer {
             recentered = true
         }
         let moving = frame.time < movingUntil
+        // 没经过系统滤波的深度（长焦双摄）每帧各测各的：补洞之前先跨帧稳定（DepthHistory），不然补出来的整片深度逐帧变
+        let measured = depthHistory.update(frame.disparity.centerCropped(by: c), colors: frame.colors,
+                                           fresh: depthAge == 0, relative: frame.relativeDepth)
         // 补洞按这一帧的颜色引导（长焦双摄不用系统滤波，白墙、屏幕上有成片的洞）
-        var map = DepthRefiner.fillInvalid(frame.disparity.centerCropped(by: c), guide: frame.colors)
+        var map = DepthRefiner.fillInvalid(measured, guide: frame.colors)
         let lowLongSide = max(160, frame.outputLongSide / max(1, settings.blurDownscale))
 
         // 1. 对焦（裁出来的画面坐标）。点按或回到中心时重新锁定；手机在动时变远也只坚持 0.3 秒。

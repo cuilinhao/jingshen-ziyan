@@ -125,6 +125,7 @@ if args.first == "--live" {
         if let v = job["tstrength"] as? Double { pipeline.temporal.strength = Float(v) }
         if let v = job["bstrength"] as? Double { pipeline.temporal.backgroundStrength = Float(v) }
         if let v = job["hold"] as? Double { pipeline.maxHoldOverride = v }
+        if let v = job["dhist"] as? Bool { pipeline.analyzer.depthHistory.enabled = v }
         let frame = try readPPMBytes(job["img"] as! String)
         let crop = Float(job["crop"] as? Double ?? 1)
         let longSide = job["long"] as? Int ?? 1440
