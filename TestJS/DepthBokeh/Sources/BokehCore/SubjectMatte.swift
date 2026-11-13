@@ -108,14 +108,17 @@ public struct SubjectSeeds {
     /// 这里颜色补边不补，彩色引导滤波的 α 不能超过深度核心（只有深度能把它拉回对焦面），见 SubjectMatte.colorBlock。
     /// nil = 不限制（对焦的不是人，或者没有人像遮罩）
     public var colorBlock: FloatMap?
+    /// 拍照眼镜中可信的透射背景：与主体保护分开，在最终深度修正后恢复。
+    public var transmission: GlassesTransmission?
 
     public init(connect: FloatMap? = nil, extra: FloatMap? = nil, person: FloatMap? = nil, people: FloatMap? = nil,
-                colorBlock: FloatMap? = nil) {
+                colorBlock: FloatMap? = nil, transmission: GlassesTransmission? = nil) {
         self.connect = connect
         self.extra = extra
         self.person = person
         self.people = people
         self.colorBlock = colorBlock
+        self.transmission = transmission
     }
 }
 
@@ -272,6 +275,13 @@ public enum SubjectMatte {
                 v += leak * (farNearby[i] - v)
             }
             out[i] = v
+        }
+        if let transmission = seeds.transmission {
+            let t = transmission.sampled(width: w, height: h)
+            for i in 0..<n where t.mask[i] > 0 && t.disparity[i] > 0 {
+                out[i] += t.mask[i] * (t.disparity[i] - out[i])
+                alpha[i] *= 1 - t.mask[i]
+            }
         }
         return (FloatMap(width: w, height: h, values: out), FloatMap(width: w, height: h, values: alpha))
     }
@@ -832,7 +842,8 @@ public enum SubjectMatte {
     /// AI 单目深度把眼镜看成脸的一部分：在眼镜那一块单独跑一次，镜片是完整的一片、和脸一样近，背景是远的。所以：
     ///  1. 这一块里，人身上（遮罩 > 0.95）和背景（遮罩 < 0.02）的 AI 深度各取中位数，中间按比例算「离人多近」；
     ///     人不比背景近（模型没分出来）就不用它；
-    ///  2. 候选：离人够近（> localDepthNear）、人像遮罩没收进去（≤ 0.5）、离眼镜（眼镜遮罩 ≥ glassesThreshold）不远的地方；
+    ///  2. 候选：离人够近（> localDepthNear）、人像归属不够可靠（< 0.95）、离眼镜不远的地方；
+    ///     0.5～0.95 的镜片也可能拿到错误远深度，需要整片加入 untrusted 修复，不能因为已经算人而跳过。
     ///  3. 人的轮廓外面一圈也会被 AI 深度算近（它的边缘比人像遮罩软）：开运算去掉这种细边，只留成块的；
     ///  4. 只要挨着眼镜（眼镜遮罩 ≥ glassesThreshold）的块：是镜片没收全的那部分。
     /// - Parameters:
@@ -899,7 +910,7 @@ public enum SubjectMatte {
         for y in ry0...ry1 {
             for x in rx0...rx1 {
                 let i = y * w + x
-                if a[i] > nearAbove && m[i] <= 0.5 { candidate[i] = 1; any = true }
+                if a[i] > nearAbove && m[i] < 0.95 { candidate[i] = 1; any = true }
             }
         }
         guard any else { return nil }

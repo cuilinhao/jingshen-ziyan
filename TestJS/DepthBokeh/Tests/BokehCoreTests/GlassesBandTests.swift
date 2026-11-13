@@ -323,6 +323,22 @@ final class GlassesBandTests: XCTestCase {
                                                       parameters: p))
     }
 
+    func testLocalDepthRepairsLensWithWeakPersonMembership() throws {
+        let w = 160, h = 120
+        var g = FloatMap(width: w, height: h), m = g
+        var a = FloatMap(width: w, height: h, repeating: 0.1)
+        for y in 0..<h { for x in 80..<w { m[x, y] = 1; a[x, y] = 0.9 } }
+        for y in 40..<70 { for x in 52..<80 {
+            // 镜片已在弱人像里，但 Apple 眼镜遮罩没有完整覆盖。仍需作为不可信深度修复。
+            m[x, y] = 0.6; g[x, y] = (x < 55 || y < 43) ? 0.9 : 0.1; a[x, y] = 0.8
+        } }
+        let local = LocalDepth(map: a, x0: 0, y0: 0, x1: 1, y1: 1)
+        let added = SubjectMatte.glassesByLocalDepth(local, glasses: g, person: m,
+            width: w, height: h, parameters: .init())
+        XCTAssertEqual(added?[65, 55], 1, "0.6 的弱人像归属不代表深度正确，AI 眼镜补漏仍应覆盖内部")
+        XCTAssertEqual(added?[110, 55] ?? 0, 0, "可靠脸部不用重新当作眼镜补区")
+    }
+
     /// 只给了画面的一块（拍照时就是这样：眼镜周围一块）：结果只在这一块里，位置要对得上
     func testGlassesLocalDepthCropPlacement() throws {
         let w = 160, h = 120

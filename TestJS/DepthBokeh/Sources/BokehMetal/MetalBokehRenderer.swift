@@ -76,7 +76,7 @@ public final class MetalBokehRenderer {
         "downsampleKernel", "boxHKernel", "boxVKernel", "minHKernel", "minVKernel",
         "upsampleDepthKernel", "gfPrepareGrayKernel", "gfCoeffGrayKernel", "gfApplyGrayKernel",
         "temporalDepthKernel", "subjectCoreKernel", "gfPrepareColorKernel", "gfCoeffColorKernel",
-        "gfApplyColorKernel", "subjectFixKernel", "cocKernel", "boostKernel", "layerTilesKernel",
+        "gfApplyColorKernel", "subjectFixKernel", "glassesTransmissionKernel", "cocKernel", "boostKernel", "layerTilesKernel",
         "dilateTilesKernel", "layerPrefixKernel", "layerDiskKernel", "layerUpsampleKernel",
         "layerDirectKernel", "clearKernel", "clearUIntKernel", "pullKernel", "pushTopKernel", "pushKernel",
         "finishBokehKernel", "defocusWeightKernel", "stabilizeBokehKernel", "compositeKernel",
@@ -181,6 +181,15 @@ public final class MetalBokehRenderer {
         let blockTex = seeds?.colorBlock.map { slot.upload($0, into: \.colorBlock, device: device) }
         // 所有人的遮罩：人身上不做焦外高光提亮（CPU 版 render 的 highlightExclusion）
         let peopleTex = seeds?.people.map { slot.upload($0, into: \.people, device: device) }
+        let transmissionTex = seeds?.transmission.map { transmission -> (mask: MTLTexture, weightedDepth: MTLTexture) in
+            let mask = transmission.mask
+            let disparity = transmission.disparity.resized(width: mask.width, height: mask.height)
+            // 先预乘再插值：遮罩外的近深度不能污染镜片内的背景，与 GlassesTransmission.sampled 一致。
+            let weighted = FloatMap(width: mask.width, height: mask.height,
+                                    values: zip(mask.values, disparity.values).map { $0 * $1 })
+            return (slot.upload(mask, into: \.transmissionMask, device: device),
+                    slot.upload(weighted, into: \.transmissionDepth, device: device))
+        }
 
         var gpuLens = GPULens(lens, longSide: L)
         let centers = plan.layerCenters
@@ -331,6 +340,17 @@ public final class MetalBokehRenderer {
             }
             depthCur = fixed
             matte = ws.alpha
+            if let transmissionTex {
+                // 主体修正结束后，core/depthCore 不再使用；复用为输出，避免纹理读写别名，
+                // 同时保留 refinedDepth 调试纹理及跨帧深度历史。
+                run(enc, "glassesTransmissionKernel", lw, lh) { e in
+                    e.setTexture(fixed, index: 0); e.setTexture(ws.alpha, index: 1)
+                    e.setTexture(transmissionTex.mask, index: 2); e.setTexture(transmissionTex.weightedDepth, index: 3)
+                    e.setTexture(ws.depthCore, index: 4); e.setTexture(ws.core, index: 5)
+                }
+                depthCur = ws.depthCore
+                matte = ws.core
+            }
         }
 
         // ---- 5. 模糊半径、分层、高光 ----
@@ -775,6 +795,8 @@ final class UploadSlot {
     var person: MTLTexture?
     var people: MTLTexture?
     var colorBlock: MTLTexture?
+    var transmissionMask: MTLTexture?
+    var transmissionDepth: MTLTexture?
 
     func upload(_ map: FloatMap, into key: ReferenceWritableKeyPath<UploadSlot, MTLTexture?>, device: MTLDevice) -> MTLTexture {
         var t = self[keyPath: key]

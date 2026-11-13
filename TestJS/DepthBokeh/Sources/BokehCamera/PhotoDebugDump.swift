@@ -16,7 +16,7 @@ import BokehCore
 ///    faces.pfm：眼镜带（FaceBand，有人脸才写）
 ///  - gainmap.pfm：对齐、裁好的 HDR 增益图；highlightExclusion.pfm：按它算出来的「不做焦外高光提亮」的亮区（有才写）
 ///  - apple-portrait.pfm、apple-glasses.pfm、apple-hair.pfm……：Apple 拍照时算的人像遮罩和语义遮罩（相机给了才写，
-///    一般是照片一半的分辨率，已按倍率裁好）。只用来和我们自己的分割对比，不参与渲染
+///    一般是照片一半的分辨率，已按倍率裁好）。眼镜遮罩参与拍照渲染的眼镜归属与透射证据判定；其余用于分割对比
 ///  - photo.json：机型、系统、拍照那一刻的相机状态（格式、色彩空间、曝光模式 / ISO / 快门 / 曝光偏差、测光点）、
 ///    对焦点 / ƒ / 焦段 / 裁切、编辑器参数、照片元数据（EXIF、MakerApple）、照片里带哪些辅助图、图像亮度统计
 enum PhotoDebugDump {
@@ -45,7 +45,7 @@ enum PhotoDebugDump {
         if let m = photo.highlightExclusion {
             DebugRecorder.writePFM(m, to: folder.appendingPathComponent("highlightExclusion.pfm"))
         }
-        // Apple 拍照时算的遮罩（人像遮罩、眼镜 / 头发 / 皮肤……），已按倍率裁好，只用来和我们的分割对比
+        // Apple 拍照时算的遮罩，已按倍率裁好：眼镜遮罩参与拍照渲染，其余用于和我们的分割对比
         for (name, m) in appleMattes {
             DebugRecorder.writePFM(m, to: folder.appendingPathComponent("apple-\(name).pfm"))
         }

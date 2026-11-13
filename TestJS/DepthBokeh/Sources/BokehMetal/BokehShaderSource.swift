@@ -662,6 +662,42 @@ kernel void subjectFixKernel(texture2d<float, access::read> depth [[texture(0)]]
     outTex.write(float4(v, 0.0f, 0.0f, 0.0f), gid);
 }
 
+// 可信透射背景在主体保护之后恢复；mask 和预乘深度都按像素中心双线性采样。
+kernel void glassesTransmissionKernel(texture2d<float, access::read> depth [[texture(0)]],
+                                      texture2d<float, access::read> alpha [[texture(1)]],
+                                      texture2d<float, access::read> mask [[texture(2)]],
+                                      texture2d<float, access::read> weightedDepth [[texture(3)]],
+                                      texture2d<float, access::write> depthOut [[texture(4)]],
+                                      texture2d<float, access::write> alphaOut [[texture(5)]],
+                                      uint2 gid [[thread_position_in_grid]]) {
+    uint w = depthOut.get_width(), h = depthOut.get_height();
+    if (gid.x >= w || gid.y >= h) { return; }
+    float coverage = resampleTex(mask, gid, w, h).x;
+    float target = coverage > 1e-6f ? resampleTex(weightedDepth, gid, w, h).x / coverage : 0.0f;
+    if (w < mask.get_width() || h < mask.get_height()) {
+        // 点采样在缩小时会跳过细框；目标像素覆盖的源区域必须全部允许透射。
+        uint2 size = uint2(mask.get_width(), mask.get_height());
+        uint2 outSize = uint2(w, h);
+        uint2 first = gid * size / outSize;
+        uint2 last = ((gid + 1u) * size + outSize - 1u) / outSize - 1u;
+        for (uint y = first.y; y <= last.y; ++y) {
+            for (uint x = first.x; x <= last.x; ++x) {
+                coverage = min(coverage, mask.read(uint2(x, y)).x);
+            }
+        }
+    }
+    float t = clamp((coverage - 0.9f) / 0.1f, 0.0f, 1.0f);
+    float a = t * t * (3.0f - 2.0f * t);
+    float d = depth.read(gid).x;
+    float matte = alpha.read(gid).x;
+    if (a > 0.0f && target > 0.0f) {
+        d += a * (target - d);
+        matte *= 1.0f - a;
+    }
+    depthOut.write(float4(d, 0.0f, 0.0f, 0.0f), gid);
+    alphaOut.write(float4(matte, 0.0f, 0.0f, 0.0f), gid);
+}
+
 // ================================================================ 6. 模糊半径、分层位置、高光（BokehRenderer.render 1–3）
 
 struct LayerParams {

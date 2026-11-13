@@ -1026,7 +1026,7 @@ public final class LiveFrameAnalyzer {
     }
 
     /// 拍下来的照片：没有时间历史，对焦点直接取中位数。
-    ///  - glassesMatte：Apple 拍照时给的眼镜遮罩（和照片对齐、裁好，任意分辨率）。有它就不用 faceBand 去猜伸出脸外的眼镜
+    ///  - glassesMatte：Apple 拍照时给的眼镜遮罩（和照片对齐、裁好，任意分辨率），优先用它；双摄原始近深度可支持 faceBand 补漏
     ///  - glassesDepth：眼镜那一块单独跑的 AI 深度。眼镜遮罩没收全的镜片按它补上（SubjectMatte.glassesByLocalDepth）
     ///  - glassesFollowDepth：这张深度测得出镜框（双摄）。眼镜遮罩也先看深度：遮罩里深度在后面、又连着遮罩外面背景的
     ///    不算眼镜（眼镜遮罩会漏到贴着镜框的背景上）。LiDAR 穿过镜片测到后面的墙，分不出来，关着（只信眼镜遮罩）
@@ -1065,9 +1065,10 @@ public final class LiveFrameAnalyzer {
             var person = personMask
             let band = edgeBand(map, relative: relativeDepth, matte: matte)
             var accessories: FloatMap?
+            var transmission: GlassesTransmission?
             if let pm = person {
-                // 伸出脸外的眼镜算人：有 Apple 的眼镜遮罩就用它（SubjectMatte.glassesAccessories），
-                // 没有才用眼镜带里离脸不远的软边去猜（同 analyze）
+                // 伸出脸外的眼镜算人：优先 Apple 眼镜遮罩；局部 AI 与有原始近深度证据的眼镜带补漏。
+                // 没有 Apple 遮罩时，沿用眼镜带里离脸不远的软边（同 analyze）。
                 let added: FloatMap?
                 if let gm = glassesMatte {
                     var fromMatte = SubjectMatte.glassesAccessories(gm, person: pm, width: map.width, height: map.height,
@@ -1079,6 +1080,23 @@ public final class LiveFrameAnalyzer {
                                                                    height: map.height, parameters: matte) {
                         fromMatte = fromMatte.map { SubjectMatte.withAccessories($0, adding: more) } ?? more
                     }
+                    // Apple 和局部 AI 都会漏掉反光（photo-20261112-173241）。不能因此关闭眼镜带：
+                    // 已确认戴眼镜、对焦在人身上时，只补回双摄原始近深度支持的软人像，避免修边把它填成背景。
+                    // 远背景、填洞值均不能成为补入证据；原有 Apple / AI 接纳与透射规则继续生效。
+                    if fromMatte != nil, glassesFollowDepth, let fb = faceBand,
+                       focusOnPerson(allPeople: pm, focusedByInstance: false, point: focusPoint),
+                       var more = SubjectMatte.accessories(pm, faceBand: fb, depth: map, lens: lens,
+                                                           parameters: matte, band: band) {
+                        let near = lens.sharpDisparityRange(limit: 2 * matte.sharpLimit)
+                        // 小光圈的 CoC 范围会放宽到远背景；近深度证据必须另有与光圈无关的上限。
+                        let maxGap = 0.5 * matte.band * max(lens.relativeScale ?? lens.focusDisparity, 1e-3)
+                        for i in more.values.indices {
+                            let raw = disparity.values[i]
+                            if !raw.isFinite || raw <= 0 || raw < near.low || raw > near.high ||
+                               abs(raw - lens.focusDisparity) > maxGap { more.values[i] = 0 }
+                        }
+                        fromMatte = fromMatte.map { SubjectMatte.withAccessories($0, adding: more) }
+                    }
                     added = fromMatte
                 } else if let fb = faceBand {
                     added = SubjectMatte.accessories(pm, faceBand: fb, depth: map, lens: lens, parameters: matte, band: band)
@@ -1086,6 +1104,11 @@ public final class LiveFrameAnalyzer {
                     added = nil
                 }
                 if let added {
+                    if let gm = glassesMatte, let c,
+                       focusOnPerson(allPeople: pm, focusedByInstance: false, point: focusPoint) {
+                        transmission = GlassesTransmission.estimate(accepted: added, glasses: gm, person: pm,
+                            rawDepth: disparity, colors: c, lens: lens)
+                    }
                     person = SubjectMatte.withAccessories(pm, adding: added)
                     accessories = added
                 }
@@ -1093,6 +1116,14 @@ public final class LiveFrameAnalyzer {
             // 按人像遮罩修深度边缘（同 analyze）
             if let pm = person {
                 map = SegmentEdgeRepair.repair(depth: map, segments: pm, band: band, untrusted: accessories)
+            }
+            if let t = transmission {
+                // 先让镜片内不透明细节沿完整眼镜连接到脸取得近深度，再移除透射背景。
+                // 提前挖洞会把反光/细镜框切成孤岛，修边回退到原始远深度。
+                person = person.map { removing(t.mask, from: $0) }
+                for i in map.values.indices where t.mask.values[i] > 0 {
+                    map.values[i] = t.disparity.values[i]
+                }
             }
             let allPeople = person
             var focusedPerson: FloatMap?
@@ -1156,6 +1187,13 @@ public final class LiveFrameAnalyzer {
                                        focusedPersonMask: focusedPerson, colorBlock: colorBlock)
             // 所有人：人身上不做焦外高光提亮（同 analyze）
             seeds?.people = people?.resized(width: map.width, height: map.height)
+            if let t = transmission, var s = seeds {
+                s.person = s.person.map { removing(t.mask, from: $0) }
+                s.extra = s.extra.map { removing(t.mask, from: $0) }
+                s.connect = s.connect.map { removing(t.mask, from: $0) }
+                s.transmission = t
+                seeds = s
+            }
             // 照片的 HDR 增益图说不是光源的过曝亮区（白色表面，HDRHighlights.nonLightMask）：和人一样不提亮
             if let ex = highlightExclusion, seeds != nil {
                 let people = seeds?.people

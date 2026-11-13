@@ -136,12 +136,12 @@ public final class DepthCameraController: NSObject, ObservableObject, @unchecked
     /// 只对 LiDAR 这种绝对深度生效（双摄视差、AI 深度换算不出米）
     public var minSubjectDistance: Float = 0.30
     /// 拍照后给编辑器的图像长边
-    public var photoLongSide = 3024
+    public var photoLongSide = 3024 
     /// 每拍一张都存一份拍照调试包（PhotoDebugDump：原始照片文件、交给编辑器的图和深度、按快门那一刻的相机曝光参数），
     /// 相机界面右上角「发送数据」AirDrop 到 Mac。排查成片过曝（录屏 0.5x-baoguang）用；每张约 20–40 MB，查完关掉。
-    /// 打开时还会向相机要 Apple 的人像遮罩和语义遮罩（眼镜、头发……）一起存进包里（不参与渲染）；
+    /// 打开时还会向相机要 Apple 的人像和其他语义遮罩一起存进包里；眼镜遮罩始终用于拍照渲染，其余用于对比；
     /// 要在相机配置（启动、换镜头）之前打开才生效
-    public var savePhotoDebug = false
+    public var savePhotoDebug = true
     /// 换相机时新相机已经出画面、深度还没到：先显示没虚化的新画面（画面不停住），深度到了 0.2 秒淡入虚化。
     /// false = 以前的做法：一直停在上一帧，等新相机出帧并且深度到了（最多 0.8 秒）再淡入
     public var previewBeforeDepth = true

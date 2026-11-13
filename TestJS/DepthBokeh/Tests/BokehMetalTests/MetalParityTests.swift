@@ -193,6 +193,51 @@ final class MetalParityTests: XCTestCase {
         print("Metal 设备：\(r.device.name)")
     }
 
+    /// 透射背景经过主体保护后仍应回到远处；细镜框及覆盖不完整的边缘继续留在焦面。
+    /// 删除 GPU 的透射恢复会让最终深度变成 1、alpha 变成 1，CPU / GPU 比较也会失败。
+    func testGlassesTransmissionParity() throws {
+        let r = try makeRenderer()
+        var image = PlanarImage(width: 96, height: 72)
+        image.r = [Float](repeating: 0.2, count: image.pixelCount)
+        image.g = [Float](repeating: 0.3, count: image.pixelCount)
+        image.b = [Float](repeating: 0.4, count: image.pixelCount)
+        let depth = FloatMap(width: 24, height: 18, values: [Float](repeating: 1, count: 24 * 18))
+        var mask = [Float](repeating: 0, count: 24 * 18)
+        var target = [Float](repeating: 1, count: 24 * 18)
+        for y in 5..<13 { for x in 8..<16 where x != 12 {
+            mask[y * 24 + x] = 1
+            target[y * 24 + x] = 0.25
+        } }
+        let transmission = GlassesTransmission(mask: FloatMap(width: 24, height: 18, values: mask),
+                                               disparity: FloatMap(width: 24, height: 18, values: target))
+        let scene = Scene(image: image, disparity: depth, colors: image.resized(width: 24, height: 18), person: depth)
+        var plan = LiveFrameAnalyzer.stillPlan(disparity: depth, relativeDepth: false, colors: scene.colors,
+                                               fNumber: 2, focusPoint: (0.5, 0.5), personMask: nil,
+                                               outputLongSide: 96, settings: LiveFrameAnalyzer.Settings())
+        plan.seeds = SubjectSeeds(person: depth, transmission: transmission)
+        // 背景层必须存在，恢复后的深度才能参与真实景深渲染。
+        plan.layerCenters = BokehRenderer.layerCenters(
+            sMin: plan.lens.signedBlurRadius(disparity: 0.25, imageLongSide: 96), sMax: 0, perSide: 5)
+        for side in [24, 48, 72, 16, 8] {
+            plan.lowLongSide = side
+            let cpu = BokehRenderer()
+            let label = "眼镜透射·低分辨率 \(side)"
+            check(try compareFrame(r, cpu: cpu, scene: scene, plan: plan, quality: .preview, refinePasses: 1,
+                                   cpuTemporal: nil, gpuTemporal: nil, label: label), label)
+            let debug = try XCTUnwrap(r.debug)
+            let gpuDepth = r.readBack(debug.depth)
+            let gpuAlpha = r.readBack(try XCTUnwrap(debug.matte))
+            let w = debug.depth.width, h = debug.depth.height
+            let background = (h / 2) * w + Int(Float(w) * 9.5 / 24)
+            let frame = (h / 2) * w + Int(Float(w) * 12.5 / 24)
+            XCTAssertEqual(try XCTUnwrap(cpu.debugLowDisparity).values[background], 0.25, accuracy: 1e-5)
+            XCTAssertEqual(gpuDepth[background], 0.25, accuracy: 1e-5, label)
+            XCTAssertEqual(gpuAlpha[background], 0, accuracy: 1e-5, label)
+            XCTAssertEqual(gpuDepth[frame], 1, accuracy: 1e-5, "\(label)：细镜框必须保留")
+            XCTAssertEqual(gpuAlpha[frame], 1, accuracy: 1e-5, "\(label)：细镜框不能挖空")
+        }
+    }
+
     /// 拍照编辑（两遍引导滤波、照片质量、没有跨帧状态）：LiDAR 和双摄相对深度各一次
     func testPhotoParity() throws {
         let r = try makeRenderer()
