@@ -219,7 +219,8 @@ public final class LiveFrameAnalyzer {
         }
         let moving = frame.time < movingUntil
         // 没经过系统滤波的深度（长焦双摄）每帧各测各的：补洞之前先跨帧稳定（DepthHistory），不然补出来的整片深度逐帧变
-        let measured = depthHistory.update(frame.disparity.centerCropped(by: c), colors: frame.colors,
+        let rawFrameDepth = frame.disparity.centerCropped(by: c)
+        let measured = depthHistory.update(rawFrameDepth, colors: frame.colors,
                                            fresh: depthAge == 0, relative: frame.relativeDepth)
         // 补洞按这一帧的颜色引导（长焦双摄不用系统滤波，白墙、屏幕上有成片的洞）
         var map = DepthRefiner.fillInvalid(measured, guide: frame.colors)
@@ -358,6 +359,7 @@ public final class LiveFrameAnalyzer {
             let allPeople = person
             var focusedPerson: FloatMap?
             var excludedPeople: FloatMap?
+            var expansionRejection: FloatMap?
             // 人像遮罩分不出是谁（画面上挨着的人连成一片），这里只留对焦点上的那一个人；
             // 别的人不管多远、挨不挨着，都从遮罩里去掉，清晰还是虚化交给深度（镜头）决定
             if person != nil || frame.personInstances != nil {
@@ -393,12 +395,23 @@ public final class LiveFrameAnalyzer {
                     // 只留对焦的那个人附近（外加一圈头发、眼镜）：挨着他、但 Vision 没编上号的第 5 个人不跟着清晰
                     if let fl = focusLabel, let part = parts.first(where: { $0.label == fl }) {
                         var outside = Self.outsideOf(part.mask)
+                        var instance = part.mask
+                        var instanceValid: [Float]?
                         if let then, let colors {
                             // 画面从那以后变了的地方（人在动）不限制：1 − 对齐后的「外面」
                             outside = Self.alignMask(outside, maskColors: then, colors: colors,
                                                      colorsSmall: small(for: then, colors)).mask
+                            let aligned = Self.alignMask(instance, maskColors: then, colors: colors,
+                                                         colorsSmall: small(for: then, colors))
+                            instance = aligned.mask
+                            instanceValid = aligned.stale.map { $0.map { 1 - $0 } }
                         }
                         base = Self.removing(outside, from: base)
+                        expansionRejection = Self.farPersonExpansion(base, instance: instance,
+                            rawDepth: rawFrameDepth, depth: map, lens: lens, band: matte.band,
+                            rawOffset: frame.relativeDepth && depthHistory.active ? depthHistory.lastOffset : 0,
+                            valid: instanceValid)
+                        if let rejected = expansionRejection { base = Self.removing(rejected, from: base) }
                     }
                 }
                 // 对焦的人有编号：遮罩里剩下的就是他。没有（没有人像实例，或者他是 Vision 没编上号的第 5 个人）：
@@ -470,9 +483,10 @@ public final class LiveFrameAnalyzer {
                     changedSinceMask = oc
                 }
             }
-            let colorBlock = Self.subjectColorBlock(people: people, personSubject: personSubject, object: objectSubject,
-                                                    width: map.width, height: map.height, matte: matte,
-                                                    keep: changedSinceMask)
+            var colorBlock = Self.subjectColorBlock(people: people, personSubject: personSubject,
+                object: objectSubject, width: map.width, height: map.height, matte: matte,
+                keep: changedSinceMask)
+            if let rejected = expansionRejection { colorBlock = HDRHighlights.maxMerge(colorBlock, rejected) }
             seeds = SubjectMatte.seeds(depth: map, colors: colors, focusDisparity: focusD, focusPoint: (fx, fy),
                                        parameters: matte, scale: relativeScale, personMask: person, lens: lens,
                                        sharpPeople: people.flatMap { Self.sharpPeople($0, depth: map, lens: lens,
@@ -747,6 +761,39 @@ public final class LiveFrameAnalyzer {
         let binary = instance.values.map { $0 > 0.5 ? Float(1) : 0 }
         let near = SubjectMatte.dilateBinary(binary, width: w, height: h, radius: max(2, max(w, h) / 30))
         return FloatMap(width: w, height: h, values: near.map { 1 - $0 })
+    }
+
+    /// 已选人物实例外扩时，不能把明显更远的另一个人带入焦平面。
+    /// 原始实例内部不动（人物自身厚度、被遮断的手照旧保护）。只信原始有效深度和修边后深度
+    /// 都连续在焦面后方的区域；洞、零星噪声、已修回近深度的头发/眼镜不作反证。
+    /// 判定使用原有视差 band，不随光圈改变人物归属。实时 instance / valid 必须先对齐当前画面；
+    /// rawOffset 只统一相对深度的标尺，仍需本帧原始有效值，不能拿历史补洞值当反证。
+    static func farPersonExpansion(_ subject: FloatMap, instance: FloatMap, rawDepth: FloatMap,
+                                   depth: FloatMap, lens: LensParameters, band: Float,
+                                   rawOffset: Float = 0, valid: [Float]? = nil) -> FloatMap? {
+        let w = depth.width, h = depth.height, n = w * h
+        guard w > 0, h > 0, rawDepth.width == w, rawDepth.height == h,
+              lens.focusDisparity > 0 else { return nil }
+        let limit = lens.focusDisparity - band * max(lens.relativeScale ?? lens.focusDisparity, 1e-3)
+        let subject = subject.resized(width: w, height: h).values
+        let instance = instance.resized(width: w, height: h).values
+        var notFar = [Float](repeating: 1, count: n)
+        for i in 0..<n {
+            let raw = rawDepth.values[i], d = depth.values[i]
+            if raw.isFinite && raw > 0 && max(raw - rawOffset, 1e-4) < limit && d.isFinite && d > 0 && d < limit {
+                notFar[i] = 0
+            }
+        }
+        // 3×3 邻域共同支持远深度，避免单个低分辨率深度像素把发丝/镜框切掉。
+        let unsupported = SubjectMatte.dilateBinary(notFar, width: w, height: h, radius: 1)
+        var rejected = [Float](repeating: 0, count: n)
+        var any = false
+        for i in 0..<n where subject[i] > 0 && instance[i] <= 0.5 && unsupported[i] == 0 {
+            if let valid, valid.count == n, valid[i] < 0.99 { continue }
+            rejected[i] = 1
+            any = true
+        }
+        return any ? FloatMap(width: w, height: h, values: rejected) : nil
     }
 
     /// 分不出是谁时（没有人像实例）：人像遮罩里只留按镜头算本来就清晰（虚化 ≤ 长边 limit）的像素，再往外留一圈
@@ -1128,6 +1175,7 @@ public final class LiveFrameAnalyzer {
             let allPeople = person
             var focusedPerson: FloatMap?
             var excludedPeople: FloatMap?
+            var expansionRejection: FloatMap?
             // 只留对焦点上的那一个人，别人交给深度决定（同 analyze）
             if person != nil || personInstances != nil {
                 var base = person ?? FloatMap(width: map.width, height: map.height)
@@ -1145,6 +1193,9 @@ public final class LiveFrameAnalyzer {
                     }
                     if let fl = focusLabel, let part = parts.first(where: { $0.label == fl }) {
                         base = removing(outsideOf(part.mask), from: base)
+                        expansionRejection = farPersonExpansion(base, instance: part.mask,
+                            rawDepth: disparity, depth: map, lens: lens, band: matte.band)
+                        if let rejected = expansionRejection { base = removing(rejected, from: base) }
                     }
                 }
                 if focusLabel != nil {
@@ -1177,8 +1228,9 @@ public final class LiveFrameAnalyzer {
                 }
             }
             // 点中的人 / 物体：分割外面颜色说了不算（同 analyze）
-            let colorBlock = subjectColorBlock(people: people, personSubject: personSubject, object: objectSubject,
-                                               width: map.width, height: map.height, matte: matte, keep: nil)
+            var colorBlock = subjectColorBlock(people: people, personSubject: personSubject,
+                object: objectSubject, width: map.width, height: map.height, matte: matte, keep: nil)
+            if let rejected = expansionRejection { colorBlock = HDRHighlights.maxMerge(colorBlock, rejected) }
             seeds = SubjectMatte.seeds(depth: map, colors: c, focusDisparity: focusD, focusPoint: focusPoint,
                                        parameters: matte, scale: relativeScale, personMask: person, lens: lens,
                                        sharpPeople: people.flatMap { sharpPeople($0, depth: map, lens: lens,
